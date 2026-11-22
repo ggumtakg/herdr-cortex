@@ -156,7 +156,7 @@ flowchart TB
 
 ### 설치
 ```powershell
-git clone https://github.com/<your-account>/herdr-cortex.git
+git clone https://github.com/ggumtakg/herdr-cortex.git
 cd herdr-cortex
 npm install
 powershell -ExecutionPolicy Bypass -File .\install.ps1
