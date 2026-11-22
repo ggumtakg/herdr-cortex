@@ -1,0 +1,5 @@
+node_modules/
+.memory/index.sqlite*
+.memory/state/
+*.tmp.*
+herdr-chat-mod-기획서.md
