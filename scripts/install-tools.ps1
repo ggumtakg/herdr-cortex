@@ -396,13 +396,30 @@ function script:Get-HerdrPolicyState {
     }
 }
 
+# Run $Setter and decide by reading the value back with $Getter, not by whether the setter threw.
+# Set-ExecutionPolicy stores the new CurrentUser value and THEN reports a security error when a more specific
+# scope overrides it -- which is always the case under `powershell -ExecutionPolicy Bypass -File install.ps1`
+# (the Process scope). Treating that error as a failure made the installer say "could not set" and skip the
+# record uninstall.ps1 needs to restore the previous value, although the policy had been changed.
+function script:Invoke-HerdrPolicyChange {
+    param([string]$Value, [scriptblock]$Setter, [scriptblock]$Getter)
+    $failure = $null
+    try { & $Setter $Value } catch { $failure = $_ }
+    $now = [string](& $Getter)
+    if ($now -eq $Value) { return }
+    if ($failure) { throw $failure }
+    throw "The ExecutionPolicy of the current user is '$now' after setting it to '$Value'."
+}
+
 function script:Set-HerdrCurrentUserPolicy {
     param([string]$Value, [string]$TestHome)
     if ($TestHome) {
         [System.IO.File]::WriteAllText((Join-Path $TestHome "test-execution-policy.txt"), $Value)
         return
     }
-    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy $Value -Force
+    Invoke-HerdrPolicyChange -Value $Value `
+        -Setter { param($v) Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy $v -Force -ErrorAction Stop } `
+        -Getter { Get-ExecutionPolicy -Scope CurrentUser }
 }
 
 # True when the profile (a local script) would not be loaded under these policies.

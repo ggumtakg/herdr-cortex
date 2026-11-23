@@ -1,6 +1,6 @@
 {
   "name": "herdr-cortex",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Windows 11 Herdr multi-agent persistent memory (Markdown + SQLite 4-table Structured/FTS5/Vector/Graph), auto-recovery hooks, session reviver, cross-tab relay, and HEAD orchestration toolkit for Claude Code and Antigravity CLI.",
   "type": "module",
   "private": true,

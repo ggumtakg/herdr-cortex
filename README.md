@@ -1147,7 +1147,7 @@ flowchart TB
 ## 16. 테스트
 
 ```powershell
-npm test               # 자동 테스트 전체 (18개 파일, 181개)
+npm test               # 자동 테스트 전체 (18개 파일, 182개)
 npm run embed          # 임베딩을 기다리는 문서를 한꺼번에 처리
 npm run mcp            # MCP 서버를 직접 실행
 npm run trust -- list  # cortex-trust와 같은 명령 (프로필 없이)

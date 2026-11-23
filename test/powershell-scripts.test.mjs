@@ -857,3 +857,61 @@ test('install.ps1 and uninstall.ps1 (test home): prerequisites by -NodePath, val
     env.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// ExecutionPolicy: success is judged by the value read back, not by whether Set-ExecutionPolicy threw
+// ---------------------------------------------------------------------------------------------
+
+// Set-ExecutionPolicy stores the CurrentUser value and then throws a security error when a more specific scope
+// overrides it, which is always so under `powershell -ExecutionPolicy Bypass -File install.ps1`. A real install
+// reported "could not set" and skipped the record uninstall needs, although the policy had changed.
+const POLICY_DRIVER = [
+  'param([string]$ToolsPath, [string]$OutPath)',
+  '$ErrorActionPreference = "Stop"',
+  '. $ToolsPath',
+  '$results = New-Object System.Collections.Generic.List[object]',
+  'function Probe([string]$Name, [scriptblock]$Setter) {',
+  '    $script:stored = "Undefined"',
+  '    $threw = $false; $message = ""',
+  '    try { Invoke-HerdrPolicyChange -Value "RemoteSigned" -Setter $Setter -Getter { $script:stored } }',
+  '    catch { $threw = $true; $message = [string]$_.Exception.Message }',
+  '    $results.Add(@{ name = $Name; threw = $threw; message = $message; stored = $script:stored })',
+  '}',
+  'Probe "stores-then-throws" { param($v) $script:stored = $v; throw (New-Object System.Security.SecurityException "Security error.") }',
+  'Probe "throws-without-storing" { param($v) throw (New-Object System.Security.SecurityException "Access denied.") }',
+  'Probe "silently-does-nothing" { param($v) }',
+  'Probe "stores" { param($v) $script:stored = $v }',
+  '[System.IO.File]::WriteAllText($OutPath, (ConvertTo-Json -InputObject $results.ToArray() -Depth 4), (New-Object System.Text.UTF8Encoding($false)))',
+  '',
+].join('\r\n');
+
+test('ExecutionPolicy change: a setter that stores the value and then throws counts as done; one that does not store it fails', { skip: SKIP }, () => {
+  const env = makeTempEnv('herdr-cortex-ps-policy-');
+  try {
+    const driverPath = path.join(env.root, 'policy-driver.ps1');
+    const outPath = path.join(env.root, 'policy-out.json');
+    fs.writeFileSync(driverPath, POLICY_DRIVER);
+    const res = runPsFile(driverPath, ['-ToolsPath', INSTALL_TOOLS, '-OutPath', outPath], { env: psEnv(env) });
+    assert.equal(res.status, 0, `${res.stdout}\n${res.stderr}`);
+    const byName = Object.fromEntries(JSON.parse(fs.readFileSync(outPath, 'utf8')).map((r) => [r.name, r]));
+
+    assert.equal(byName['stores-then-throws'].threw, false, 'the override warning is not a failure');
+    assert.equal(byName['stores-then-throws'].stored, 'RemoteSigned');
+    assert.equal(byName.stores.threw, false);
+
+    assert.equal(byName['throws-without-storing'].threw, true);
+    assert.match(byName['throws-without-storing'].message, /Access denied/);
+    assert.equal(byName['throws-without-storing'].stored, 'Undefined');
+
+    assert.equal(byName['silently-does-nothing'].threw, true);
+    assert.match(byName['silently-does-nothing'].message, /is 'Undefined' after setting it to 'RemoteSigned'/);
+
+    // The real setter is used only outside the test home; it must go through the same check.
+    const source = fs.readFileSync(INSTALL_TOOLS, 'utf8');
+    assert.match(source, /Invoke-HerdrPolicyChange -Value \$Value/);
+
+    assertRealHomeUntouched();
+  } finally {
+    env.cleanup();
+  }
+});

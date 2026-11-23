@@ -1224,11 +1224,11 @@ test('memory_overview: budget is kept within MEMORY_OVERVIEW_BUDGET_MIN..MAX, a 
   }
 });
 
-test('version: package.json, both root entries of package-lock.json, SERVER_INFO and the MCP README state 1.1.0', () => {
+test('version: package.json, both root entries of package-lock.json, SERVER_INFO and the MCP README state 1.1.1', () => {
   const readJson = (name) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, name), 'utf8'));
   const pkg = readJson('package.json');
   const lock = readJson('package-lock.json');
-  assert.equal(pkg.version, '1.1.0');
+  assert.equal(pkg.version, '1.1.1');
   assert.deepEqual([lock.version, lock.packages[''].version, SERVER_INFO.version], [pkg.version, pkg.version, pkg.version]);
   assert.deepEqual([lock.name, lock.packages[''].name, SERVER_INFO.name], [pkg.name, pkg.name, pkg.name]);
   const mcpReadme = fs.readFileSync(path.join(REPO_ROOT, 'src', 'mcp', 'README.md'), 'utf8');

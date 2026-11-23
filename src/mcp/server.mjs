@@ -15,7 +15,7 @@ import { createToolRegistry } from './tools.mjs';
 
 export const SERVER_INFO = Object.freeze({
   name: 'herdr-cortex',
-  version: '1.1.0',
+  version: '1.1.1',
 });
 
 export const DEFAULT_PROTOCOL_VERSION = '2024-11-05';

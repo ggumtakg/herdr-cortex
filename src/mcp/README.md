@@ -28,7 +28,7 @@
 
 - 전송은 표준 입출력입니다. 표준 입력에서 한 줄에 JSON 하나를 읽고, 응답도 표준 출력에 한 줄로 씁니다. 빈 줄은 건너뜁니다. 진단 메시지는 표준 오류에 `[herdr-cortex-mcp]`로 시작하는 줄로 씁니다.
 - 요청은 도착한 순서대로 하나씩 처리합니다. 앞 요청의 응답을 쓴 뒤에 다음 요청을 처리하므로 응답 순서가 요청 순서와 같습니다.
-- `initialize` 응답의 `serverInfo`는 `SERVER_INFO`(`name: "herdr-cortex"`, `version: "1.1.0"`, `package.json`의 `version`과 같은 값)이고 `capabilities`는 `{ "tools": {} }`뿐입니다.
+- `initialize` 응답의 `serverInfo`는 `SERVER_INFO`(`name: "herdr-cortex"`, `version: "1.1.1"`, `package.json`의 `version`과 같은 값)이고 `capabilities`는 `{ "tools": {} }`뿐입니다.
 - 프로토콜 버전은 협상하지 않습니다. 클라이언트가 `params.protocolVersion`을 문자열로 보내면 그 값을 그대로 돌려주고, 보내지 않으면 `DEFAULT_PROTOCOL_VERSION`(`"2024-11-05"`)을 돌려줍니다.
 
 ### 처리하는 메서드
