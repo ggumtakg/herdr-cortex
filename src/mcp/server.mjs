@@ -1,8 +1,7 @@
 import path from 'node:path';
 import readline from 'node:readline';
-import { pathToFileURL } from 'node:url';
 import { CortexStore } from '../core/store.mjs';
-import { REPO_ROOT, isProjectEnabled, loadConfig } from '../core/config.mjs';
+import { REPO_ROOT, isMainModule, isProjectEnabled, loadConfig } from '../core/config.mjs';
 import { createEmbeddingQueue, resolveEmbeddingProvider } from '../embeddings/index.mjs';
 import { createRelayTools } from '../relay/tools.mjs';
 import { createToolRegistry } from './tools.mjs';
@@ -78,6 +77,11 @@ export function createMcpServer({
   async function handleMessage(msg) {
     if (!msg || typeof msg !== 'object') {
       return makeJsonRpcError(null, -32600, 'Invalid Request');
+    }
+
+    // A JSON-RPC batch (array payload) is answered with one error instead of being dropped silently.
+    if (Array.isArray(msg)) {
+      return makeJsonRpcError(null, -32600, 'Invalid Request: JSON-RPC batch requests are not supported; send one request per line');
     }
 
     const { id, method, params } = msg;
@@ -233,7 +237,7 @@ function parseCliOptions(argv) {
   return opts;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+if (isMainModule(import.meta.url)) {
   const opts = parseCliOptions(process.argv.slice(2));
   const config = loadConfig({ projectDir: opts.projectDir, globalDir: opts.globalDir });
   const projectEnabled = isProjectEnabled(opts.projectDir, config);

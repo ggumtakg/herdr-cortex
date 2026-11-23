@@ -14,9 +14,18 @@ import {
   sanitizeRelFilePath,
   validateDocId,
 } from './config.mjs';
-import { parseMarkdownDoc, serializeMarkdownDoc } from './frontmatter.mjs';
-import { openTierDb, syncFromDisk, syncSingleFile } from './db.mjs';
+import { decodeDocBytes } from './encoding.mjs';
+import {
+  UnsafeUpdateError,
+  parseMarkdownDoc,
+  parseMarkdownDocDetailed,
+  renderUpdatedMarkdownDoc,
+  serializeMarkdownDoc,
+} from './frontmatter.mjs';
+import { indexSingleFile, openTierDb, readDocFile, syncFromDisk, withTransaction } from './db.mjs';
 import { exploreGraph, getNeighbors, normalizeGraphTarget } from './graph.mjs';
+
+export { UnsafeUpdateError };
 
 export const VALID_TYPES = new Set(['decision', 'worklog', 'knowledge', 'todo', 'baseline']);
 export const VALID_STATUSES = new Set(['active', 'done', 'superseded', 'archived']);
@@ -61,6 +70,60 @@ function resolveDocAbsPath(tierDir, relPath) {
   const { root, docsDir } = getTierPaths(tierDir);
   const abs = path.resolve(root, relPath);
   return assertInsideDir(docsDir, abs);
+}
+
+let lastIssuedTimestampMs = 0;
+
+/**
+ * Current time as a Date that is strictly later than any Date this function returned earlier in this
+ * process, so two documents saved back-to-back never share a millisecond timestamp.
+ */
+function nextTimestampDate() {
+  const ms = Math.max(Date.now(), lastIssuedTimestampMs + 1);
+  lastIssuedTimestampMs = ms;
+  return new Date(ms);
+}
+
+/**
+ * Read a document and compute its rewritten text without touching the disk.
+ * `mutate(parsed)` receives the parsed document and returns the new { frontmatter, body }.
+ * Returns { absPath, originalBytes, text }.
+ * Throws `UnsafeUpdateError` when the file cannot be rewritten without risking loss of content:
+ * its text encoding cannot be determined, or its frontmatter would not survive the rewrite.
+ */
+function planDocRewrite(absPath, relPath, mutate) {
+  const refuse = (reason) => new UnsafeUpdateError(
+    `UNSAFE_UPDATE: "${relPath}" was not modified because ${reason}. Fix the file by hand (for example re-save it as UTF-8, or simplify its frontmatter) and try again.`,
+  );
+
+  const originalBytes = fs.readFileSync(absPath);
+  const decoded = decodeDocBytes(originalBytes);
+  if (!decoded.safe) throw refuse(decoded.reason);
+
+  const parsed = parseMarkdownDocDetailed(decoded.text);
+  const { frontmatter, body } = mutate(parsed);
+  try {
+    return { absPath, originalBytes, text: renderUpdatedMarkdownDoc(parsed, frontmatter, body) };
+  } catch (err) {
+    if (err instanceof UnsafeUpdateError) throw refuse(err.reason);
+    throw err;
+  }
+}
+
+function restoreOriginalFile(plan) {
+  try {
+    fs.writeFileSync(plan.absPath, plan.originalBytes);
+  } catch {
+    // best effort: the caller is already reporting the original failure
+  }
+}
+
+function removeFileQuietly(filePath) {
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // ignore cleanup failure
+  }
 }
 
 export class CortexStore {
@@ -189,7 +252,7 @@ export class CortexStore {
       throw new Error('saveDoc requires a non-empty "summary"');
     }
 
-    const now = new Date();
+    const now = nextTimestampDate();
     const nowIso = formatIsoTimestamp(now);
     const id = params.id ? validateDocId(String(params.id).trim()) : generateDocId(type, title, now);
 
@@ -251,55 +314,40 @@ export class CortexStore {
 
     const body = String(params.content ?? '');
     const markdown = serializeMarkdownDoc(frontmatter, body);
-    atomicWriteText(targetPath, markdown);
 
-    // Transition superseded doc atomically while preserving its body;
-    // rollback newly created file cleanly if writing the superseded file fails.
-    let supersededDoc = null;
-    let supersedesWarning = null;
-    if (supersedes) {
-      const oldRow = tier.db.prepare('SELECT id, path FROM docs WHERE id = ?').get(supersedes);
-      if (oldRow) {
-        const oldAbs = resolveDocAbsPath(tier.dir, oldRow.path);
-        if (fs.existsSync(oldAbs)) {
-          try {
-            const oldRaw = fs.readFileSync(oldAbs, 'utf8');
-            const parsedOld = parseMarkdownDoc(oldRaw);
-            const updatedOldFm = {
-              ...parsedOld.frontmatter,
-              id: parsedOld.frontmatter.id || oldRow.id,
-              status: 'superseded',
-              updated_at: nowIso,
-            };
-            atomicWriteText(oldAbs, serializeMarkdownDoc(updatedOldFm, parsedOld.body));
-            syncSingleFile(tier.db, tier.dir, oldAbs);
-            supersededDoc = oldRow.id;
-          } catch (err) {
-            try {
-              if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
-            } catch {
-              // ignore cleanup failure
-            }
-            throw err;
-          }
-        } else {
-          supersedesWarning = `Target "${supersedes}" file missing on disk in "${scope}" scope; not transitioned.`;
-        }
-      } else {
-        const otherScope = scope === 'project' ? 'global' : 'project';
-        const otherTier = this.getTierIfExists(otherScope);
-        let foundInOther = false;
-        if (otherTier) {
-          syncFromDisk(otherTier.db, otherTier.dir);
-          foundInOther = Boolean(otherTier.db.prepare('SELECT id FROM docs WHERE id = ?').get(supersedes));
-        }
-        supersedesWarning = foundInOther
-          ? `Target "${supersedes}" exists in "${otherScope}" scope, not "${scope}"; not transitioned.`
-          : `Target "${supersedes}" not found in "${scope}" scope; not transitioned.`;
+    // Create the new file, rewrite the superseded document and index both under the tier's write lock
+    // (BEGIN IMMEDIATE), so another process cannot interleave its own read-modify-write of those files.
+    let indexed = null;
+    let transition = { plan: null, transitioned: null, notFound: null };
+    withTransaction(tier.db, () => {
+      if (tier.db.prepare('SELECT id FROM docs WHERE id = ?').get(id)) {
+        throw new Error(`Document "${id}" already exists in scope "${scope}". Use updateDoc to modify it.`);
       }
-    }
+      if (fs.existsSync(targetPath)) {
+        throw new Error(`Target file "${path.basename(targetPath)}" already exists on disk. Use updateDoc or choose a unique id.`);
+      }
+      if (supersedes) {
+        transition = this._planSupersedeTransition(tier, supersedes, nowIso);
+      }
 
-    const indexed = syncSingleFile(tier.db, tier.dir, targetPath);
+      let supersededWritten = false;
+      try {
+        atomicWriteText(targetPath, markdown);
+        if (transition.plan) {
+          atomicWriteText(transition.plan.absPath, transition.plan.text);
+          supersededWritten = true;
+          indexSingleFile(tier.db, tier.dir, transition.plan.absPath);
+        }
+        indexed = indexSingleFile(tier.db, tier.dir, targetPath);
+      } catch (err) {
+        // Leave the disk as it was: drop the new file and put the superseded document back.
+        removeFileQuietly(targetPath);
+        if (supersededWritten) restoreOriginalFile(transition.plan);
+        throw err;
+      }
+    });
+
+    const supersedesWarning = supersedes ? this._supersedeWarning(scope, supersedes, transition.notFound) : null;
     this._notifyWrite(scope, id);
 
     return {
@@ -316,12 +364,64 @@ export class CortexStore {
       files,
       derived_from: derivedFrom,
       supersedes: supersedes || null,
-      supersededTransitioned: supersededDoc,
+      supersededTransitioned: transition.transitioned,
       ...(supersedesWarning ? { supersedesWarning } : {}),
       created_at: indexed.created_at,
       updated_at: indexed.updated_at,
       embed_status: indexed.embed_status || 'pending',
     };
+  }
+
+  /**
+   * Prepare the transition of document `supersedesId` to status "superseded" (shared by saveDoc and
+   * updateDoc). Must be called inside the tier's write transaction; nothing is written here.
+   * Returns { plan, transitioned, notFound }:
+   * - plan: pending rewrite of the old document (see `planDocRewrite`), or null
+   * - transitioned: id of the document that will be transitioned, or null
+   * - notFound: 'row' (no such document in this tier), 'file' (indexed but missing on disk), or null
+   * Throws `UnsafeUpdateError` when the old document cannot be rewritten without losing content.
+   */
+  _planSupersedeTransition(tier, supersedesId, nowIso) {
+    const oldRow = tier.db.prepare('SELECT id, path FROM docs WHERE id = ?').get(supersedesId);
+    if (!oldRow) {
+      return { plan: null, transitioned: null, notFound: 'row' };
+    }
+    const oldAbs = resolveDocAbsPath(tier.dir, oldRow.path);
+    if (!fs.existsSync(oldAbs)) {
+      return { plan: null, transitioned: null, notFound: 'file' };
+    }
+    const plan = planDocRewrite(oldAbs, oldRow.path, (parsed) => ({
+      frontmatter: {
+        ...parsed.frontmatter,
+        id: parsed.frontmatter.id || oldRow.id,
+        status: 'superseded',
+        updated_at: nowIso,
+      },
+      body: parsed.body,
+    }));
+    return { plan, transitioned: oldRow.id, notFound: null };
+  }
+
+  /**
+   * Warning text for a supersede target that could not be transitioned, or null.
+   * Looks into the other scope, so it must run outside the tier's write transaction.
+   */
+  _supersedeWarning(scope, supersedesId, notFound) {
+    if (notFound === 'file') {
+      return `Target "${supersedesId}" file missing on disk in "${scope}" scope; not transitioned.`;
+    }
+    if (notFound !== 'row') return null;
+
+    const otherScope = scope === 'project' ? 'global' : 'project';
+    const otherTier = this.getTierIfExists(otherScope);
+    let foundInOther = false;
+    if (otherTier) {
+      syncFromDisk(otherTier.db, otherTier.dir);
+      foundInOther = Boolean(otherTier.db.prepare('SELECT id FROM docs WHERE id = ?').get(supersedesId));
+    }
+    return foundInOther
+      ? `Target "${supersedesId}" exists in "${otherScope}" scope, not "${scope}"; not transitioned.`
+      : `Target "${supersedesId}" not found in "${scope}" scope; not transitioned.`;
   }
 
   updateDoc(params = {}) {
@@ -354,39 +454,77 @@ export class CortexStore {
       throw new Error(`Invalid type "${params.type}": expected one of ${[...VALID_TYPES].join(', ')}`);
     }
 
+    // `supersedes: ""` clears the link; a non-empty value records it and transitions the target.
+    const supersedesGiven = params.supersedes !== undefined && params.supersedes !== null;
+    const supersedes = supersedesGiven ? String(params.supersedes).trim() : '';
+    if (supersedes) {
+      validateDocId(supersedes);
+      if (supersedes === id) {
+        throw new Error('A document cannot supersede itself');
+      }
+    }
+
     const absPath = resolveDocAbsPath(foundTier.dir, foundRow.path);
-    const raw = fs.readFileSync(absPath, 'utf8');
-    const parsed = parseMarkdownDoc(raw);
-    const fm = { ...parsed.frontmatter, id: parsed.frontmatter.id || id };
+    const nowIso = formatIsoTimestamp(nextTimestampDate());
 
-    if (params.type !== undefined) fm.type = String(params.type).trim();
-    if (params.status !== undefined) fm.status = String(params.status).trim();
-    if (params.title !== undefined) fm.title = String(params.title).trim();
-    if (params.summary !== undefined) fm.summary = String(params.summary).trim();
-    if (params.session !== undefined) fm.session = String(params.session).trim();
-    if (params.branch !== undefined) fm.branch = String(params.branch).trim();
-    if (params.due !== undefined) fm.due = String(params.due).trim();
-    if (params.tags !== undefined) fm.tags = normalizeStringArray(params.tags) || [];
-    if (params.files !== undefined) {
-      fm.files = sanitizeFilesArray(params.files, this.projectRoot) || [];
-    }
-    if (params.derived_from !== undefined) {
-      fm.derived_from = normalizeStringArray(params.derived_from) || [];
-    }
+    const applyUpdate = (parsed) => {
+      const fm = { ...parsed.frontmatter, id: parsed.frontmatter.id || id };
 
-    const nowIso = formatIsoTimestamp();
-    fm.updated_at = nowIso;
+      if (params.type !== undefined) fm.type = String(params.type).trim();
+      if (params.status !== undefined) fm.status = String(params.status).trim();
+      if (params.title !== undefined) fm.title = String(params.title).trim();
+      if (params.summary !== undefined) fm.summary = String(params.summary).trim();
+      if (params.session !== undefined) fm.session = String(params.session).trim();
+      if (params.branch !== undefined) fm.branch = String(params.branch).trim();
+      if (params.due !== undefined) fm.due = String(params.due).trim();
+      if (params.tags !== undefined) fm.tags = normalizeStringArray(params.tags) || [];
+      if (params.files !== undefined) {
+        fm.files = sanitizeFilesArray(params.files, this.projectRoot) || [];
+      }
+      if (params.derived_from !== undefined) {
+        fm.derived_from = normalizeStringArray(params.derived_from) || [];
+      }
+      if (supersedesGiven) fm.supersedes = supersedes;
 
-    let body = parsed.body;
-    if (params.content !== undefined) {
-      body = String(params.content);
-    } else if (params.append_content !== undefined && String(params.append_content).length > 0) {
-      const appendText = String(params.append_content);
-      body = body.trimEnd() ? `${body.trimEnd()}\n\n${appendText}` : appendText;
-    }
+      fm.updated_at = nowIso;
 
-    atomicWriteText(absPath, serializeMarkdownDoc(fm, body));
-    const indexed = syncSingleFile(foundTier.db, foundTier.dir, absPath);
+      let body = parsed.body;
+      if (params.content !== undefined) {
+        body = String(params.content);
+      } else if (params.append_content !== undefined && String(params.append_content).length > 0) {
+        const appendText = String(params.append_content);
+        body = body.trimEnd() ? `${body.trimEnd()}\n\n${appendText}` : appendText;
+      }
+      return { frontmatter: fm, body };
+    };
+
+    // Read, modify and write the file under the tier's write lock (BEGIN IMMEDIATE). Every writer
+    // takes the same lock, so two processes updating one document cannot lose each other's change.
+    // Both rewrites are computed before anything is written: a refusal leaves the disk untouched.
+    let indexed = null;
+    let transition = { plan: null, transitioned: null, notFound: null };
+    withTransaction(foundTier.db, () => {
+      const plan = planDocRewrite(absPath, foundRow.path, applyUpdate);
+      if (supersedes) {
+        transition = this._planSupersedeTransition(foundTier, supersedes, nowIso);
+      }
+
+      atomicWriteText(plan.absPath, plan.text);
+      if (transition.plan) {
+        try {
+          atomicWriteText(transition.plan.absPath, transition.plan.text);
+        } catch (err) {
+          restoreOriginalFile(plan);
+          throw err;
+        }
+        indexSingleFile(foundTier.db, foundTier.dir, transition.plan.absPath);
+      }
+      indexed = indexSingleFile(foundTier.db, foundTier.dir, plan.absPath);
+    });
+
+    const supersedesWarning = supersedes
+      ? this._supersedeWarning(foundTier.scope, supersedes, transition.notFound)
+      : null;
     this._notifyWrite(foundTier.scope, id);
 
     return {
@@ -400,6 +538,13 @@ export class CortexStore {
       session: indexed.session,
       branch: indexed.branch,
       tags: parseTagsJson(indexed.tagsJson),
+      ...(supersedes
+        ? {
+            supersedes,
+            supersededTransitioned: transition.transitioned,
+            ...(supersedesWarning ? { supersedesWarning } : {}),
+          }
+        : {}),
       updated_at: indexed.updated_at,
       embed_status: indexed.embed_status || 'pending',
     };
@@ -421,7 +566,7 @@ export class CortexStore {
       try {
         const absPath = resolveDocAbsPath(tier.dir, row.path);
         if (fs.existsSync(absPath)) {
-          extraFm = parseMarkdownDoc(fs.readFileSync(absPath, 'utf8')).frontmatter;
+          extraFm = parseMarkdownDoc(readDocFile(absPath).text).frontmatter;
         }
       } catch {
         // DB content still authoritative fallback

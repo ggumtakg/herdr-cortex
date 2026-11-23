@@ -3,12 +3,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
+  compareTimestamps,
   ensureTierDirs,
   formatIsoTimestamp,
   getTierPaths,
   isValidId,
   normalizeRelPath,
 } from './config.mjs';
+import { decodeDocBytes } from './encoding.mjs';
 import { extractReferences, parseMarkdownDoc } from './frontmatter.mjs';
 
 let sqliteVecModule = null;
@@ -784,18 +786,27 @@ function writeDocAndEdges(stmts, record, prevDoc = null) {
   }
 }
 
+/**
+ * Order documents of one session by creation time, then by id.
+ * Timestamps are compared as points in time rather than as strings, so second-precision values
+ * written by older versions, millisecond values, and hand-written variants (`Z`, no offset) mix correctly.
+ */
+function compareSessionDocOrder(a, b) {
+  const byTime = compareTimestamps(a.created_at, b.created_at);
+  if (byTime !== 0) return byTime;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
 function rebuildSessionNextEdges(db, sessions) {
   if (!sessions || sessions.size === 0) return;
 
-  const selectSessionDocs = db.prepare(
-    'SELECT id FROM docs WHERE session = ? ORDER BY created_at ASC, id ASC',
-  );
+  const selectSessionDocs = db.prepare('SELECT id, created_at FROM docs WHERE session = ?');
   const deleteSessionEdgeForSrc = db.prepare("DELETE FROM edges WHERE src = ? AND kind = 'session_next'");
   const insertEdge = db.prepare('INSERT OR REPLACE INTO edges (src, dst, kind, weight) VALUES (?, ?, ?, ?)');
 
   for (const session of sessions) {
     if (!session) continue;
-    const rows = selectSessionDocs.all(session);
+    const rows = selectSessionDocs.all(session).sort(compareSessionDocOrder);
     for (const row of rows) {
       deleteSessionEdgeForSrc.run(row.id);
     }
@@ -806,50 +817,92 @@ function rebuildSessionNextEdges(db, sessions) {
 }
 
 /**
- * Incrementally sync a single Markdown file on disk into SQLite (10-30ms fast path).
+ * Read a document file and decode it to text (UTF-8, UTF-16 with a byte-order mark, or CP949).
+ * Returns the `decodeDocBytes` result; undecodable bytes never throw, they come back with `safe: false`
+ * and a lossy `text` that can be indexed but must not be written back.
  */
-export function syncSingleFile(db, tierDir, absFilePath) {
+export function readDocFile(absPath) {
+  return decodeDocBytes(fs.readFileSync(absPath));
+}
+
+/**
+ * Index a single Markdown file inside a transaction the caller already holds (see `withTransaction`).
+ * This lets a caller keep its own read-modify-write of the file and the index update under one write lock.
+ */
+export function indexSingleFile(db, tierDir, absFilePath) {
   const root = path.resolve(tierDir);
   const resolvedFile = path.resolve(absFilePath);
   const stat = fs.statSync(resolvedFile);
-  const rawText = fs.readFileSync(resolvedFile, 'utf8');
+  const rawText = readDocFile(resolvedFile).text;
   const record = normalizeDocRecord(resolvedFile, root, rawText, stat);
   if (!record) {
     throw new Error(`Unable to derive valid document ID for "${resolvedFile}"`);
   }
 
-  withTransaction(db, () => {
-    const prevByPath = db
-      .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error FROM docs WHERE path = ?')
-      .get(record.doc.path);
-    const prevById = db
-      .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error FROM docs WHERE id = ?')
-      .get(record.doc.id);
+  const prevByPath = db
+    .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error FROM docs WHERE path = ?')
+    .get(record.doc.path);
+  const prevById = db
+    .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error FROM docs WHERE id = ?')
+    .get(record.doc.id);
 
-    const affectedSessions = new Set();
-    if (prevByPath?.session) affectedSessions.add(prevByPath.session);
-    if (prevById?.session) affectedSessions.add(prevById.session);
-    if (record.doc.session) affectedSessions.add(record.doc.session);
+  const affectedSessions = new Set();
+  if (prevByPath?.session) affectedSessions.add(prevByPath.session);
+  if (prevById?.session) affectedSessions.add(prevById.session);
+  if (record.doc.session) affectedSessions.add(record.doc.session);
 
-    const stmts = upsertDocStatements(db);
+  const stmts = upsertDocStatements(db);
 
-    if (prevByPath && prevByPath.id !== record.doc.id) {
-      stmts.deleteDocById.run(prevByPath.id);
-      stmts.deleteFtsById.run(prevByPath.id);
-      if (stmts.deleteVecById) stmts.deleteVecById.run(prevByPath.id);
-      stmts.deleteAllDocEdges.run(prevByPath.id, prevByPath.id);
-    }
+  if (prevByPath && prevByPath.id !== record.doc.id) {
+    stmts.deleteDocById.run(prevByPath.id);
+    stmts.deleteFtsById.run(prevByPath.id);
+    if (stmts.deleteVecById) stmts.deleteVecById.run(prevByPath.id);
+    stmts.deleteAllDocEdges.run(prevByPath.id, prevByPath.id);
+  }
 
-    const prevForDoc = prevById || (prevByPath?.id === record.doc.id ? prevByPath : null);
-    if (prevForDoc && prevForDoc.session !== record.doc.session) {
-      stmts.deleteSessionNextForDoc.run(record.doc.id, record.doc.id);
-    }
+  const prevForDoc = prevById || (prevByPath?.id === record.doc.id ? prevByPath : null);
+  if (prevForDoc && prevForDoc.session !== record.doc.session) {
+    stmts.deleteSessionNextForDoc.run(record.doc.id, record.doc.id);
+  }
 
-    writeDocAndEdges(stmts, record, prevForDoc);
-    rebuildSessionNextEdges(db, affectedSessions);
-  });
+  writeDocAndEdges(stmts, record, prevForDoc);
+  rebuildSessionNextEdges(db, affectedSessions);
 
   return record.doc;
+}
+
+/**
+ * Incrementally sync a single Markdown file on disk into SQLite (10-30ms fast path).
+ */
+export function syncSingleFile(db, tierDir, absFilePath) {
+  return withTransaction(db, () => indexSingleFile(db, tierDir, absFilePath));
+}
+
+// Bump when the way file bytes are turned into text changes, so files indexed by an older decoder
+// (for example CP949 files that were read as broken UTF-8) are re-read once on the next sync.
+const TEXT_DECODER_VERSION = '2';
+
+const duplicateDocsByTier = new Map(); // tier root -> [{ id, path, keptPath }]
+const warnedDuplicates = new Set(); // `${tierRoot}\0${id}\0${path}`
+
+function noteDuplicateDoc(found, tierRoot, id, relPath, keptPath) {
+  found.push({ id, path: relPath, keptPath });
+  const key = `${tierRoot}\0${id}\0${relPath}`;
+  if (warnedDuplicates.has(key)) return;
+  warnedDuplicates.add(key);
+  console.error(
+    `[herdr-cortex] Warning: duplicate document ID "${id}" in "${relPath}" (already indexed at "${keptPath}"); skipping duplicate.`,
+  );
+}
+
+/**
+ * Documents that the most recent `syncFromDisk` of this tier (in this process) skipped because another
+ * file already uses the same id. Returns [{ id, path, keptPath }] with paths relative to the tier directory;
+ * empty when the tier has not been synced yet or has no duplicates.
+ */
+export function getDuplicateDocIds(tierDir) {
+  const found = duplicateDocsByTier.get(path.resolve(tierDir)) || [];
+  return found.map((item) => ({ ...item }));
 }
 
 /**
@@ -864,8 +917,12 @@ export function syncFromDisk(db, tierDir) {
   let addedOrUpdated = 0;
   let statUpdated = 0;
   let deleted = 0;
+  const duplicates = [];
 
   withTransaction(db, () => {
+    const decoderRow = db.prepare("SELECT value FROM index_meta WHERE key = 'textDecoderVersion'").get();
+    const rereadAll = decoderRow?.value !== TEXT_DECODER_VERSION;
+
     const existingRows = db
       .prepare('SELECT id, path, mtime_ms, size, hash, content_hash, session, embed_status, embed_model, embed_attempts, embed_error FROM docs')
       .all();
@@ -894,11 +951,11 @@ export function syncFromDisk(db, tierDir) {
       const relPath = normalizeRelPath(path.relative(paths.root, absPath));
       const existing = byPath.get(relPath);
 
-      if (existing && existing.mtime_ms === stat.mtimeMs && existing.size === stat.size) {
+      const statUnchanged = Boolean(existing) && existing.mtime_ms === stat.mtimeMs && existing.size === stat.size;
+
+      if (statUnchanged && !rereadAll) {
         if (seenIds.has(existing.id)) {
-          console.error(
-            `[herdr-cortex] Warning: duplicate document ID "${existing.id}" in "${relPath}" (already indexed at "${seenIds.get(existing.id)}"); skipping duplicate.`,
-          );
+          noteDuplicateDoc(duplicates, paths.root, existing.id, relPath, seenIds.get(existing.id));
           continue;
         }
         seenPaths.add(relPath);
@@ -906,9 +963,10 @@ export function syncFromDisk(db, tierDir) {
         continue;
       }
 
+      // Undecodable bytes come back as lossy text (still indexable); only a failed read skips the file.
       let rawText;
       try {
-        rawText = fs.readFileSync(absPath, 'utf8');
+        rawText = readDocFile(absPath).text;
       } catch {
         continue;
       }
@@ -916,14 +974,14 @@ export function syncFromDisk(db, tierDir) {
       const fileHash = sha256(rawText);
       if (existing && existing.hash === fileHash) {
         if (seenIds.has(existing.id)) {
-          console.error(
-            `[herdr-cortex] Warning: duplicate document ID "${existing.id}" in "${relPath}" (already indexed at "${seenIds.get(existing.id)}"); skipping duplicate.`,
-          );
+          noteDuplicateDoc(duplicates, paths.root, existing.id, relPath, seenIds.get(existing.id));
           continue;
         }
         seenPaths.add(relPath);
         seenIds.set(existing.id, relPath);
-        toStatOnly.push({ id: existing.id, mtime_ms: stat.mtimeMs, size: stat.size });
+        if (!statUnchanged) {
+          toStatOnly.push({ id: existing.id, mtime_ms: stat.mtimeMs, size: stat.size });
+        }
         continue;
       }
 
@@ -931,9 +989,7 @@ export function syncFromDisk(db, tierDir) {
       if (!record) continue;
 
       if (seenIds.has(record.doc.id)) {
-        console.error(
-          `[herdr-cortex] Warning: duplicate document ID "${record.doc.id}" in "${relPath}" (already indexed at "${seenIds.get(record.doc.id)}"); skipping duplicate.`,
-        );
+        noteDuplicateDoc(duplicates, paths.root, record.doc.id, relPath, seenIds.get(record.doc.id));
         continue;
       }
 
@@ -953,6 +1009,10 @@ export function syncFromDisk(db, tierDir) {
         toDelete.push(row);
         if (row.session) affectedSessions.add(row.session);
       }
+    }
+
+    if (rereadAll) {
+      db.prepare('INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)').run('textDecoderVersion', TEXT_DECODER_VERSION);
     }
 
     if (toUpsert.length === 0 && toStatOnly.length === 0 && toDelete.length === 0) {
@@ -995,6 +1055,8 @@ export function syncFromDisk(db, tierDir) {
     statUpdated = toStatOnly.length;
     deleted = toDelete.filter((r) => !seenIds.has(r.id)).length;
   });
+
+  duplicateDocsByTier.set(paths.root, duplicates);
 
   return {
     addedOrUpdated,

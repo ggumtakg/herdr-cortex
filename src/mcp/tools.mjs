@@ -55,6 +55,44 @@ function makeSubagentDeniedError(toolName) {
   };
 }
 
+// Arguments every tool accepts in addition to its input schema: the PreToolUse hook injects
+// `_caller_agent_id` to mark subagent callers (see `isSubagentCaller`).
+const INTERNAL_ARGUMENT_KEYS = new Set(['_caller_agent_id']);
+
+function allowedArgumentNames(tool) {
+  const properties = tool?.inputSchema?.properties;
+  return properties && typeof properties === 'object' ? Object.keys(properties) : [];
+}
+
+/**
+ * Argument names that are not declared in the tool's `inputSchema.properties`.
+ * A misspelled argument would otherwise be dropped silently and the call would appear to succeed.
+ * A tool whose schema declares no `properties` object at all is not checked.
+ */
+function findUnknownArguments(tool, args) {
+  if (!args || typeof args !== 'object') return [];
+  const properties = tool?.inputSchema?.properties;
+  if (!properties || typeof properties !== 'object') return [];
+  const allowed = new Set(allowedArgumentNames(tool));
+  return Object.keys(args).filter((key) => !allowed.has(key) && !INTERNAL_ARGUMENT_KEYS.has(key));
+}
+
+function makeUnknownArgumentError(tool, unknownArgs) {
+  const allowed = allowedArgumentNames(tool);
+  const quoted = unknownArgs.map((key) => `"${key}"`).join(', ');
+  return {
+    isError: true,
+    errorCode: 'UNKNOWN_ARGUMENT',
+    data: {
+      error: 'UNKNOWN_ARGUMENT',
+      tool: tool.name,
+      unknown_arguments: unknownArgs,
+      allowed_arguments: allowed,
+      message: `Unknown argument${unknownArgs.length === 1 ? '' : 's'} ${quoted} for tool "${tool.name}". Allowed arguments: ${allowed.join(', ') || '(none)'}.`,
+    },
+  };
+}
+
 function makeProjectExcludedError(toolName, projectDir) {
   return {
     isError: true,
@@ -352,7 +390,7 @@ export function createToolRegistry(
 
   registerTool({
     name: 'memory_update',
-    description: 'Update an existing canonical Markdown memory document (HEAD main conversation only).',
+    description: 'Update an existing canonical Markdown memory document (HEAD main conversation only). Setting supersedes transitions the superseded document exactly like memory_save.',
     writeProtected: true,
     inputSchema: {
       type: 'object',
@@ -370,6 +408,7 @@ export function createToolRegistry(
         branch: { type: 'string' },
         tags: { type: 'array', items: { type: 'string' } },
         files: { type: 'array', items: { type: 'string' } },
+        supersedes: { type: 'string', description: 'ID of the document this one replaces; that document becomes status "superseded" (empty string clears the link)' },
         derived_from: { type: 'array', items: { type: 'string' } },
         due: { type: 'string' },
         project_dir: { type: 'string', description: 'Optional project directory override' },
@@ -527,6 +566,11 @@ export function createToolRegistry(
         return makeSubagentDeniedError(name);
       }
 
+      const unknownArgs = findUnknownArguments(tool, args);
+      if (unknownArgs.length > 0) {
+        return makeUnknownArgumentError(tool, unknownArgs);
+      }
+
       try {
         const result = await tool.handler(args || {}, meta || {});
         if (result && typeof result === 'object' && result.isError && 'data' in result) {
@@ -534,6 +578,17 @@ export function createToolRegistry(
         }
         return { isError: false, data: result };
       } catch (err) {
+        if (err?.code === 'UNSAFE_UPDATE') {
+          return {
+            isError: true,
+            errorCode: 'UNSAFE_UPDATE',
+            data: {
+              error: 'UNSAFE_UPDATE',
+              tool: name,
+              message: err.message || String(err),
+            },
+          };
+        }
         return {
           isError: true,
           errorCode: 'TOOL_EXECUTION_ERROR',

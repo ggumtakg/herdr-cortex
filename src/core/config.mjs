@@ -41,6 +41,33 @@ function sleepSync(ms) {
   Atomics.wait(SLEEP_BUF, 0, 0, ms);
 }
 
+function realPathOrResolved(p) {
+  const resolved = path.resolve(p);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+/**
+ * True when the module at `importMetaUrl` is the script Node was started with.
+ * Node loads the main module from its real path while `process.argv[1]` keeps the path as typed,
+ * so a launch through a junction or symlink only matches when both sides are compared as real paths.
+ */
+export function isMainModule(importMetaUrl, argv1 = process.argv[1]) {
+  if (!importMetaUrl || !argv1) return false;
+  let modulePath;
+  try {
+    modulePath = fileURLToPath(importMetaUrl);
+  } catch {
+    return false;
+  }
+  const a = realPathOrResolved(modulePath);
+  const b = realPathOrResolved(argv1);
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
 /**
  * Resolve global cortex home directory.
  * Respects process.env.HERDR_CORTEX_HOME for test isolation.
@@ -440,7 +467,9 @@ const TYPE_PREFIX = {
 };
 
 /**
- * Format local ISO-8601 timestamp with timezone offset (e.g. 2026-11-22T21:15:00+09:00).
+ * Format local ISO-8601 timestamp with millisecond precision and timezone offset
+ * (e.g. 2026-11-22T21:15:00.042+09:00). Millisecond precision keeps documents saved
+ * within the same second in creation order.
  */
 export function formatIsoTimestamp(date = new Date()) {
   const d = date instanceof Date ? date : new Date(date);
@@ -450,10 +479,57 @@ export function formatIsoTimestamp(date = new Date()) {
   const absMin = Math.abs(offsetMin);
   const offH = pad(Math.floor(absMin / 60));
   const offM = pad(absMin % 60);
+  const ms = String(d.getMilliseconds()).padStart(3, '0');
   return (
     `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
-    + `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${sign}${offH}:${offM}`
+    + `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${ms}${sign}${offH}:${offM}`
   );
+}
+
+const TIMESTAMP_PARTS_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?)?$/i;
+
+/**
+ * Parse a document timestamp into epoch milliseconds.
+ * Accepts the current millisecond format, the older second-precision format, date-only values,
+ * and timestamps with or without a timezone offset (no offset = local time).
+ * Returns NaN when the value is not a recognizable timestamp.
+ */
+export function parseTimestampMs(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return NaN;
+  const m = TIMESTAMP_PARTS_RE.exec(raw);
+  if (!m) {
+    return Date.parse(raw);
+  }
+  const [, y, mo, d, h = '0', mi = '0', s = '0', frac = '', zone = ''] = m;
+  const fracMs = frac ? Number(`0.${frac}`) * 1000 : 0;
+  if (!zone) {
+    const local = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s)).getTime();
+    return local + fracMs;
+  }
+  let offsetMin = 0;
+  if (zone.toUpperCase() !== 'Z') {
+    const digits = zone.slice(1).replace(':', '');
+    offsetMin = (Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2, 4))) * (zone[0] === '-' ? -1 : 1);
+  }
+  const utc = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s));
+  return utc - offsetMin * 60000 + fracMs;
+}
+
+/**
+ * Chronological comparator for document timestamps of mixed precision or format.
+ * Values that cannot be parsed sort before parseable ones, and among themselves as plain strings.
+ */
+export function compareTimestamps(a, b) {
+  const ta = parseTimestampMs(a);
+  const tb = parseTimestampMs(b);
+  const aOk = Number.isFinite(ta);
+  const bOk = Number.isFinite(tb);
+  if (aOk && bOk) return ta < tb ? -1 : ta > tb ? 1 : 0;
+  if (aOk !== bOk) return aOk ? 1 : -1;
+  const sa = String(a ?? '');
+  const sb = String(b ?? '');
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
 }
 
 /**

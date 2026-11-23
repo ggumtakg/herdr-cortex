@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import {
   REPO_ROOT,
   assertInsideDir,
   atomicWriteJson,
   getProjectMemoryDir,
   getTierPaths,
+  isMainModule,
   isProjectEnabled,
   loadConfig,
 } from '../core/config.mjs';
@@ -634,7 +634,7 @@ function parseCliArgs(argv) {
   return { event: positional[0] || '' };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+if (isMainModule(import.meta.url)) {
   let output = {};
   try {
     const { event } = parseCliArgs(process.argv.slice(2));

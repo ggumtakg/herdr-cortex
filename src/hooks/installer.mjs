@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import {
   DEFAULT_CONFIG,
   REPO_ROOT,
   assertInsideDir,
   atomicWriteJson,
   atomicWriteText,
+  isMainModule,
 } from '../core/config.mjs';
 import { resolveEffectiveHome } from '../revive/tracker.mjs';
 
@@ -443,7 +443,7 @@ function logSummary(res) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+if (isMainModule(import.meta.url)) {
   const action = (process.argv[2] || '').trim().toLowerCase();
   const repoRoot = process.argv[3] ? path.resolve(process.argv[3]) : REPO_ROOT;
 

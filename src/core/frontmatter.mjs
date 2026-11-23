@@ -112,14 +112,116 @@ function parseInlineArray(rawInput) {
   return items;
 }
 
+const FRONTMATTER_KEY_RE = /^([A-Za-z0-9_-]+)\s*:(.*)$/;
+
 /**
- * Parse YAML frontmatter and Markdown body from raw UTF-8 text.
+ * Raised when a document cannot be rewritten without risking loss of content.
+ * Callers must not write anything; the file has to be fixed by hand.
  */
-export function parseMarkdownDoc(rawText) {
+export class UnsafeUpdateError extends Error {
+  constructor(reason) {
+    super(reason);
+    this.name = 'UnsafeUpdateError';
+    this.code = 'UNSAFE_UPDATE';
+    this.reason = reason;
+  }
+}
+
+/**
+ * Parse the value of the `key: value` entry that starts at fmLines[i].
+ * Returns { value, next } where `next` is the index of the first line after the entry.
+ */
+function parseFrontmatterValue(fmLines, i, restRaw) {
+  const rest = stripInlineComment(restRaw).trim();
+
+  // Block scalar: |, |-, >, >-
+  if (rest === '|' || rest === '|-' || rest === '>' || rest === '>-') {
+    const folded = rest.startsWith('>');
+    const blockLines = [];
+    let blockIndent = null;
+    let next = i + 1;
+
+    while (next < fmLines.length) {
+      const nextLine = fmLines[next];
+      if (nextLine.trim() === '') {
+        blockLines.push('');
+        next++;
+        continue;
+      }
+      const indentMatch = /^(\s+)/.exec(nextLine);
+      if (!indentMatch) break;
+      const indentLen = indentMatch[1].length;
+      if (blockIndent === null) blockIndent = indentLen;
+      if (indentLen < blockIndent) break;
+      blockLines.push(nextLine.slice(blockIndent));
+      next++;
+    }
+
+    while (blockLines.length > 0 && blockLines[blockLines.length - 1] === '') {
+      blockLines.pop();
+    }
+
+    let value;
+    if (folded) {
+      value = blockLines
+        .map((l, idx) => {
+          if (l === '') return '\n';
+          if (idx > 0 && blockLines[idx - 1] !== '') return ` ${l}`;
+          return l;
+        })
+        .join('');
+    } else {
+      value = blockLines.join('\n');
+    }
+    return { value, next };
+  }
+
+  // Inline array
+  if (rest.startsWith('[') && rest.endsWith(']')) {
+    return { value: parseInlineArray(rest), next: i + 1 };
+  }
+
+  // Empty value: could be followed by a block array (- item), indented or unindented
+  if (rest === '') {
+    const items = [];
+    let j = i + 1;
+    while (j < fmLines.length) {
+      const nextLine = fmLines[j];
+      if (!nextLine.trim()) {
+        j++;
+        continue;
+      }
+      if (/^\s*---/.test(nextLine)) break;
+      const itemMatch = /^\s*-(?:\s+(.*)|\s*)$/.exec(nextLine);
+      if (!itemMatch) break;
+      const parsed = parseScalar(itemMatch[1] ?? '');
+      if (parsed !== '') items.push(parsed);
+      j++;
+    }
+    if (items.length > 0) {
+      return { value: items, next: j };
+    }
+    return { value: '', next: i + 1 };
+  }
+
+  // Regular scalar
+  return { value: parseScalar(restRaw), next: i + 1 };
+}
+
+/**
+ * Parse YAML frontmatter and Markdown body, keeping the original frontmatter lines.
+ * Returns { frontmatter, body, hasFrontmatter, entries } where `entries` lists the frontmatter block
+ * in file order:
+ *   { key, lines }               a `key: value` entry the parser understood (with its value lines)
+ *   { key: null, lines, inert }  a line it did not interpret (`inert` = blank line or comment)
+ * `renderUpdatedMarkdownDoc` uses the entries to rewrite a document without dropping such lines.
+ */
+export function parseMarkdownDocDetailed(rawText) {
   const normalized = String(rawText ?? '').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+  const noFrontmatter = () => ({ frontmatter: {}, body: normalized, hasFrontmatter: false, entries: [] });
 
   if (!/^---[ \t]*(?:\n|$)/.test(normalized)) {
-    return { frontmatter: {}, body: normalized };
+    return noFrontmatter();
   }
 
   const lines = normalized.split('\n');
@@ -132,113 +234,44 @@ export function parseMarkdownDoc(rawText) {
   }
 
   if (closeIdx === -1) {
-    return { frontmatter: {}, body: normalized };
+    return noFrontmatter();
   }
 
   const fmLines = lines.slice(1, closeIdx);
+
+  // A leading `---` ... `---` block without a single `key: value` line is a pair of horizontal
+  // rules around ordinary text, not frontmatter: keep the whole file as body.
+  if (!fmLines.some((line) => FRONTMATTER_KEY_RE.test(line))) {
+    return noFrontmatter();
+  }
+
   let body = lines.slice(closeIdx + 1).join('\n');
   if (body.startsWith('\n')) body = body.slice(1);
 
   const frontmatter = {};
+  const entries = [];
   let i = 0;
 
   while (i < fmLines.length) {
     const line = fmLines[i];
     if (!line.trim() || line.trimStart().startsWith('#')) {
+      entries.push({ key: null, lines: [line], inert: true });
       i++;
       continue;
     }
 
-    const keyMatch = /^([A-Za-z0-9_-]+)\s*:(.*)$/.exec(line);
+    const keyMatch = FRONTMATTER_KEY_RE.exec(line);
     if (!keyMatch) {
+      entries.push({ key: null, lines: [line], inert: false });
       i++;
       continue;
     }
 
     const key = keyMatch[1];
-    const restRaw = keyMatch[2];
-    const rest = stripInlineComment(restRaw).trim();
-
-    // Block scalar: |, |-, >, >-
-    if (rest === '|' || rest === '|-' || rest === '>' || rest === '>-') {
-      const folded = rest.startsWith('>');
-      const blockLines = [];
-      let blockIndent = null;
-      i++;
-
-      while (i < fmLines.length) {
-        const nextLine = fmLines[i];
-        if (nextLine.trim() === '') {
-          blockLines.push('');
-          i++;
-          continue;
-        }
-        const indentMatch = /^(\s+)/.exec(nextLine);
-        if (!indentMatch) break;
-        const indentLen = indentMatch[1].length;
-        if (blockIndent === null) blockIndent = indentLen;
-        if (indentLen < blockIndent) break;
-        blockLines.push(nextLine.slice(blockIndent));
-        i++;
-      }
-
-      while (blockLines.length > 0 && blockLines[blockLines.length - 1] === '') {
-        blockLines.pop();
-      }
-
-      let value;
-      if (folded) {
-        value = blockLines
-          .map((l, idx) => {
-            if (l === '') return '\n';
-            if (idx > 0 && blockLines[idx - 1] !== '') return ` ${l}`;
-            return l;
-          })
-          .join('');
-      } else {
-        value = blockLines.join('\n');
-      }
-      frontmatter[key] = value;
-      continue;
-    }
-
-    // Inline array
-    if (rest.startsWith('[') && rest.endsWith(']')) {
-      frontmatter[key] = parseInlineArray(rest);
-      i++;
-      continue;
-    }
-
-    // Empty value: could be followed by a block array (- item), indented or unindented
-    if (rest === '') {
-      const items = [];
-      let j = i + 1;
-      while (j < fmLines.length) {
-        const nextLine = fmLines[j];
-        if (!nextLine.trim()) {
-          j++;
-          continue;
-        }
-        if (/^\s*---/.test(nextLine)) break;
-        const itemMatch = /^\s*-(?:\s+(.*)|\s*)$/.exec(nextLine);
-        if (!itemMatch) break;
-        const parsed = parseScalar(itemMatch[1] ?? '');
-        if (parsed !== '') items.push(parsed);
-        j++;
-      }
-      if (items.length > 0) {
-        frontmatter[key] = items;
-        i = j;
-      } else {
-        frontmatter[key] = '';
-        i++;
-      }
-      continue;
-    }
-
-    // Regular scalar
-    frontmatter[key] = parseScalar(restRaw);
-    i++;
+    const { value, next } = parseFrontmatterValue(fmLines, i, keyMatch[2]);
+    frontmatter[key] = value;
+    entries.push({ key, lines: fmLines.slice(i, next) });
+    i = next;
   }
 
   // Coerce numeric document reference fields to strings
@@ -253,6 +286,14 @@ export function parseMarkdownDoc(rawText) {
     frontmatter.derived_from = frontmatter.derived_from.map((v) => String(v));
   }
 
+  return { frontmatter, body, hasFrontmatter: true, entries };
+}
+
+/**
+ * Parse YAML frontmatter and Markdown body from raw UTF-8 text.
+ */
+export function parseMarkdownDoc(rawText) {
+  const { frontmatter, body } = parseMarkdownDocDetailed(rawText);
   return { frontmatter, body };
 }
 
@@ -271,6 +312,55 @@ function formatYamlScalar(value) {
     return JSON.stringify(str);
   }
   return str;
+}
+
+/**
+ * Format one frontmatter key as YAML lines. Returns [] when the key is omitted from the output.
+ */
+function formatFrontmatterEntry(key, val) {
+  if (val === undefined || val === null) return [];
+
+  if (Array.isArray(val)) {
+    const clean = val.map((v) => String(v).trim()).filter(Boolean);
+    if (clean.length === 0) {
+      return INLINE_ARRAY_KEYS.has(key) ? [`${key}: []`] : [];
+    }
+    if (INLINE_ARRAY_KEYS.has(key) && clean.every((v) => !v.includes('\n'))) {
+      return [`${key}: [${clean.map((v) => formatYamlScalar(v)).join(', ')}]`];
+    }
+    const out = [`${key}:`];
+    for (const item of clean) {
+      out.push(`  - ${formatYamlScalar(item)}`);
+    }
+    return out;
+  }
+
+  const strVal = typeof val === 'string' ? val : String(val);
+  if (strVal === '' && key !== 'title' && key !== 'summary') {
+    return [];
+  }
+
+  if (typeof val === 'string' && val.includes('\n')) {
+    const out = [`${key}: |-`];
+    for (const bl of val.replace(/\r\n/g, '\n').split('\n')) {
+      out.push(`  ${bl}`);
+    }
+    return out;
+  }
+
+  return [`${key}: ${formatYamlScalar(val)}`];
+}
+
+function normalizeBodyForWrite(body) {
+  return String(body ?? '').replace(/\r\n/g, '\n').replace(/^\n+/, '');
+}
+
+function joinFrontmatterAndBody(lines, body) {
+  const cleanBody = normalizeBodyForWrite(body);
+  if (!cleanBody) {
+    return `${lines.join('\n')}\n`;
+  }
+  return `${lines.join('\n')}\n\n${cleanBody.endsWith('\n') ? cleanBody : `${cleanBody}\n`}`;
 }
 
 /**
@@ -293,55 +383,151 @@ export function serializeMarkdownDoc(frontmatter = {}, body = '') {
   }
 
   const lines = ['---'];
-
   for (const key of orderedKeys) {
-    const val = frontmatter[key];
-    if (val === undefined || val === null) continue;
+    for (const line of formatFrontmatterEntry(key, frontmatter[key])) {
+      lines.push(line);
+    }
+  }
+  lines.push('---');
+  return joinFrontmatterAndBody(lines, body);
+}
 
-    if (Array.isArray(val)) {
-      const clean = val.map((v) => String(v).trim()).filter(Boolean);
-      if (clean.length === 0) {
-        if (INLINE_ARRAY_KEYS.has(key)) {
-          lines.push(`${key}: []`);
-        }
-        continue;
+function frontmatterValuesEqual(a, b) {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => String(v) === String(b[i]));
+  }
+  return a === b;
+}
+
+function stripTrailingNewlines(text) {
+  let end = text.length;
+  while (end > 0 && text[end - 1] === '\n') end--;
+  return text.slice(0, end);
+}
+
+/**
+ * True when the key entry at `index` is followed by indented lines the parser did not interpret
+ * (children of a nested mapping, the rest of a multi-line scalar, ...). Those lines belong to the
+ * key's value, so replacing the key would silently detach or drop them.
+ */
+function hasUninterpretedContinuation(entries, index) {
+  for (let j = index + 1; j < entries.length; j++) {
+    const entry = entries[j];
+    if (entry.key !== null) return false;
+    if (entry.inert) continue;
+    return /^\s/.test(entry.lines[0]);
+  }
+  return false;
+}
+
+function uninterpretedLines(entries) {
+  const out = [];
+  for (const entry of entries) {
+    if (entry.key === null && entry.lines[0].trim() !== '') out.push(entry.lines[0]);
+  }
+  return out;
+}
+
+/**
+ * Re-read the rewritten text and confirm that everything the update did not touch is still there:
+ * the body, every frontmatter line the parser did not interpret, and the value of every unchanged key.
+ */
+function assertRewritePreservesContent(parsed, frontmatter, body, text) {
+  const reparsed = parseMarkdownDocDetailed(text);
+  if (!reparsed.hasFrontmatter) {
+    throw new UnsafeUpdateError('the rewritten frontmatter would no longer be recognized as frontmatter');
+  }
+  if (stripTrailingNewlines(reparsed.body) !== stripTrailingNewlines(normalizeBodyForWrite(body))) {
+    throw new UnsafeUpdateError('the document body would not survive the rewrite unchanged');
+  }
+  const before = uninterpretedLines(parsed.entries);
+  const after = uninterpretedLines(reparsed.entries);
+  if (before.length !== after.length || before.some((line, i) => line !== after[i])) {
+    throw new UnsafeUpdateError('frontmatter lines this tool does not interpret (comments, nested or multi-line YAML) would not survive the rewrite unchanged');
+  }
+  for (const key of Object.keys(parsed.frontmatter)) {
+    const original = parsed.frontmatter[key];
+    const untouched = Object.prototype.hasOwnProperty.call(frontmatter, key)
+      && frontmatterValuesEqual(original, frontmatter[key]);
+    if (untouched && !frontmatterValuesEqual(original, reparsed.frontmatter[key])) {
+      throw new UnsafeUpdateError(`frontmatter key "${key}" was not changed but would be read differently after the rewrite`);
+    }
+  }
+}
+
+/**
+ * Rewrite a parsed document (`parseMarkdownDocDetailed` result) with an updated frontmatter object and body.
+ *
+ * Unlike `serializeMarkdownDoc`, only the keys whose value actually changed are re-formatted. Every other
+ * frontmatter line is emitted exactly as it was read, in place: unchanged keys, comments, blank lines,
+ * and lines the parser does not understand (nested YAML and the like). New keys are inserted at their
+ * canonical position, so a document written by this tool comes out identical to `serializeMarkdownDoc`.
+ *
+ * Throws `UnsafeUpdateError` instead of returning text when the rewrite could lose content.
+ */
+export function renderUpdatedMarkdownDoc(parsed, frontmatter = {}, body = '') {
+  if (!parsed || !parsed.hasFrontmatter) {
+    // No frontmatter block to preserve: the whole original file is the body.
+    return serializeMarkdownDoc(frontmatter, body);
+  }
+
+  const { entries } = parsed;
+  const hasKey = (key) => Object.prototype.hasOwnProperty.call(frontmatter, key);
+  const lastEntryOfKey = new Map();
+  entries.forEach((entry, idx) => {
+    if (entry.key !== null) lastEntryOfKey.set(entry.key, idx);
+  });
+
+  const canonicalRank = new Map(CANONICAL_KEYS.map((key, idx) => [key, idx]));
+  const newCanonicalKeys = CANONICAL_KEYS.filter((key) => hasKey(key) && !lastEntryOfKey.has(key));
+  const newOtherKeys = Object.keys(frontmatter).filter((key) => !canonicalRank.has(key) && !lastEntryOfKey.has(key));
+
+  const lines = ['---'];
+  const emit = (entryLines) => {
+    for (const line of entryLines) lines.push(line);
+  };
+
+  for (let idx = 0; idx < entries.length; idx++) {
+    const entry = entries[idx];
+    if (entry.key === null) {
+      emit(entry.lines);
+      continue;
+    }
+
+    const rank = canonicalRank.get(entry.key);
+    if (rank !== undefined) {
+      while (newCanonicalKeys.length > 0 && canonicalRank.get(newCanonicalKeys[0]) < rank) {
+        const key = newCanonicalKeys.shift();
+        emit(formatFrontmatterEntry(key, frontmatter[key]));
       }
-      if (INLINE_ARRAY_KEYS.has(key) && clean.every((v) => !v.includes('\n'))) {
-        lines.push(`${key}: [${clean.map((v) => formatYamlScalar(v)).join(', ')}]`);
-      } else {
-        lines.push(`${key}:`);
-        for (const item of clean) {
-          lines.push(`  - ${formatYamlScalar(item)}`);
-        }
-      }
+    }
+
+    // With duplicate keys only the last one is effective; earlier ones are kept as they are.
+    const isEffective = lastEntryOfKey.get(entry.key) === idx;
+    const unchanged = !isEffective
+      || (hasKey(entry.key) && frontmatterValuesEqual(parsed.frontmatter[entry.key], frontmatter[entry.key]));
+    if (unchanged) {
+      emit(entry.lines);
       continue;
     }
 
-    const strVal = typeof val === 'string' ? val : String(val);
-    if (strVal === '' && key !== 'title' && key !== 'summary' && key !== 'due') {
-      continue;
+    if (hasUninterpretedContinuation(entries, idx)) {
+      throw new UnsafeUpdateError(
+        `frontmatter key "${entry.key}" is followed by indented lines this tool does not interpret (nested or multi-line YAML), so replacing its value could detach or drop them`,
+      );
     }
-    if (strVal === '' && key === 'due') {
-      continue;
-    }
+    emit(formatFrontmatterEntry(entry.key, frontmatter[entry.key]));
+  }
 
-    if (typeof val === 'string' && val.includes('\n')) {
-      lines.push(`${key}: |-`);
-      for (const bl of val.replace(/\r\n/g, '\n').split('\n')) {
-        lines.push(`  ${bl}`);
-      }
-      continue;
-    }
-
-    lines.push(`${key}: ${formatYamlScalar(val)}`);
+  for (const key of [...newCanonicalKeys, ...newOtherKeys]) {
+    emit(formatFrontmatterEntry(key, frontmatter[key]));
   }
 
   lines.push('---');
-  const cleanBody = String(body ?? '').replace(/\r\n/g, '\n').replace(/^\n+/, '');
-  if (!cleanBody) {
-    return `${lines.join('\n')}\n`;
-  }
-  return `${lines.join('\n')}\n\n${cleanBody.endsWith('\n') ? cleanBody : `${cleanBody}\n`}`;
+  const text = joinFrontmatterAndBody(lines, body);
+  assertRewritePreservesContent(parsed, frontmatter, body, text);
+  return text;
 }
 
 const URL_RE = /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i;
@@ -411,6 +597,101 @@ function isLikelyFilePath(candidate) {
 }
 
 /**
+ * Build a lookup "first index >= from of any character in `chars`" (text.length when there is none).
+ * The last answer is cached, so a caller whose `from` only moves forward scans the text once in total.
+ */
+function makeForwardFinder(text, chars) {
+  let cachedFrom = 0;
+  let cachedIndex = -1;
+  return (from) => {
+    if (cachedIndex >= 0 && from >= cachedFrom && from <= cachedIndex) return cachedIndex;
+    let i = from;
+    while (i < text.length && !chars.includes(text[i])) i++;
+    cachedFrom = from;
+    cachedIndex = i;
+    return i;
+  };
+}
+
+/**
+ * Targets of `[[target]]` / `[[target|alias]]` wiki links, in document order.
+ * Linear-time scanner returning exactly the capture group of
+ * /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g, which backtracks quadratically on long runs of "[".
+ */
+export function scanWikiLinkTargets(text) {
+  const src = String(text ?? '');
+  const targets = [];
+  const nextStop = makeForwardFinder(src, ']|');
+  const nextClose = makeForwardFinder(src, ']');
+  let pos = 0;
+
+  while (true) {
+    const open = src.indexOf('[[', pos);
+    if (open === -1) break;
+
+    const stop = nextStop(open + 2); // end of the target: first "]" or "|"
+    let end = -1;
+    if (stop > open + 2 && stop < src.length) {
+      const close = src[stop] === '|' ? nextClose(stop + 1) : stop;
+      if (src[close] === ']' && src[close + 1] === ']') end = close + 2;
+    }
+
+    if (end === -1) {
+      pos = open + 1;
+      continue;
+    }
+    targets.push(src.slice(open + 2, stop));
+    pos = end;
+  }
+  return targets;
+}
+
+/**
+ * Targets of `[label](target)` Markdown links (images `![...](...)` excluded), in document order.
+ * Linear-time scanner returning exactly the capture group of
+ * /(?<!!)\[[^\]]+\]\(([^)]+)\)/g, which backtracks quadratically on long runs of "[" or "[a](".
+ */
+export function scanMarkdownLinkTargets(text) {
+  const src = String(text ?? '');
+  const targets = [];
+  const nextBracketClose = makeForwardFinder(src, ']');
+  const nextParenClose = makeForwardFinder(src, ')');
+  let pos = 0;
+
+  while (true) {
+    const open = src.indexOf('[', pos);
+    if (open === -1) break;
+    pos = open + 1;
+    if (open > 0 && src[open - 1] === '!') continue;
+
+    const close = nextBracketClose(open + 1); // label must be non-empty and followed by "("
+    if (close === open + 1 || close >= src.length || src[close + 1] !== '(') continue;
+
+    const paren = nextParenClose(close + 2); // target must be non-empty
+    if (paren === close + 2 || paren >= src.length) continue;
+
+    targets.push(src.slice(close + 2, paren));
+    pos = paren + 1;
+  }
+  return targets;
+}
+
+/**
+ * Heading text of an ATX heading line (`# Title`), or null when the line is not a heading.
+ * Linear-time equivalent of /^(#{1,6})\s+(.+?)\s*$/ followed by trimming the capture; that pattern
+ * backtracks quadratically on a heading with a long run of spaces in the middle.
+ */
+export function parseHeadingLine(line) {
+  const prefix = /^#{1,6}\s/.exec(line);
+  if (!prefix) return null;
+  const rest = line.slice(prefix[0].length);
+  const text = rest.trim();
+  // `.` never matches a line terminator, so the original pattern rejects a heading that contains one.
+  if (text === '') return /[^\r\u2028\u2029]/.test(rest) ? '' : null;
+  return /[\r\u2028\u2029]/.test(text) ? null : text;
+}
+
+/**
  * Extract structured references from Markdown body and frontmatter:
  * - linksTo: [[doc-id]] wikilinks
  * - fileLinks: [label](path) markdown links (ignoring URLs)
@@ -430,19 +711,17 @@ export function extractReferences(content, frontmatter = {}) {
   const derivedFrom = new Set();
 
   // 1. [[doc-id]] or [[doc-id|alias]]
-  const wikiRe = /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
-  let m;
-  while ((m = wikiRe.exec(text)) !== null) {
-    const id = m[1].trim();
+  for (const target of scanWikiLinkTargets(text)) {
+    const id = target.trim();
     if (isValidId(id)) {
       linksTo.add(id);
     }
   }
 
   // 2. [label](path) markdown links (ignore images ![...] and URLs)
-  const mdLinkRe = /(?<!!)\[[^\]]+\]\(([^)]+)\)/g;
-  while ((m = mdLinkRe.exec(text)) !== null) {
-    const rawTarget = m[1].trim().split(/\s+/)[0].replace(/^<|>$/g, '');
+  let m;
+  for (const target of scanMarkdownLinkTargets(text)) {
+    const rawTarget = target.trim().split(/\s+/)[0].replace(/^<|>$/g, '');
     if (!rawTarget || URL_RE.test(rawTarget)) continue;
     const withoutFragment = rawTarget.split('#')[0].split('?')[0];
     if (!withoutFragment) continue;
@@ -578,10 +857,10 @@ export function chunkMarkdown(content, { maxChars = 800, overlap = 100 } = {}) {
         currentLines.push(line);
         continue;
       }
-      const headingMatch = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
-      if (headingMatch) {
+      const headingText = parseHeadingLine(line);
+      if (headingText !== null) {
         pushSection();
-        currentHeading = headingMatch[2].trim();
+        currentHeading = headingText;
         currentLines.push(line);
         continue;
       }

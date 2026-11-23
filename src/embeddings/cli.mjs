@@ -1,7 +1,6 @@
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { CortexStore } from '../core/store.mjs';
-import { isProjectEnabled, loadConfig } from '../core/config.mjs';
+import { isMainModule, isProjectEnabled, loadConfig } from '../core/config.mjs';
 import { processPendingEmbeddings, resolveEmbeddingProvider } from './index.mjs';
 
 function parseArgs(argv) {
@@ -129,7 +128,7 @@ export async function runEmbedCli(argv = process.argv.slice(2), { provider: inje
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+if (isMainModule(import.meta.url)) {
   runEmbedCli().catch((err) => {
     process.stderr.write(`embed cli error: ${err?.stack || err}\n`);
     process.exitCode = 1;

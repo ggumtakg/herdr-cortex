@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import {
   REPO_ROOT,
   assertInsideDir,
   getProjectMemoryDir,
+  isMainModule,
   isProjectEnabled,
   isValidId,
   loadConfig,
@@ -540,7 +540,7 @@ function parseCliArgs(argv) {
   };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+if (isMainModule(import.meta.url)) {
   try {
     const { event, part } = parseCliArgs(process.argv.slice(2));
     const raw = fs.readFileSync(0, 'utf8').replace(/^\uFEFF/, '');
