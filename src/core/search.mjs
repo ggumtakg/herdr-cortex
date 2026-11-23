@@ -3,6 +3,11 @@ import { hasVectorTable, readIndexMeta, syncFromDisk } from './db.mjs';
 import { getNeighbors } from './graph.mjs';
 
 const RRF_K = 60;
+const DEFAULT_MAX_VEC_DISTANCE = 0.65;
+
+const TRIM_PUNCT_RE = /^[?.!,:;'"`()\[\]{}]+|[?.!,:;'"`()\[\]{}]+$/g;
+const HANGUL_3PLUS_RE = /^[가-힣]{3,}$/;
+const HANGUL_PARTICLE_RE = /(?:에서|으로|에게|부터|까지|은|는|이|가|을|를|의|에|로|와|과|도|만)$/;
 
 function parseTagsJson(raw) {
   try {
@@ -21,14 +26,43 @@ function escapeLike(token) {
   return String(token).replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
-export function tokenizeQuery(query) {
+function stripHangulParticle(token) {
+  if (!HANGUL_3PLUS_RE.test(token)) return null;
+  const stem = token.replace(HANGUL_PARTICLE_RE, '');
+  if (stem.length >= 2 && stem.length < token.length) {
+    return stem;
+  }
+  return null;
+}
+
+function extractQueryTokens(query) {
   const cleaned = String(query || '').trim();
-  if (!cleaned) return [];
-  const rawTokens = cleaned
+  if (!cleaned) return { primaryTokens: [], stemTokens: [] };
+
+  const rawParts = cleaned
     .split(/[\s,;()\[\]{}|/\\]+/)
-    .map((t) => t.replace(/^["'`]+|["'`]+$/g, '').trim())
+    .map((t) => t.replace(TRIM_PUNCT_RE, '').trim())
     .filter(Boolean);
-  return [...new Set(rawTokens)];
+
+  const primaryTokens = [...new Set(rawParts)];
+  const primaryLower = new Set(primaryTokens.map((t) => t.toLowerCase()));
+  const stemTokens = [];
+  const seenStems = new Set();
+
+  for (const token of primaryTokens) {
+    const stem = stripHangulParticle(token);
+    if (stem && !primaryLower.has(stem) && !seenStems.has(stem)) {
+      seenStems.add(stem);
+      stemTokens.push({ stem, parentKey: token.toLowerCase() });
+    }
+  }
+
+  return { primaryTokens, stemTokens };
+}
+
+export function tokenizeQuery(query) {
+  const { primaryTokens, stemTokens } = extractQueryTokens(query);
+  return [...primaryTokens, ...stemTokens.map((s) => s.stem)];
 }
 
 function buildFilterWhere({ type, session, branch, file, include_superseded }) {
@@ -66,22 +100,87 @@ function buildFilterWhere({ type, session, branch, file, include_superseded }) {
   };
 }
 
-function runKeywordSearch(db, query, candidateIds, candidateMap, { include_superseded = false } = {}) {
+function hydrateDocsByIds(db, docIds) {
+  const uniqueIds = [...new Set(docIds.filter(Boolean))];
+  const map = new Map();
+  if (uniqueIds.length === 0) return map;
+
+  const BATCH = 200;
+  for (let i = 0; i < uniqueIds.length; i += BATCH) {
+    const batch = uniqueIds.slice(i, i + BATCH);
+    const placeholders = batch.map(() => '?').join(', ');
+    const rows = db
+      .prepare(`
+        SELECT d.id, d.type, d.status, d.session, d.branch, d.title, d.summary, d.tags, d.due, d.updated_at
+        FROM docs d
+        WHERE d.id IN (${placeholders})
+      `)
+      .all(...batch);
+    for (const row of rows) {
+      map.set(row.id, row);
+    }
+  }
+  return map;
+}
+
+function filterDocIdsByWhere(db, docIds, whereSql, filterParams) {
+  const uniqueIds = [...new Set(docIds.filter(Boolean))];
+  const allowed = new Set();
+  if (uniqueIds.length === 0) return allowed;
+
+  const BATCH = 200;
+  for (let i = 0; i < uniqueIds.length; i += BATCH) {
+    const batch = uniqueIds.slice(i, i + BATCH);
+    const placeholders = batch.map(() => '?').join(', ');
+    const rows = db
+      .prepare(`SELECT d.id FROM docs d WHERE d.id IN (${placeholders}) AND (${whereSql})`)
+      .all(...batch, ...filterParams);
+    for (const row of rows) {
+      allowed.add(row.id);
+    }
+  }
+  return allowed;
+}
+
+function runKeywordSearch(db, query, { whereSql, filterParams, maxLimit = 10 }) {
   const trimmed = String(query || '').trim();
-  if (!trimmed || candidateIds.size === 0) return [];
+  if (!trimmed) return [];
 
-  const tokens = tokenizeQuery(trimmed);
-  if (tokens.length === 0) return [];
+  const { primaryTokens, stemTokens } = extractQueryTokens(trimmed);
+  if (primaryTokens.length === 0) return [];
 
-  const longTokens = tokens.filter((t) => t.length >= 3);
-  const shortTokens = tokens.filter((t) => t.length >= 1 && t.length <= 2);
+  const ftsLimit = Math.max(100, maxLimit * 5);
+  const likeLimit = Math.max(200, maxLimit * 10);
+
+  const ftsItems = [];
+  const likeItems = [];
+
+  for (const token of primaryTokens) {
+    const key = token.toLowerCase();
+    if (token.length >= 3) {
+      ftsItems.push({ token, weight: 1.0, tokenKey: key });
+    } else {
+      likeItems.push({ token, weight: 1.0, tokenKey: key });
+    }
+  }
+
+  for (const { stem, parentKey } of stemTokens) {
+    if (stem.length >= 3) {
+      ftsItems.push({ token: stem, weight: 0.75, tokenKey: parentKey });
+    } else {
+      likeItems.push({ token: stem, weight: 0.75, tokenKey: parentKey });
+    }
+  }
 
   const docScores = new Map();
   const docMatchedTokens = new Map();
+  const docUpdatedAt = new Map();
 
-  const addScore = (docId, delta, tokenKey) => {
-    if (!candidateIds.has(docId)) return;
+  const addScore = (docId, delta, tokenKey, updatedAt) => {
     docScores.set(docId, (docScores.get(docId) || 0) + delta);
+    if (updatedAt && !docUpdatedAt.has(docId)) {
+      docUpdatedAt.set(docId, updatedAt);
+    }
     if (tokenKey) {
       let set = docMatchedTokens.get(docId);
       if (!set) {
@@ -92,82 +191,81 @@ function runKeywordSearch(db, query, candidateIds, candidateMap, { include_super
     }
   };
 
-  // 1. FTS5 trigram search for 3+ char tokens
+  // 1. FTS5 trigram search with SQL pushdown of structured filters BEFORE LIMIT
   const ftsStmt = db.prepare(`
-    SELECT doc_id, bm25(docs_fts, 0.0, 3.0, 2.0, 1.5, 1.0) AS rank_score
+    SELECT d.id AS doc_id, d.updated_at, bm25(docs_fts, 0.0, 3.0, 2.0, 1.5, 1.0) AS rank_score
     FROM docs_fts
-    WHERE docs_fts MATCH ?
+    JOIN docs d ON d.id = docs_fts.doc_id
+    WHERE (${whereSql}) AND docs_fts MATCH ?
     ORDER BY rank_score ASC
-    LIMIT 100
+    LIMIT ?
   `);
 
-  const runFtsToken = (token, weight, tokenKey) => {
+  for (const item of ftsItems) {
     try {
-      const rows = ftsStmt.all(escapeFtsPhrase(token));
+      const rows = ftsStmt.all(...filterParams, escapeFtsPhrase(item.token), ftsLimit);
       for (const row of rows) {
-        // SQLite bm25() returns negative values where more negative = better match
         const mag = Math.max(0.1, Math.abs(Number(row.rank_score) || 0) + 1.0);
-        addScore(row.doc_id, mag * weight, tokenKey);
+        addScore(row.doc_id, mag * item.weight, item.tokenKey, row.updated_at);
       }
     } catch {
-      // Fallback to LIKE below if FTS5 rejects a special token
-      shortTokens.push(token);
+      // Fallback to LIKE if FTS5 rejects a special token
+      likeItems.push(item);
     }
-  };
-
-  for (const token of longTokens) {
-    runFtsToken(token, 1.0, token.toLowerCase());
   }
 
-  // Also run phrase FTS5 boost when multi-word query is >= 3 chars (e.g. "기억 복구")
-  if (trimmed.length >= 3 && tokens.length > 1) {
+  // Phrase FTS5 boost for multi-word queries >= 3 chars (punctuation-cleaned)
+  const cleanPhrase = primaryTokens.join(' ');
+  if (cleanPhrase.length >= 3 && primaryTokens.length > 1) {
     try {
-      const rows = ftsStmt.all(escapeFtsPhrase(trimmed));
+      const rows = ftsStmt.all(...filterParams, escapeFtsPhrase(cleanPhrase), ftsLimit);
       for (const row of rows) {
         const mag = Math.max(0.1, Math.abs(Number(row.rank_score) || 0) + 1.0);
-        addScore(row.doc_id, mag * 0.8, null);
+        addScore(row.doc_id, mag * 0.8, null, row.updated_at);
       }
     } catch {
       // ignore phrase FTS syntax edge cases
     }
   }
 
-  // 2. Hybrid LIKE fallback for 1-2 char tokens (e.g. "압축", "락", "훅", "DB")
-  const uniqueShort = [...new Set(shortTokens)];
-  if (uniqueShort.length > 0) {
-    const statusClause = include_superseded ? '' : "status NOT IN ('superseded', 'archived') AND ";
+  // 2. Hybrid LIKE fallback for 1-2 char tokens & short Hangul stems with SQL pushdown
+  if (likeItems.length > 0) {
     const likeStmt = db.prepare(`
-      SELECT id, title, summary, tags, content
-      FROM docs
-      WHERE ${statusClause}(
-        LOWER(title) LIKE ? ESCAPE '\\'
-        OR LOWER(summary) LIKE ? ESCAPE '\\'
-        OR LOWER(tags) LIKE ? ESCAPE '\\'
-        OR LOWER(content) LIKE ? ESCAPE '\\'
+      SELECT d.id, d.title, d.summary, d.tags, d.content, d.updated_at
+      FROM docs d
+      WHERE (${whereSql}) AND (
+        LOWER(d.title) LIKE ? ESCAPE '\\'
+        OR LOWER(d.summary) LIKE ? ESCAPE '\\'
+        OR LOWER(d.tags) LIKE ? ESCAPE '\\'
+        OR LOWER(d.content) LIKE ? ESCAPE '\\'
       )
-      ORDER BY updated_at DESC
-      LIMIT 200
+      ORDER BY d.updated_at DESC
+      LIMIT ?
     `);
 
-    for (const token of uniqueShort) {
-      const lower = token.toLowerCase();
+    const seenLikeTokens = new Set();
+    for (const item of likeItems) {
+      const lower = item.token.toLowerCase();
+      const dedupeKey = `${lower}\0${item.tokenKey}`;
+      if (seenLikeTokens.has(dedupeKey)) continue;
+      seenLikeTokens.add(dedupeKey);
+
       const pattern = `%${escapeLike(lower)}%`;
-      const rows = likeStmt.all(pattern, pattern, pattern, pattern);
+      const rows = likeStmt.all(...filterParams, pattern, pattern, pattern, pattern, likeLimit);
       for (const row of rows) {
-        if (!candidateIds.has(row.id)) continue;
         let fieldScore = 0;
         if (String(row.title || '').toLowerCase().includes(lower)) fieldScore += 3.0;
         if (String(row.summary || '').toLowerCase().includes(lower)) fieldScore += 2.0;
         if (String(row.tags || '').toLowerCase().includes(lower)) fieldScore += 1.5;
         if (String(row.content || '').toLowerCase().includes(lower)) fieldScore += 1.0;
         if (fieldScore > 0) {
-          addScore(row.id, fieldScore, lower);
+          addScore(row.id, fieldScore * item.weight, item.tokenKey, row.updated_at);
         }
       }
     }
   }
 
-  const totalTokens = tokens.length;
+  const totalTokens = primaryTokens.length;
   const ranked = [];
   for (const [docId, rawScore] of docScores.entries()) {
     const matchedCount = docMatchedTokens.get(docId)?.size || 0;
@@ -176,7 +274,7 @@ function runKeywordSearch(db, query, candidateIds, candidateMap, { include_super
       docId,
       score: rawScore * coverageBoost,
       matchedTokens: matchedCount,
-      updatedAt: candidateMap.get(docId)?.updated_at || '',
+      updatedAt: docUpdatedAt.get(docId) || '',
     });
   }
 
@@ -184,22 +282,56 @@ function runKeywordSearch(db, query, candidateIds, candidateMap, { include_super
   return ranked;
 }
 
-function runVectorSearch(db, tierDir, queryVec, candidateIds, limit) {
+function getVecRowCount(db, vecAvailable) {
+  if (!vecAvailable || !hasVectorTable(db)) return 0;
+  try {
+    const row = db.prepare('SELECT COUNT(*) AS cnt FROM doc_chunks_vec').get();
+    return Number(row?.cnt) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function runVectorSearch(
+  db,
+  queryVec,
+  {
+    whereSql,
+    filterParams,
+    type = '',
+    session = '',
+    branch = '',
+    file = '',
+    include_superseded = false,
+    limit = 10,
+    maxDistance = DEFAULT_MAX_VEC_DISTANCE,
+  } = {},
+) {
   if (!queryVec || !(queryVec instanceof Float32Array) || queryVec.length === 0) {
     return [];
   }
   if (!hasVectorTable(db)) return [];
 
-  const meta = readIndexMeta(tierDir);
+  const meta = readIndexMeta(db);
   if (meta.dimensions > 0 && meta.dimensions !== queryVec.length) {
     return [];
   }
 
-  const countRow = db.prepare('SELECT COUNT(*) AS cnt FROM doc_chunks_vec').get();
-  if (!countRow || Number(countRow.cnt) === 0) return [];
-
   const k = BigInt(Math.max(limit * 6, 40));
   const queryBytes = new Uint8Array(queryVec.buffer, queryVec.byteOffset, queryVec.byteLength);
+
+  // CRITICAL sqlite-vec rule: use `!=` chains (NEVER `NOT IN`) so vec0 pushes down predicates cleanly.
+  const vecClauses = ['embedding MATCH ?', 'k = ?'];
+  const vecParams = [queryBytes, k];
+
+  if (!include_superseded) {
+    vecClauses.push("status != 'superseded'");
+    vecClauses.push("status != 'archived'");
+  }
+  if (type) {
+    vecClauses.push('type = ?');
+    vecParams.push(String(type).trim());
+  }
 
   let rows;
   try {
@@ -207,27 +339,38 @@ function runVectorSearch(db, tierDir, queryVec, candidateIds, limit) {
       .prepare(`
         SELECT doc_id, distance
         FROM doc_chunks_vec
-        WHERE embedding MATCH ? AND k = ?
+        WHERE ${vecClauses.join(' AND ')}
         ORDER BY distance ASC
       `)
-      .all(queryBytes, k);
+      .all(...vecParams);
   } catch {
     return [];
   }
 
   const bestByDoc = new Map();
   for (const row of rows) {
-    if (!candidateIds.has(row.doc_id)) continue;
     const dist = Number(row.distance);
+    if (!Number.isFinite(dist) || dist > maxDistance) continue;
     const prev = bestByDoc.get(row.doc_id);
     if (prev === undefined || dist < prev) {
       bestByDoc.set(row.doc_id, dist);
     }
   }
 
-  return [...bestByDoc.entries()]
-    .map(([docId, distance]) => ({ docId, distance }))
-    .sort((a, b) => a.distance - b.distance);
+  if (bestByDoc.size === 0) return [];
+
+  // Always verify candidates against canonical documents table (guards against
+  // stale doc_chunks_vec.status after disableVec syncs AND applies session/branch/file filters)
+  const allowedIds = filterDocIdsByWhere(db, [...bestByDoc.keys()], whereSql, filterParams);
+
+  const results = [];
+  for (const [docId, distance] of bestByDoc.entries()) {
+    if (!allowedIds.has(docId)) continue;
+    results.push({ docId, distance });
+  }
+
+  results.sort((a, b) => a.distance - b.distance);
+  return results;
 }
 
 function computeRecencyBoost(updatedAt) {
@@ -252,17 +395,106 @@ export async function searchMemory(store, params = {}) {
     file = '',
     include_superseded = false,
     limit = 10,
+    maxDistance = DEFAULT_MAX_VEC_DISTANCE,
     embeddingProvider = null,
   } = params;
 
   const maxLimit = Math.max(1, Math.min(100, Number(limit) || 10));
   const scopes = scope === 'all' ? ['project', 'global'] : [scope];
   const trimmedQuery = String(query || '').trim();
+  const safeMaxDist = Number.isFinite(Number(maxDistance)) ? Number(maxDistance) : DEFAULT_MAX_VEC_DISTANCE;
 
-  // Compute query embedding once (gracefully degrade on offline/error)
+  const { whereSql, params: filterParams } = buildFilterWhere({
+    type,
+    session,
+    branch,
+    file,
+    include_superseded: Boolean(include_superseded),
+  });
+
+  // 1. Open only existing tiers lazily (never create .memory/ on read-only search)
+  const activeTiers = [];
+  for (const s of scopes) {
+    const tier = typeof store.getTierIfExists === 'function'
+      ? store.getTierIfExists(s)
+      : store.getTier(s);
+    if (!tier) continue;
+    syncFromDisk(tier.db, tier.dir);
+    const vecRowCount = trimmedQuery ? getVecRowCount(tier.db, tier.vecAvailable) : 0;
+    const meta = vecRowCount > 0 ? readIndexMeta(tier.db) : null;
+    activeTiers.push({ scope: s, tier, vecRowCount, meta });
+  }
+
+  if (activeTiers.length === 0) {
+    return {
+      query: trimmedQuery,
+      scope,
+      vectorUsed: false,
+      totalReturned: 0,
+      results: [],
+    };
+  }
+
+  // Filter-only listing when query is empty (SQL LIMIT pushdown, zero bulk load)
+  if (!trimmedQuery) {
+    const combined = [];
+    for (const { scope: s, tier } of activeTiers) {
+      const rows = tier.db
+        .prepare(`
+          SELECT d.id, d.type, d.status, d.session, d.branch, d.title, d.summary, d.tags, d.due, d.updated_at
+          FROM docs d
+          WHERE ${whereSql}
+          ORDER BY d.updated_at DESC
+          LIMIT ?
+        `)
+        .all(...filterParams, maxLimit);
+      for (const row of rows) {
+        combined.push({
+          row,
+          scope: s,
+          db: tier.db,
+          score: 1 + computeRecencyBoost(row.updated_at),
+        });
+      }
+    }
+
+    combined.sort(
+      (a, b) => b.score - a.score || String(b.row.updated_at).localeCompare(String(a.row.updated_at)),
+    );
+
+    const topHits = combined.slice(0, maxLimit).map(({ row, scope: s, db, score }) => ({
+      id: row.id,
+      scope: s,
+      type: row.type,
+      status: row.status,
+      title: row.title,
+      summary: row.summary,
+      tags: parseTagsJson(row.tags),
+      session: row.session,
+      branch: row.branch,
+      updated_at: row.updated_at,
+      score: Number(score.toFixed(6)),
+      relations: getNeighbors(db, row.id, { direction: 'both', limit: 8 }).map((rel) => ({
+        kind: rel.kind,
+        direction: rel.direction,
+        target: rel.target,
+        ...(rel.title ? { title: rel.title } : {}),
+      })),
+    }));
+
+    return {
+      query: trimmedQuery,
+      scope,
+      vectorUsed: false,
+      totalReturned: topHits.length,
+      results: topHits,
+    };
+  }
+
+  // 2. Lazy query embedding: ONLY call embeddingProvider.embed if at least one target tier has indexed vectors!
   let queryVec = null;
-  let vectorUsed = false;
-  if (trimmedQuery && embeddingProvider && typeof embeddingProvider.embed === 'function') {
+  const anyTierHasVectors = activeTiers.some((t) => t.vecRowCount > 0);
+  if (anyTierHasVectors && embeddingProvider && typeof embeddingProvider.embed === 'function') {
     try {
       const vecs = await embeddingProvider.embed([trimmedQuery], { taskType: 'query' });
       if (Array.isArray(vecs) && vecs[0] && vecs[0].length > 0) {
@@ -273,99 +505,120 @@ export async function searchMemory(store, params = {}) {
     }
   }
 
-  const { whereSql, params: filterParams } = buildFilterWhere({
-    type,
-    session,
-    branch,
-    file,
-    include_superseded: Boolean(include_superseded),
-  });
+  // 3. Run keyword + vector search per tier
+  let vectorUsed = false;
+  const tierStates = [];
 
-  const combinedResults = [];
-
-  for (const s of scopes) {
-    const tier = store.getTier(s);
-    syncFromDisk(tier.db, tier.dir);
-
-    const candidateRows = tier.db
-      .prepare(`
-        SELECT d.id, d.type, d.status, d.session, d.branch, d.title, d.summary, d.tags, d.due, d.updated_at
-        FROM docs d
-        WHERE ${whereSql}
-        ORDER BY d.updated_at DESC
-      `)
-      .all(...filterParams);
-
-    if (candidateRows.length === 0) continue;
-
-    const candidateMap = new Map();
-    const candidateIds = new Set();
-    for (const row of candidateRows) {
-      candidateMap.set(row.id, row);
-      candidateIds.add(row.id);
-    }
-
-    // Filter-only listing when query is empty
-    if (!trimmedQuery) {
-      for (const row of candidateRows.slice(0, maxLimit)) {
-        combinedResults.push({
-          row,
-          scope: s,
-          db: tier.db,
-          score: 1 + computeRecencyBoost(row.updated_at),
-        });
-      }
-      continue;
-    }
-
-    const kwRanked = runKeywordSearch(tier.db, trimmedQuery, candidateIds, candidateMap, {
-      include_superseded: Boolean(include_superseded),
+  for (const entry of activeTiers) {
+    const { scope: s, tier, vecRowCount, meta } = entry;
+    const kwRanked = runKeywordSearch(tier.db, trimmedQuery, {
+      whereSql,
+      filterParams,
+      maxLimit,
     });
-    const vecRanked = tier.vecAvailable && queryVec
-      ? runVectorSearch(tier.db, tier.dir, queryVec, candidateIds, maxLimit)
+    const vecRanked = vecRowCount > 0 && queryVec
+      ? runVectorSearch(tier.db, queryVec, {
+          whereSql,
+          filterParams,
+          type,
+          session,
+          branch,
+          file,
+          include_superseded: Boolean(include_superseded),
+          limit: maxLimit,
+          maxDistance: safeMaxDist,
+        })
       : [];
 
     if (vecRanked.length > 0) vectorUsed = true;
 
-    const rrfScores = new Map();
-    const addRrf = (docId, rank, weight) => {
-      const contribution = weight / (RRF_K + rank);
-      rrfScores.set(docId, (rrfScores.get(docId) || 0) + contribution);
-    };
+    tierStates.push({
+      scope: s,
+      tier,
+      embedModel: meta?.embedModel || '',
+      kwRanked,
+      vecRanked,
+      rrfScores: new Map(),
+    });
+  }
 
-    kwRanked.forEach((hit, idx) => addRrf(hit.docId, idx + 1, 1.0));
-    vecRanked.forEach((hit, idx) => addRrf(hit.docId, idx + 1, 1.0));
+  // 4. Compute RRF scores
+  const addRrf = (scoreMap, docId, rank, weight) => {
+    const contribution = weight / (RRF_K + rank);
+    scoreMap.set(docId, (scoreMap.get(docId) || 0) + contribution);
+  };
 
-    // 1-hop graph expansion boost from top seeds
-    const seedIds = [...rrfScores.entries()]
+  for (const ts of tierStates) {
+    ts.kwRanked.forEach((hit, idx) => addRrf(ts.rrfScores, hit.docId, idx + 1, 1.0));
+  }
+
+  // Cross-tier global vector ranking when multiple tiers share the same embedding model
+  const vecTiers = tierStates.filter((ts) => ts.vecRanked.length > 0);
+  const distinctModels = new Set(vecTiers.map((ts) => ts.embedModel).filter(Boolean));
+  const useGlobalVecRank = vecTiers.length > 1 && distinctModels.size <= 1;
+
+  if (useGlobalVecRank) {
+    const globalVecHits = [];
+    for (const ts of vecTiers) {
+      for (const hit of ts.vecRanked) {
+        globalVecHits.push({ ts, docId: hit.docId, distance: hit.distance });
+      }
+    }
+    globalVecHits.sort((a, b) => a.distance - b.distance);
+    globalVecHits.forEach((item, idx) => addRrf(item.ts.rrfScores, item.docId, idx + 1, 1.0));
+  } else {
+    for (const ts of vecTiers) {
+      ts.vecRanked.forEach((hit, idx) => addRrf(ts.rrfScores, hit.docId, idx + 1, 1.0));
+    }
+  }
+
+  // 5. 1-hop graph expansion boost from top seeds + hydrate ONLY matched docs
+  const combinedResults = [];
+
+  for (const ts of tierStates) {
+    if (ts.rrfScores.size === 0) continue;
+
+    const seedIds = [...ts.rrfScores.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
       .map(([docId]) => docId);
+    const seedSet = new Set(seedIds);
 
-    const graphNeighborScores = new Map();
+    const rawNeighborScores = new Map();
     for (const seedId of seedIds) {
-      const neighbors = getNeighbors(tier.db, seedId, { direction: 'both', limit: 15 });
+      const neighbors = getNeighbors(ts.tier.db, seedId, { direction: 'both', limit: 15 });
       for (const n of neighbors) {
         if (n.target.startsWith('file:')) continue;
-        if (!candidateIds.has(n.target)) continue;
-        if (seedIds.includes(n.target)) continue;
-        graphNeighborScores.set(
+        if (seedSet.has(n.target)) continue;
+        rawNeighborScores.set(
           n.target,
-          Math.max(graphNeighborScores.get(n.target) || 0, Number(n.weight) || 1.0),
+          Math.max(rawNeighborScores.get(n.target) || 0, Number(n.weight) || 1.0),
         );
       }
     }
 
-    const graphRanked = [...graphNeighborScores.entries()].sort((a, b) => b[1] - a[1]);
-    graphRanked.forEach(([docId], idx) => addRrf(docId, idx + 1, 0.25));
+    if (rawNeighborScores.size > 0) {
+      const validNeighborIds = filterDocIdsByWhere(
+        ts.tier.db,
+        [...rawNeighborScores.keys()],
+        whereSql,
+        filterParams,
+      );
+      const graphRanked = [...rawNeighborScores.entries()]
+        .filter(([docId]) => validNeighborIds.has(docId))
+        .sort((a, b) => b[1] - a[1]);
+      graphRanked.forEach(([docId], idx) => addRrf(ts.rrfScores, docId, idx + 1, 0.25));
+    }
 
-    for (const [docId, baseScore] of rrfScores.entries()) {
-      const row = candidateMap.get(docId);
+    // Hydrate ONLY matched doc IDs
+    const hydratedMap = hydrateDocsByIds(ts.tier.db, [...ts.rrfScores.keys()]);
+    for (const [docId, baseScore] of ts.rrfScores.entries()) {
+      const row = hydratedMap.get(docId);
       if (!row) continue;
       combinedResults.push({
         row,
-        scope: s,
-        db: tier.db,
+        scope: ts.scope,
+        db: ts.tier.db,
         score: baseScore + computeRecencyBoost(row.updated_at),
       });
     }

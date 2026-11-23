@@ -9,13 +9,14 @@ import {
   getGlobalDir,
   getProjectMemoryDir,
   getTierPaths,
+  isProjectEnabled as checkProjectEnabled,
   loadConfig,
   sanitizeRelFilePath,
   validateDocId,
 } from './config.mjs';
 import { parseMarkdownDoc, serializeMarkdownDoc } from './frontmatter.mjs';
 import { openTierDb, syncFromDisk, syncSingleFile } from './db.mjs';
-import { exploreGraph, getNeighbors } from './graph.mjs';
+import { exploreGraph, getNeighbors, normalizeGraphTarget } from './graph.mjs';
 
 export const VALID_TYPES = new Set(['decision', 'worklog', 'knowledge', 'todo', 'baseline']);
 export const VALID_STATUSES = new Set(['active', 'done', 'superseded', 'archived']);
@@ -42,14 +43,14 @@ function normalizeStringArray(val) {
   return [];
 }
 
-function sanitizeFilesArray(val) {
+function sanitizeFilesArray(val, projectRoot = null) {
   const items = normalizeStringArray(val);
   if (items === undefined) return undefined;
   const cleaned = [];
   for (const item of items) {
-    const safe = sanitizeRelFilePath(item);
+    const safe = sanitizeRelFilePath(item, projectRoot);
     if (!safe) {
-      throw new Error(`Invalid relative file path "${item}": traversal, absolute paths, drive letters, and NUL bytes are not allowed`);
+      throw new Error(`Invalid relative file path "${item}": traversal, external absolute paths, drive letters, and NUL bytes are not allowed`);
     }
     cleaned.push(safe);
   }
@@ -79,20 +80,37 @@ export class CortexStore {
     this._tiers = new Map();
   }
 
+  isProjectEnabled() {
+    return checkProjectEnabled(this.projectRoot, this.config);
+  }
+
   getTierDir(scope = 'project') {
     if (scope === 'global') return this.globalDir;
     if (scope === 'project') return this.projectDir;
     throw new Error(`Invalid scope "${scope}": expected "project" or "global"`);
   }
 
-  getTier(scope = 'project') {
+  getTier(scope = 'project', { create = true } = {}) {
     if (scope !== 'project' && scope !== 'global') {
       throw new Error(`Invalid scope "${scope}": expected "project" or "global"`);
+    }
+    if (scope === 'project' && !this.isProjectEnabled()) {
+      if (!create) return null;
+      throw new Error(`Project memory is disabled for "${this.projectRoot}" by cortex config`);
     }
     if (this._tiers.has(scope)) {
       return this._tiers.get(scope);
     }
+
     const dir = this.getTierDir(scope);
+    const paths = getTierPaths(dir);
+    if (!create) {
+      const existsOnDisk = fs.existsSync(paths.dbPath) || fs.existsSync(paths.docsDir);
+      if (!existsOnDisk) {
+        return null;
+      }
+    }
+
     ensureTierDirs(dir);
     const opened = openTierDb(dir, { disableVec: this.disableVec });
     const tier = {
@@ -107,11 +125,19 @@ export class CortexStore {
     return tier;
   }
 
+  getTierIfExists(scope = 'project') {
+    return this.getTier(scope, { create: false });
+  }
+
   sync(scope = 'all') {
     const scopes = scope === 'all' ? ['project', 'global'] : [scope];
     const results = {};
     for (const s of scopes) {
-      const tier = this.getTier(s);
+      const tier = this.getTierIfExists(s);
+      if (!tier) {
+        results[s] = { addedOrUpdated: 0, statUpdated: 0, deleted: 0 };
+        continue;
+      }
       results[s] = syncFromDisk(tier.db, tier.dir);
     }
     return results;
@@ -167,7 +193,7 @@ export class CortexStore {
     const nowIso = formatIsoTimestamp(now);
     const id = params.id ? validateDocId(String(params.id).trim()) : generateDocId(type, title, now);
 
-    const tier = this.getTier(scope);
+    const tier = this.getTier(scope, { create: true });
     syncFromDisk(tier.db, tier.dir);
 
     const existing = tier.db.prepare('SELECT id, path FROM docs WHERE id = ?').get(id);
@@ -176,8 +202,8 @@ export class CortexStore {
     }
 
     const tags = normalizeStringArray(params.tags) || [];
-    const files = sanitizeFilesArray(params.files) || [];
-    const derivedFrom = normalizeStringArray(params.derived_from);
+    const files = sanitizeFilesArray(params.files, this.projectRoot) || [];
+    const derivedFrom = normalizeStringArray(params.derived_from) || [];
     const supersedes = params.supersedes ? validateDocId(String(params.supersedes).trim()) : '';
 
     if (supersedes && supersedes === id) {
@@ -217,7 +243,7 @@ export class CortexStore {
       tags,
       ...(files.length > 0 ? { files } : {}),
       ...(supersedes ? { supersedes } : {}),
-      ...(derivedFrom && derivedFrom.length > 0 ? { derived_from: derivedFrom } : {}),
+      ...(derivedFrom.length > 0 ? { derived_from: derivedFrom } : {}),
       ...(params.due ? { due: String(params.due).trim() } : {}),
       created_at: nowIso,
       updated_at: nowIso,
@@ -227,25 +253,49 @@ export class CortexStore {
     const markdown = serializeMarkdownDoc(frontmatter, body);
     atomicWriteText(targetPath, markdown);
 
-    // Transition superseded doc atomically while preserving its body
+    // Transition superseded doc atomically while preserving its body;
+    // rollback newly created file cleanly if writing the superseded file fails.
     let supersededDoc = null;
+    let supersedesWarning = null;
     if (supersedes) {
       const oldRow = tier.db.prepare('SELECT id, path FROM docs WHERE id = ?').get(supersedes);
       if (oldRow) {
         const oldAbs = resolveDocAbsPath(tier.dir, oldRow.path);
         if (fs.existsSync(oldAbs)) {
-          const oldRaw = fs.readFileSync(oldAbs, 'utf8');
-          const parsedOld = parseMarkdownDoc(oldRaw);
-          const updatedOldFm = {
-            ...parsedOld.frontmatter,
-            id: parsedOld.frontmatter.id || oldRow.id,
-            status: 'superseded',
-            updated_at: nowIso,
-          };
-          atomicWriteText(oldAbs, serializeMarkdownDoc(updatedOldFm, parsedOld.body));
-          syncSingleFile(tier.db, tier.dir, oldAbs);
-          supersededDoc = oldRow.id;
+          try {
+            const oldRaw = fs.readFileSync(oldAbs, 'utf8');
+            const parsedOld = parseMarkdownDoc(oldRaw);
+            const updatedOldFm = {
+              ...parsedOld.frontmatter,
+              id: parsedOld.frontmatter.id || oldRow.id,
+              status: 'superseded',
+              updated_at: nowIso,
+            };
+            atomicWriteText(oldAbs, serializeMarkdownDoc(updatedOldFm, parsedOld.body));
+            syncSingleFile(tier.db, tier.dir, oldAbs);
+            supersededDoc = oldRow.id;
+          } catch (err) {
+            try {
+              if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+            } catch {
+              // ignore cleanup failure
+            }
+            throw err;
+          }
+        } else {
+          supersedesWarning = `Target "${supersedes}" file missing on disk in "${scope}" scope; not transitioned.`;
         }
+      } else {
+        const otherScope = scope === 'project' ? 'global' : 'project';
+        const otherTier = this.getTierIfExists(otherScope);
+        let foundInOther = false;
+        if (otherTier) {
+          syncFromDisk(otherTier.db, otherTier.dir);
+          foundInOther = Boolean(otherTier.db.prepare('SELECT id FROM docs WHERE id = ?').get(supersedes));
+        }
+        supersedesWarning = foundInOther
+          ? `Target "${supersedes}" exists in "${otherScope}" scope, not "${scope}"; not transitioned.`
+          : `Target "${supersedes}" not found in "${scope}" scope; not transitioned.`;
       }
     }
 
@@ -264,11 +314,13 @@ export class CortexStore {
       branch: indexed.branch,
       tags,
       files,
+      derived_from: derivedFrom,
       supersedes: supersedes || null,
       supersededTransitioned: supersededDoc,
+      ...(supersedesWarning ? { supersedesWarning } : {}),
       created_at: indexed.created_at,
       updated_at: indexed.updated_at,
-      embed_status: 'pending',
+      embed_status: indexed.embed_status || 'pending',
     };
   }
 
@@ -280,7 +332,8 @@ export class CortexStore {
     let foundTier = null;
     let foundRow = null;
     for (const s of candidateScopes) {
-      const tier = this.getTier(s);
+      const tier = this.getTierIfExists(s);
+      if (!tier) continue;
       syncFromDisk(tier.db, tier.dir);
       const row = tier.db.prepare('SELECT id, path FROM docs WHERE id = ?').get(id);
       if (row) {
@@ -315,7 +368,7 @@ export class CortexStore {
     if (params.due !== undefined) fm.due = String(params.due).trim();
     if (params.tags !== undefined) fm.tags = normalizeStringArray(params.tags) || [];
     if (params.files !== undefined) {
-      fm.files = sanitizeFilesArray(params.files) || [];
+      fm.files = sanitizeFilesArray(params.files, this.projectRoot) || [];
     }
     if (params.derived_from !== undefined) {
       fm.derived_from = normalizeStringArray(params.derived_from) || [];
@@ -348,7 +401,7 @@ export class CortexStore {
       branch: indexed.branch,
       tags: parseTagsJson(indexed.tagsJson),
       updated_at: indexed.updated_at,
-      embed_status: 'pending',
+      embed_status: indexed.embed_status || 'pending',
     };
   }
 
@@ -357,7 +410,8 @@ export class CortexStore {
     const candidateScopes = scope === 'all' ? ['project', 'global'] : [scope];
 
     for (const s of candidateScopes) {
-      const tier = this.getTier(s);
+      const tier = this.getTierIfExists(s);
+      if (!tier) continue;
       syncFromDisk(tier.db, tier.dir);
       const row = tier.db.prepare('SELECT * FROM docs WHERE id = ?').get(cleanId);
       if (!row) continue;
@@ -385,7 +439,7 @@ export class CortexStore {
         summary: row.summary,
         tags: parseTagsJson(row.tags),
         files: normalizeStringArray(extraFm.files) || [],
-        supersedes: extraFm.supersedes || '',
+        supersedes: extraFm.supersedes ? String(extraFm.supersedes) : '',
         derived_from: normalizeStringArray(extraFm.derived_from) || [],
         due: row.due,
         created_at: row.created_at,
@@ -406,185 +460,286 @@ export class CortexStore {
   }
 
   exploreGraph({ target, scope = 'project', depth = 2, direction = 'both', limit = 60 } = {}) {
+    const maxDepth = Math.max(1, Math.min(10, Number(depth) || 2));
+    const maxEdges = Math.max(1, Math.min(500, Number(limit) || 60));
+    const dir = direction === 'in' || direction === 'out' ? direction : 'both';
+    const normalizedTarget = normalizeGraphTarget(target);
+    if (!normalizedTarget) {
+      throw new Error('exploreGraph requires a non-empty target');
+    }
+
     const scopes = scope === 'all' ? ['project', 'global'] : [scope];
     if (scopes.length === 1) {
-      const tier = this.getTier(scopes[0]);
+      const tier = this.getTierIfExists(scopes[0]);
+      if (!tier) {
+        return {
+          scope: scopes[0],
+          target: normalizedTarget,
+          depth: maxDepth,
+          direction: dir,
+          nodes: [],
+          edges: [],
+        };
+      }
       syncFromDisk(tier.db, tier.dir);
       return {
         scope: scopes[0],
-        ...exploreGraph(tier.db, { target, depth, direction, limit }),
+        ...exploreGraph(tier.db, { target: normalizedTarget, depth: maxDepth, direction: dir, limit: maxEdges }),
       };
     }
 
     const nodeMap = new Map();
     const edgeMap = new Map();
-    let normalizedTarget = target;
 
     for (const s of scopes) {
-      const tier = this.getTier(s);
+      const tier = this.getTierIfExists(s);
+      if (!tier) continue;
       syncFromDisk(tier.db, tier.dir);
-      const res = exploreGraph(tier.db, { target, depth, direction, limit });
-      normalizedTarget = res.target;
+      const res = exploreGraph(tier.db, { target: normalizedTarget, depth: maxDepth, direction: dir, limit: maxEdges });
       for (const node of res.nodes) {
         const prev = nodeMap.get(node.id);
-        if (!prev || (!prev.exists && node.exists) || node.hop < prev.hop) {
-          nodeMap.set(node.id, { ...node, scope: node.exists ? s : prev?.scope });
+        if (!prev) {
+          nodeMap.set(node.id, { ...node, ...(node.exists ? { scope: s } : {}) });
+        } else {
+          const minHop = Math.min(prev.hop, node.hop);
+          // NEVER allow `exists: false` to overwrite `exists: true`
+          if (!prev.exists && node.exists) {
+            nodeMap.set(node.id, { ...node, hop: minHop, scope: s });
+          } else {
+            nodeMap.set(node.id, { ...prev, hop: minHop });
+          }
         }
       }
       for (const edge of res.edges) {
-        const key = `${edge.src}|${edge.dst}|${edge.kind}`;
-        if (!edgeMap.has(key)) edgeMap.set(key, edge);
+        const key = `${edge.src}\0${edge.dst}\0${edge.kind}`;
+        const prevEdge = edgeMap.get(key);
+        if (!prevEdge || edge.hop < prevEdge.hop) {
+          edgeMap.set(key, edge);
+        }
       }
     }
+
+    // Enforce limit after cross-tier merge
+    const mergedEdges = [...edgeMap.values()]
+      .sort((a, b) => a.hop - b.hop || b.weight - a.weight || a.kind.localeCompare(b.kind))
+      .slice(0, maxEdges);
+
+    const activeNodeIds = new Set([normalizedTarget]);
+    for (const edge of mergedEdges) {
+      activeNodeIds.add(edge.src);
+      activeNodeIds.add(edge.dst);
+    }
+
+    const mergedNodes = [...nodeMap.values()]
+      .filter((n) => activeNodeIds.has(n.id))
+      .sort((a, b) => a.hop - b.hop || a.id.localeCompare(b.id));
 
     return {
       scope: 'all',
       target: normalizedTarget,
-      depth,
-      direction,
-      nodes: [...nodeMap.values()].sort((a, b) => a.hop - b.hop || a.id.localeCompare(b.id)),
-      edges: [...edgeMap.values()],
+      depth: maxDepth,
+      direction: dir,
+      nodes: mergedNodes,
+      edges: mergedEdges,
     };
   }
 
   getOverview({ session = '', includeGlobal = true } = {}) {
-    const projectTier = this.getTier('project');
-    syncFromDisk(projectTier.db, projectTier.dir);
-
+    const projectTier = this.getTierIfExists('project');
     const sessionFilter = String(session || '').trim();
     const whereSession = sessionFilter ? ' AND session = ?' : '';
     const sessionParams = sessionFilter ? [sessionFilter] : [];
 
-    // 1. Active sessions & branches
-    const sessionRows = projectTier.db
-      .prepare(`
-        SELECT session, branch, COUNT(*) AS doc_count, MAX(updated_at) AS latest_updated_at
-        FROM docs
-        WHERE status = 'active' AND session != '' ${whereSession}
-        GROUP BY session, branch
-        ORDER BY latest_updated_at DESC
-      `)
-      .all(...sessionParams);
-
     const sessionsMap = new Map();
-    for (const r of sessionRows) {
-      let entry = sessionsMap.get(r.session);
-      if (!entry) {
-        entry = {
-          session: r.session,
-          branches: [],
-          docCount: 0,
-          latestUpdatedAt: r.latest_updated_at,
-        };
-        sessionsMap.set(r.session, entry);
-      }
-      if (r.branch && !entry.branches.includes(r.branch)) {
-        entry.branches.push(r.branch);
-      }
-      entry.docCount += Number(r.doc_count) || 0;
-      if (r.latest_updated_at > entry.latestUpdatedAt) {
-        entry.latestUpdatedAt = r.latest_updated_at;
-      }
-    }
+    let p0Baselines = [];
+    let todos = [];
+    let decisions = [];
+    let recentWork = [];
+    let projectStats = { total: 0, active: 0, embed_ready: 0, embed_pending: 0, embed_error: 0 };
+    let projectLastError = null;
 
-    // 2. Active todos
-    const todos = projectTier.db
-      .prepare(`
-        SELECT id, title, summary, session, branch, due, tags, updated_at
-        FROM docs
-        WHERE status = 'active' AND type = 'todo' ${whereSession}
-        ORDER BY CASE WHEN due != '' THEN 0 ELSE 1 END, due ASC, updated_at DESC
-        LIMIT 30
-      `)
-      .all(...sessionParams)
-      .map((r) => ({ ...r, tags: parseTagsJson(r.tags) }));
+    if (projectTier) {
+      syncFromDisk(projectTier.db, projectTier.dir);
 
-    // 3. Recent active decisions & baselines
-    const decisions = projectTier.db
-      .prepare(`
-        SELECT id, type, title, summary, session, branch, tags, updated_at
-        FROM docs
-        WHERE status = 'active' AND type IN ('decision', 'baseline') ${whereSession}
-        ORDER BY updated_at DESC
-        LIMIT 30
-      `)
-      .all(...sessionParams)
-      .map((r) => ({ ...r, tags: parseTagsJson(r.tags) }));
-
-    // 4. Recent active worklogs & knowledge
-    const recentWork = projectTier.db
-      .prepare(`
-        SELECT id, type, title, summary, session, branch, tags, updated_at
-        FROM docs
-        WHERE status = 'active' AND type IN ('worklog', 'knowledge') ${whereSession}
-        ORDER BY updated_at DESC
-        LIMIT 20
-      `)
-      .all(...sessionParams)
-      .map((r) => ({ ...r, tags: parseTagsJson(r.tags) }));
-
-    const projectStats = projectTier.db
-      .prepare(`
-        SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
-          SUM(CASE WHEN embed_status = 'pending' THEN 1 ELSE 0 END) AS pending
-        FROM docs
-      `)
-      .get();
-
-    // 5. Global preferences & knowledge
-    let globalPreferences = [];
-    let globalStats = { total: 0, active: 0, pending: 0 };
-
-    if (includeGlobal) {
-      const globalTier = this.getTier('global');
-      syncFromDisk(globalTier.db, globalTier.dir);
-
-      globalPreferences = globalTier.db
+      // 0. Active P0 baselines (queried separately so 30 newer decisions never push them out)
+      p0Baselines = projectTier.db
         .prepare(`
-          SELECT id, path, type, title, summary, tags, updated_at
+          SELECT id, type, title, summary, session, branch, tags, updated_at
+          FROM docs
+          WHERE status = 'active' AND type = 'baseline' AND LOWER(branch) = 'p0' ${whereSession}
+          ORDER BY updated_at DESC
+          LIMIT 10
+        `)
+        .all(...sessionParams)
+        .map((r) => ({ ...r, tags: parseTagsJson(r.tags) }));
+
+      // 1. Active sessions & branches
+      const sessionRows = projectTier.db
+        .prepare(`
+          SELECT session, branch, COUNT(*) AS doc_count, MAX(updated_at) AS latest_updated_at
+          FROM docs
+          WHERE status = 'active' AND session != '' ${whereSession}
+          GROUP BY session, branch
+          ORDER BY latest_updated_at DESC
+        `)
+        .all(...sessionParams);
+
+      for (const r of sessionRows) {
+        let entry = sessionsMap.get(r.session);
+        if (!entry) {
+          entry = {
+            session: r.session,
+            branches: [],
+            docCount: 0,
+            latestUpdatedAt: r.latest_updated_at,
+          };
+          sessionsMap.set(r.session, entry);
+        }
+        if (r.branch && !entry.branches.includes(r.branch)) {
+          entry.branches.push(r.branch);
+        }
+        entry.docCount += Number(r.doc_count) || 0;
+        if (r.latest_updated_at > entry.latestUpdatedAt) {
+          entry.latestUpdatedAt = r.latest_updated_at;
+        }
+      }
+
+      // 2. Active todos
+      todos = projectTier.db
+        .prepare(`
+          SELECT id, title, summary, session, branch, due, tags, updated_at
+          FROM docs
+          WHERE status = 'active' AND type = 'todo' ${whereSession}
+          ORDER BY CASE WHEN due != '' THEN 0 ELSE 1 END, due ASC, updated_at DESC
+          LIMIT 30
+        `)
+        .all(...sessionParams)
+        .map((r) => ({ ...r, tags: parseTagsJson(r.tags) }));
+
+      // 3. Recent active decisions & non-P0 baselines
+      decisions = projectTier.db
+        .prepare(`
+          SELECT id, type, title, summary, session, branch, tags, updated_at
           FROM docs
           WHERE status = 'active'
-          ORDER BY CASE WHEN path LIKE 'docs/preferences/%' THEN 0 ELSE 1 END, updated_at DESC
-          LIMIT 25
+            AND type IN ('decision', 'baseline')
+            AND NOT (type = 'baseline' AND LOWER(branch) = 'p0')
+            ${whereSession}
+          ORDER BY updated_at DESC
+          LIMIT 30
         `)
-        .all()
-        .map((r) => ({
-          id: r.id,
-          type: r.type,
-          category: r.path.startsWith('docs/preferences/') ? 'preferences' : 'knowledge',
-          title: r.title,
-          summary: r.summary,
-          tags: parseTagsJson(r.tags),
-          updated_at: r.updated_at,
-        }));
+        .all(...sessionParams)
+        .map((r) => ({ ...r, tags: parseTagsJson(r.tags) }));
 
-      globalStats = globalTier.db
+      // 4. Recent active worklogs & knowledge
+      recentWork = projectTier.db
+        .prepare(`
+          SELECT id, type, title, summary, session, branch, tags, updated_at
+          FROM docs
+          WHERE status = 'active' AND type IN ('worklog', 'knowledge') ${whereSession}
+          ORDER BY updated_at DESC
+          LIMIT 20
+        `)
+        .all(...sessionParams)
+        .map((r) => ({ ...r, tags: parseTagsJson(r.tags) }));
+
+      projectStats = projectTier.db
         .prepare(`
           SELECT
             COUNT(*) AS total,
             SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
-            SUM(CASE WHEN embed_status = 'pending' THEN 1 ELSE 0 END) AS pending
+            SUM(CASE WHEN embed_status = 'ready' THEN 1 ELSE 0 END) AS embed_ready,
+            SUM(CASE WHEN embed_status = 'pending' AND status NOT IN ('superseded', 'archived') THEN 1 ELSE 0 END) AS embed_pending,
+            SUM(CASE WHEN embed_status = 'error' THEN 1 ELSE 0 END) AS embed_error
           FROM docs
         `)
-        .get();
+        .get() || projectStats;
+
+      projectLastError = projectTier.db
+        .prepare("SELECT embed_error, updated_at FROM docs WHERE embed_error != '' ORDER BY updated_at DESC LIMIT 1")
+        .get() || null;
     }
+
+    // 5. Global preferences & knowledge
+    let globalPreferences = [];
+    let globalStats = { total: 0, active: 0, embed_ready: 0, embed_pending: 0, embed_error: 0 };
+    let globalLastError = null;
+
+    if (includeGlobal) {
+      const globalTier = this.getTierIfExists('global');
+      if (globalTier) {
+        syncFromDisk(globalTier.db, globalTier.dir);
+
+        globalPreferences = globalTier.db
+          .prepare(`
+            SELECT id, path, type, title, summary, tags, updated_at
+            FROM docs
+            WHERE status = 'active'
+            ORDER BY CASE WHEN path LIKE 'docs/preferences/%' THEN 0 ELSE 1 END, updated_at DESC
+            LIMIT 25
+          `)
+          .all()
+          .map((r) => ({
+            id: r.id,
+            type: r.type,
+            category: r.path.startsWith('docs/preferences/') ? 'preferences' : 'knowledge',
+            title: r.title,
+            summary: r.summary,
+            tags: parseTagsJson(r.tags),
+            updated_at: r.updated_at,
+          }));
+
+        globalStats = globalTier.db
+          .prepare(`
+            SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN embed_status = 'ready' THEN 1 ELSE 0 END) AS embed_ready,
+              SUM(CASE WHEN embed_status = 'pending' AND status NOT IN ('superseded', 'archived') THEN 1 ELSE 0 END) AS embed_pending,
+              SUM(CASE WHEN embed_status = 'error' THEN 1 ELSE 0 END) AS embed_error
+            FROM docs
+          `)
+          .get() || globalStats;
+
+        globalLastError = globalTier.db
+          .prepare("SELECT embed_error, updated_at FROM docs WHERE embed_error != '' ORDER BY updated_at DESC LIMIT 1")
+          .get() || null;
+      }
+    }
+
+    let lastError = '';
+    if (projectLastError && globalLastError) {
+      lastError = String(projectLastError.updated_at || '') >= String(globalLastError.updated_at || '')
+        ? projectLastError.embed_error
+        : globalLastError.embed_error;
+    } else {
+      lastError = projectLastError?.embed_error || globalLastError?.embed_error || '';
+    }
+
+    const embedReady = (Number(projectStats?.embed_ready) || 0) + (Number(globalStats?.embed_ready) || 0);
+    const embedPending = (Number(projectStats?.embed_pending) || 0) + (Number(globalStats?.embed_pending) || 0);
+    const embedError = (Number(projectStats?.embed_error) || 0) + (Number(globalStats?.embed_error) || 0);
 
     return {
       sessionFilter: sessionFilter || null,
+      p0Baselines,
       sessions: [...sessionsMap.values()],
       todos,
       decisions,
       recentWork,
       globalPreferences,
+      embeddingStats: {
+        ready: embedReady,
+        pending: embedPending,
+        error: embedError,
+        lastError,
+      },
       stats: {
         projectDocs: Number(projectStats?.total) || 0,
         projectActiveDocs: Number(projectStats?.active) || 0,
         globalDocs: Number(globalStats?.total) || 0,
         globalActiveDocs: Number(globalStats?.active) || 0,
-        pendingEmbeddings:
-          (Number(projectStats?.pending) || 0) + (Number(globalStats?.pending) || 0),
+        pendingEmbeddings: embedPending,
       },
     };
   }

@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { REPO_ROOT, atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
 import { CortexStore } from '../src/core/store.mjs';
 import {
+  isSubagentPayload,
   listSavedSessions,
   readSavedSession,
   recordSession,
@@ -24,6 +25,7 @@ import {
   handleClaudeUserPrompt,
 } from '../src/hooks/claude.mjs';
 import {
+  detectAntigravityTranscriptRole,
   handleAntigravityPreInvocation,
   handleAntigravitySessionStart,
 } from '../src/hooks/antigravity.mjs';
@@ -53,7 +55,7 @@ function makeTempEnv(prefix = 'herdr-cortex-hooks-') {
   );
   atomicWriteText(
     path.join(promptsDir, 'skills', 'start-job', 'SKILL.md'),
-    '# start-job\nEntry gate skill content.\n',
+    '---\nname: start-job\ndescription: Entry gate skill\n---\n\n# start-job\nEntry gate skill content.\n',
   );
 
   return {
@@ -452,17 +454,38 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
     );
     assert.deepEqual(emptyPrompt, {});
 
-    // 6. PreToolUse anti-spoofing:
-    // (a) Subagent trying to spoof empty _caller_agent_id gets overwritten with real host agent_id
-    const spoofSub = handleClaudePreToolUse({
-      tool_name: 'mcp__cortex__memory_save',
-      agent_id: 'real-subagent-77',
-      tool_input: { type: 'decision', title: 't', summary: 's', _caller_agent_id: '' },
-    });
-    assert.equal(spoofSub.hookSpecificOutput.hookEventName, 'PreToolUse');
-    assert.equal(spoofSub.hookSpecificOutput.updatedInput._caller_agent_id, 'real-subagent-77');
+    // 6. PreToolUse subagent denial & anti-spoofing:
+    // (a) Subagent calling write-protected tools gets permissionDecision: 'deny' directly
+    for (const writeCall of [
+      { tool_name: 'mcp__cortex__memory_save', tool_input: { type: 'decision', title: 't', summary: 's', _caller_agent_id: '' } },
+      { tool_name: 'mcp__cortex__memory_update', tool_input: { id: 'dec-1', status: 'done' } },
+      { tool_name: 'mcp__cortex__relay_send', tool_input: { to_terminal_id: 't2', message: 'hi' } },
+      { tool_name: 'mcp__cortex__relay_inbox', tool_input: { action: 'ack', message_id: 'all' } },
+    ]) {
+      const denied = handleClaudePreToolUse({ ...writeCall, agent_id: 'real-subagent-77' });
+      assert.equal(denied.hookSpecificOutput.hookEventName, 'PreToolUse');
+      assert.equal(denied.hookSpecificOutput.permissionDecision, 'deny');
+    }
 
-    // (b) HEAD with LLM-injected _caller_agent_id gets stripped cleanly (without permissionDecision: 'allow')
+    // (b) Subagent calling read-only cortex tool gets real host agent_id injected and NEVER permissionDecision: 'allow'
+    const subRead = handleClaudePreToolUse({
+      tool_name: 'mcp__cortex__memory_search',
+      agent_id: 'real-subagent-77',
+      tool_input: { query: 'wal', _caller_agent_id: '' },
+    });
+    assert.equal(subRead.hookSpecificOutput.hookEventName, 'PreToolUse');
+    assert.equal(subRead.hookSpecificOutput.updatedInput._caller_agent_id, 'real-subagent-77');
+    assert.equal('permissionDecision' in subRead.hookSpecificOutput, false);
+
+    const subPeek = handleClaudePreToolUse({
+      tool_name: 'mcp__cortex__relay_inbox',
+      agent_id: 'real-subagent-77',
+      tool_input: { action: 'peek' },
+    });
+    assert.equal(subPeek.hookSpecificOutput.updatedInput._caller_agent_id, 'real-subagent-77');
+    assert.equal('permissionDecision' in subPeek.hookSpecificOutput, false);
+
+    // (c) HEAD with LLM-injected _caller_agent_id gets stripped cleanly (without permissionDecision: 'allow')
     const spoofHead = handleClaudePreToolUse({
       tool_name: 'mcp__cortex__memory_save',
       tool_input: { type: 'decision', title: 't', summary: 's', _caller_agent_id: 'fake-id' },
@@ -470,14 +493,14 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
     assert.equal('_caller_agent_id' in spoofHead.hookSpecificOutput.updatedInput, false);
     assert.equal('permissionDecision' in spoofHead.hookSpecificOutput, false);
 
-    // (c) Clean HEAD call needs no rewrite
+    // (d) Clean HEAD call needs no rewrite
     const cleanHead = handleClaudePreToolUse({
       tool_name: 'mcp__cortex__memory_save',
       tool_input: { type: 'decision', title: 't', summary: 's' },
     });
     assert.deepEqual(cleanHead, {});
 
-    // (d) Non-cortex tool ignored
+    // (e) Non-cortex tool ignored
     const nonCortex = handleClaudePreToolUse({
       tool_name: 'Bash',
       agent_id: 'real-subagent-77',
@@ -485,11 +508,38 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
     });
     assert.deepEqual(nonCortex, {});
 
-    // 7. CLI child-process smoke test for pre-compact
+    // (f) PreCompact skips subagents
+    assert.deepEqual(handleClaudePreCompact({ agent_id: 'sub-1', cwd: env.projectDir }, { globalDir: env.globalDir }), {});
+
+    // (g) SessionStart on resume/fork skips duplicate HEAD_CORE while keeping overview
+    const resumeOut = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', cwd: env.projectDir },
+      { terminalId: 'tab-c1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.doesNotMatch(resumeOut.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+    assert.match(resumeOut.hookSpecificOutput.additionalContext, /Cortex Memory Overview/);
+
+    // (h) Non-Herdr /clear fallback (no HC_TERMINAL_ID) scans sibling *.jsonl by mtime
+    const nonHerdrDir = path.join(env.root, 'non-herdr-claude');
+    const olderSibling = path.join(nonHerdrDir, 'prev-non-herdr.jsonl');
+    const newBlankClear = path.join(nonHerdrDir, 'brand-new-clear.jsonl');
+    writeJsonl(olderSibling, [
+      { type: 'user', message: { role: 'user', content: 'Non-Herdr pre-clear goal' } },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Non-Herdr pre-clear reply' }] } },
+    ]);
+    atomicWriteText(newBlankClear, '');
+    const nonHerdrClear = handleClaudeSessionStart(
+      { session_id: 'brand-new-clear', source: 'clear', transcript_path: newBlankClear, cwd: env.projectDir },
+      { terminalId: '', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.match(nonHerdrClear.hookSpecificOutput.additionalContext, /Non-Herdr pre-clear goal/);
+    assert.match(nonHerdrClear.hookSpecificOutput.additionalContext, /Non-Herdr pre-clear reply/);
+
+    // 7. CLI child-process smoke test for pre-compact (including UTF-8 BOM stripping)
     const cliRes = spawnSync(
       process.execPath,
       ['--no-warnings', path.join(REPO_ROOT, 'src', 'hooks', 'claude.mjs'), 'pre-compact', '--id', 'herdr-cortex'],
-      { input: '{}', encoding: 'utf8' },
+      { input: '\uFEFF{}', encoding: 'utf8' },
     );
     assert.equal(cliRes.status, 0);
     const parsedCli = JSON.parse(cliRes.stdout.trim());
@@ -522,18 +572,19 @@ test('hooks/antigravity: SessionStart subagent skip, PreInvocation /compact poin
     assert.deepEqual(subStart, {});
     assert.equal(readSavedSession('tab-a1', { globalDir: env.globalDir, legacyHome: env.homeDir }), null);
 
-    // 2. Root SessionStart records session and injects HEAD_CORE + overview
+    // 2. Root SessionStart records session and injects HEAD_CORE + overview as separate injectSteps
     const rootStart = handleAntigravitySessionStart(
       { conversationId: 'conv-root-1', rootConversationId: 'conv-root-1', cwd: env.projectDir },
       { terminalId: 'tab-a1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
     );
-    assert.equal(rootStart.injectSteps.length, 1);
-    const startMsg = rootStart.injectSteps[0].systemMessage.systemMessage;
-    assert.match(startMsg, /# HEAD_CORE/);
-    assert.match(startMsg, /Antigravity 체크포인트 자동 복구/);
+    assert.equal(rootStart.injectSteps.length, 2);
+    const startCombined = rootStart.injectSteps.map((s) => s.systemMessage.systemMessage).join('\n\n');
+    assert.match(rootStart.injectSteps[0].systemMessage.systemMessage, /# HEAD_CORE/);
+    assert.match(rootStart.injectSteps[1].systemMessage.systemMessage, /Antigravity 체크포인트 자동 복구/);
+    assert.ok(startCombined.length <= 9000);
     assert.equal(readSavedSession('tab-a1', { globalDir: env.globalDir, legacyHome: env.homeDir }).sessionId, 'conv-root-1');
 
-    // 3. PreInvocation with /compact (including arguments) injects 1-line compact pointer
+    // 3. PreInvocation with /compact (including arguments) injects 1-line compact pointer (without duplicating HEAD_CORE)
     const compactOut = handleAntigravityPreInvocation(
       {
         conversationId: 'conv-root-1',
@@ -546,23 +597,7 @@ test('hooks/antigravity: SessionStart subagent skip, PreInvocation /compact poin
     assert.equal(compactOut.injectSteps.length, 1);
     assert.match(compactOut.injectSteps[0].systemMessage.systemMessage, /Compaction pointer/i);
 
-    // 3b. No checkpoints directory created when transcript has no CHECKPOINT
-    const noCpTranscript = path.join(env.root, 'no-cp.jsonl');
-    writeJsonl(noCpTranscript, [
-      { type: 'USER_INPUT', step_index: 1, userInput: { userResponse: 'hello' } },
-    ]);
-    handleAntigravityPreInvocation(
-      {
-        conversationId: 'conv-root-1',
-        rootConversationId: 'conv-root-1',
-        cwd: env.projectDir,
-        transcriptFullPath: noCpTranscript,
-      },
-      { terminalId: 'tab-a1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
-    );
-    assert.equal(fs.existsSync(path.join(env.projectDir, '.memory', 'state', 'checkpoints')), false);
-
-    // 4. PreInvocation detects new CHECKPOINT (DONE) -> restores once -> persists key -> does NOT duplicate next turn
+    // 4. PreInvocation detects new CHECKPOINT (DONE) -> restores once as separate injectSteps -> persists JSON state -> does NOT duplicate next turn
     const transcriptFull = path.join(env.root, 'transcript_full.jsonl');
     writeJsonl(transcriptFull, [
       { type: 'USER_INPUT', step_index: 1, userInput: { userResponse: '<USER_REQUEST>체크포인트 직전 요청</USER_REQUEST>' } },
@@ -579,15 +614,18 @@ test('hooks/antigravity: SessionStart subagent skip, PreInvocation /compact poin
       },
       { terminalId: 'tab-a1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
     );
-    assert.equal(firstCp.injectSteps.length, 1);
-    const cpMsg = firstCp.injectSteps[0].systemMessage.systemMessage;
-    assert.match(cpMsg, /# HEAD_CORE/);
-    assert.match(cpMsg, /Antigravity 체크포인트 자동 복구/);
-    assert.match(cpMsg, /체크포인트 직전 요청/);
-    assert.match(cpMsg, /체크포인트 직전 응답/);
+    assert.equal(firstCp.injectSteps.length, 3); // HEAD_CORE, overview, recentTurns
+    const cpCombined = firstCp.injectSteps.map((s) => s.systemMessage.systemMessage).join('\n\n');
+    assert.match(firstCp.injectSteps[0].systemMessage.systemMessage, /# HEAD_CORE/);
+    assert.match(firstCp.injectSteps[1].systemMessage.systemMessage, /Antigravity 체크포인트 자동 복구/);
+    assert.match(firstCp.injectSteps[2].systemMessage.systemMessage, /체크포인트 직전 요청/);
+    assert.match(firstCp.injectSteps[2].systemMessage.systemMessage, /체크포인트 직전 응답/);
+    assert.ok(cpCombined.length <= 9000);
 
-    const cpFile = path.join(env.projectDir, '.memory', 'state', 'checkpoints', 'conv-root-1.txt');
-    assert.equal(fs.readFileSync(cpFile, 'utf8').trim(), '3:2026-11-22T12:00:00Z');
+    const cpFile = path.join(env.projectDir, '.memory', 'state', 'checkpoints', 'conv-root-1.json');
+    const cpJson = JSON.parse(fs.readFileSync(cpFile, 'utf8'));
+    assert.equal(cpJson.started, true);
+    assert.equal(cpJson.checkpoint, '3:2026-11-22T12:00:00Z');
 
     // Next turn with same checkpoint -> no duplicate restore
     const secondCp = handleAntigravityPreInvocation(
@@ -698,10 +736,13 @@ test('hooks/installer: idempotent install/uninstall round-trip preserves existin
     assert.ok(agyMcp.mcpServers[MCP_SERVER_KEY]);
     assert.ok(agyMcp.mcpServers.existingServer);
 
-    // Verify Claude settings: all 4 hooks added once (idempotent), legacy record-session removed, user hook preserved
+    // Verify Claude settings: single unified SessionStart hook (no 2-process split race), all 4 hooks added once
     const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf8'));
     assert.equal(claudeSettings.theme, 'dark');
     assert.equal(claudeSettings.hooks.SessionStart.length, 2); // echo keep-me + cortex
+    const cortexStartEntry = claudeSettings.hooks.SessionStart.find((e) => e.hooks.some((h) => h.command.includes('herdr-cortex')));
+    assert.equal(cortexStartEntry.hooks.length, 1);
+    assert.match(cortexStartEntry.hooks[0].command, /session-start --id herdr-cortex/);
     assert.equal(claudeSettings.hooks.PreCompact.length, 1);
     assert.equal(claudeSettings.hooks.UserPromptSubmit.length, 1);
     assert.equal(claudeSettings.hooks.PreToolUse.length, 1);
@@ -716,9 +757,11 @@ test('hooks/installer: idempotent install/uninstall round-trip preserves existin
     assert.ok(claudeJson.mcpServers[MCP_SERVER_KEY]);
     assert.ok(claudeJson.mcpServers.otherMcp);
 
-    // Verify managed skill installed
+    // Verify managed skill installed AND frontmatter name: synced to cortex-start-job
     const managedSkillPath = path.join(env.homeDir, '.claude', 'skills', 'cortex-start-job', 'SKILL.md');
     assert.equal(fs.existsSync(managedSkillPath), true);
+    const syncedSkillMd = fs.readFileSync(managedSkillPath, 'utf8');
+    assert.match(syncedSkillMd, /^name:\s*cortex-start-job$/m);
 
     // Run uninstall -> removes only cortex entries and preserves all user entries
     uninstallCortex({ repoRoot: env.root, homeDir: env.homeDir });
@@ -810,6 +853,184 @@ test('project scoping: excludedProjects and opt-in mode suppress hook injections
     );
     assert.deepEqual(handleClaudePreCompact({ cwd: excludedProj }, { globalDir: env.globalDir }), {});
     assert.equal(handleClaudePreCompact({ cwd: allowedProj }, { globalDir: env.globalDir }).continue, true);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('P0-1 regression: Antigravity transcript role probe blocks subagents without rootConversationId, defers unknown SessionStart, and never creates .memory/ on uninitialized projects', () => {
+  const env = makeTempEnv('cortex-agy-sub-');
+  try {
+    // 1. detectAntigravityTranscriptRole classifies missing/empty, subagent [Message], and root USER_INPUT accurately
+    assert.equal(detectAntigravityTranscriptRole(path.join(env.root, 'missing.jsonl')), 'unknown');
+
+    const emptyTranscript = path.join(env.root, 'empty.jsonl');
+    atomicWriteText(emptyTranscript, '');
+    assert.equal(detectAntigravityTranscriptRole(emptyTranscript), 'unknown');
+
+    const subTranscript = path.join(env.root, 'subagent-transcript.jsonl');
+    writeJsonl(subTranscript, [
+      {
+        type: 'SYSTEM_MESSAGE',
+        step_index: 0,
+        text: '[Message] timestamp=2026-11-23T02:48:11Z sender=b8cfadc9-4bc6-41e7-98bf-e120094cd671 priority=MESSAGE_PRIORITY_HIGH content=Run audit task',
+      },
+    ]);
+    assert.equal(detectAntigravityTranscriptRole(subTranscript), 'subagent');
+
+    const rootTranscript = path.join(env.root, 'root-transcript.jsonl');
+    writeJsonl(rootTranscript, [
+      { type: 'USER_INPUT', step_index: 0, userInput: { userResponse: '<USER_REQUEST>Build feature</USER_REQUEST>' } },
+      {
+        type: 'SYSTEM_MESSAGE',
+        step_index: 1,
+        text: '[Message] timestamp=2026-11-23T02:50:00Z sender=worker-12345678 content=Worker reply',
+      },
+    ]);
+    assert.equal(detectAntigravityTranscriptRole(rootTranscript), 'root');
+
+    // 2. Real Antigravity SessionStart (no rootConversationId, empty transcript) defers to PreInvocation
+    const deferredStart = handleAntigravitySessionStart(
+      { conversationId: 'conv-head-real', transcriptPath: emptyTranscript, cwd: env.projectDir },
+      { terminalId: 't14', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.deepEqual(deferredStart, {});
+    assert.equal(readSavedSession('t14', { globalDir: env.globalDir, legacyHome: env.homeDir }), null);
+
+    // 3. First root PreInvocation (no rootConversationId, transcript has USER_INPUT) injects HEAD_CORE once
+    //    and stores checkpoint under globalDir (NEVER creating <project>/.memory/ on uninitialized project!)
+    const rootPre1 = handleAntigravityPreInvocation(
+      { conversationId: 'conv-head-real', transcriptPath: rootTranscript, cwd: env.projectDir, lastUserInput: 'Build feature' },
+      { terminalId: 't14', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.ok(rootPre1.injectSteps.length >= 1);
+    assert.match(rootPre1.injectSteps[0].systemMessage.systemMessage, /# HEAD_CORE/);
+    assert.equal(readSavedSession('t14', { globalDir: env.globalDir, legacyHome: env.homeDir })?.sessionId, 'conv-head-real');
+    assert.equal(fs.existsSync(path.join(env.projectDir, '.memory')), false);
+    assert.equal(fs.existsSync(path.join(env.globalDir, 'state', 'checkpoints', 'conv-head-real.json')), true);
+
+    // Second root PreInvocation does NOT duplicate HEAD_CORE
+    const rootPre2 = handleAntigravityPreInvocation(
+      { conversationId: 'conv-head-real', transcriptPath: rootTranscript, cwd: env.projectDir, lastUserInput: 'Next step' },
+      { terminalId: 't14', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.deepEqual(rootPre2, {});
+
+    // 4. Subagent PreInvocation (NO rootConversationId! Only transcript has [Message] sender=...)
+    //    MUST return {} and MUST NOT overwrite parent t14.json!
+    const subPre = handleAntigravityPreInvocation(
+      { conversationId: 'conv-sub-real', transcriptPath: subTranscript, cwd: env.projectDir },
+      { terminalId: 't14', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.deepEqual(subPre, {});
+    assert.equal(readSavedSession('t14', { globalDir: env.globalDir, legacyHome: env.homeDir })?.sessionId, 'conv-head-real');
+
+    // 5. tracker.mjs expanded subagent fields + strict sessionId validation
+    assert.equal(isSubagentPayload({ parentConversationId: 'parent-1' }), true);
+    assert.equal(isSubagentPayload({ parent_session_id: 'parent-2' }), true);
+    const badSid = recordSession({
+      terminalId: 't14',
+      agent: 'claude',
+      payload: { session_id: 'abc; Start-Process calc', cwd: env.projectDir },
+      globalDir: env.globalDir,
+      legacyHome: env.homeDir,
+    });
+    assert.equal(badSid.recorded, false);
+    assert.equal(badSid.reason, 'invalid_session_id');
+    assert.equal(readSavedSession('t14', { globalDir: env.globalDir, legacyHome: env.homeDir })?.sessionId, 'conv-head-real');
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('P1-3 & P2-6 regression: recent-turns tail-reads >2MB JSONL, anchors noise patterns, preserves User has answered, skips consecutive empty boundaries, and preserves tail conclusion', () => {
+  const env = makeTempEnv('cortex-tail-');
+  try {
+    // 1. >2.2MB JSONL transcript: tail-read skips old head and cleanly extracts final turns
+    const bigPath = path.join(env.root, 'huge.jsonl');
+    const fillerLine = `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'X'.repeat(1000) } })}\n`;
+    const chunks = [];
+    for (let i = 0; i < 2300; i++) chunks.push(fillerLine); // ~2.4MB
+    chunks.push(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'Mentioning <command-name> mid-sentence is valid' } })}\n`);
+    chunks.push(`${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Final tail answer preserved' }] } })}\n`);
+    chunks.push(`${JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'q1', content: 'User has answered: Ship Option B.' }] },
+    })}\n`);
+    chunks.push(`${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Proceeding with Option B.' }] } })}\n`);
+    fs.writeFileSync(bigPath, chunks.join(''), 'utf8');
+
+    const tailRes = extractClaudeRecentTurns(bigPath, { maxTurns: 2, maxChars: 4500 });
+    assert.equal(tailRes.turns.length, 2);
+    assert.match(tailRes.text, /Mentioning <command-name> mid-sentence is valid/);
+    assert.match(tailRes.text, /User has answered: Ship Option B/);
+    assert.match(tailRes.text, /Proceeding with Option B/);
+
+    // 2. Multiple consecutive empty compact_boundary entries walk back to last non-empty segment
+    const multiBoundaryPath = path.join(env.root, 'multi-boundary.jsonl');
+    writeJsonl(multiBoundaryPath, [
+      { type: 'user', message: { role: 'user', content: 'Real turn before double compact' } },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Real reply before double compact' }] } },
+      { type: 'system', subtype: 'compact_boundary' },
+      { type: 'system', subtype: 'compact_boundary' },
+    ]);
+    const multiRes = extractClaudeRecentTurns(multiBoundaryPath);
+    assert.equal(multiRes.turns.length, 1);
+    assert.match(multiRes.text, /Real reply before double compact/);
+
+    // 3. Oversized single turn trimming preserves BOTH user question (head) AND assistant conclusion (tail)
+    const hugeSinglePath = path.join(env.root, 'huge-single.jsonl');
+    writeJsonl(hugeSinglePath, [
+      { type: 'user', message: { role: 'user', content: 'HEAD_QUESTION_MARKER explain architecture' } },
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: `${'middle detail '.repeat(120)} FINAL_CONCLUSION_MARKER` }],
+        },
+      },
+    ]);
+    const trimmed = extractClaudeRecentTurns(hugeSinglePath, { maxTurns: 1, maxChars: 240 });
+    assert.ok(trimmed.charCount <= 240, `Expected <= 240, got ${trimmed.charCount}`);
+    assert.match(trimmed.text, /HEAD_QUESTION_MARKER/);
+    assert.match(trimmed.text, /FINAL_CONCLUSION_MARKER/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('Post-review regression: P0-only baseline renders in Claude and Antigravity hooks', () => {
+  const env = makeTempEnv('cortex-p0only-');
+  try {
+    const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+    try {
+      store.saveDoc({
+        id: 'base-p0-only',
+        type: 'baseline',
+        title: 'Sole P0 Baseline',
+        summary: 'Only document in this project is a P0 baseline.',
+        tags: ['P0'],
+      });
+    } finally {
+      store.close();
+    }
+
+    const claudeOut = handleClaudeSessionStart(
+      { session_id: 'head-p0-only', cwd: env.projectDir },
+      { part: 'context', terminalId: 'tab-p0', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.match(claudeOut.hookSpecificOutput?.additionalContext || '', /Sole P0 Baseline/);
+
+    const agyTranscript = path.join(env.root, 'agy-p0-only.jsonl');
+    writeJsonl(agyTranscript, [
+      { type: 'CORTEX_STEP_TYPE_USER_INPUT', userInput: { items: [{ text: 'Check P0 baseline' }] } },
+    ]);
+    const agyOut = handleAntigravityPreInvocation(
+      { conversationId: 'conv-p0-only', transcriptPath: agyTranscript, cwd: env.projectDir },
+      { terminalId: 'tab-p0-agy', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    const agyText = (agyOut.injectSteps || []).map((s) => s.systemMessage?.systemMessage || '').join('\n');
+    assert.match(agyText, /Sole P0 Baseline/);
   } finally {
     env.cleanup();
   }

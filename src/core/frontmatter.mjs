@@ -28,6 +28,10 @@ function stripInlineComment(raw) {
   let inDouble = false;
   for (let i = 0; i < raw.length; i++) {
     const ch = raw[i];
+    if (ch === '\\' && inDouble && i + 1 < raw.length) {
+      i++;
+      continue;
+    }
     if (ch === "'" && !inDouble) {
       if (inSingle && raw[i + 1] === "'") {
         i++;
@@ -35,7 +39,6 @@ function stripInlineComment(raw) {
       }
       inSingle = !inSingle;
     } else if (ch === '"' && !inSingle) {
-      if (inDouble && raw[i - 1] === '\\') continue;
       inDouble = !inDouble;
     } else if (ch === '#' && !inSingle && !inDouble) {
       if (i === 0 || /\s/.test(raw[i - 1])) {
@@ -115,7 +118,7 @@ function parseInlineArray(rawInput) {
 export function parseMarkdownDoc(rawText) {
   const normalized = String(rawText ?? '').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
 
-  if (!normalized.startsWith('---\n') && normalized !== '---') {
+  if (!/^---[ \t]*(?:\n|$)/.test(normalized)) {
     return { frontmatter: {}, body: normalized };
   }
 
@@ -206,7 +209,7 @@ export function parseMarkdownDoc(rawText) {
       continue;
     }
 
-    // Empty value: could be followed by a block array (- item)
+    // Empty value: could be followed by a block array (- item), indented or unindented
     if (rest === '') {
       const items = [];
       let j = i + 1;
@@ -216,9 +219,10 @@ export function parseMarkdownDoc(rawText) {
           j++;
           continue;
         }
-        const itemMatch = /^\s+-\s*(.*)$/.exec(nextLine);
+        if (/^\s*---/.test(nextLine)) break;
+        const itemMatch = /^\s*-(?:\s+(.*)|\s*)$/.exec(nextLine);
         if (!itemMatch) break;
-        const parsed = parseScalar(itemMatch[1]);
+        const parsed = parseScalar(itemMatch[1] ?? '');
         if (parsed !== '') items.push(parsed);
         j++;
       }
@@ -235,6 +239,18 @@ export function parseMarkdownDoc(rawText) {
     // Regular scalar
     frontmatter[key] = parseScalar(restRaw);
     i++;
+  }
+
+  // Coerce numeric document reference fields to strings
+  for (const strKey of ['id', 'supersedes']) {
+    if (typeof frontmatter[strKey] === 'number') {
+      frontmatter[strKey] = String(frontmatter[strKey]);
+    }
+  }
+  if (typeof frontmatter.derived_from === 'number') {
+    frontmatter.derived_from = String(frontmatter.derived_from);
+  } else if (Array.isArray(frontmatter.derived_from)) {
+    frontmatter.derived_from = frontmatter.derived_from.map((v) => String(v));
   }
 
   return { frontmatter, body };
@@ -330,27 +346,34 @@ export function serializeMarkdownDoc(frontmatter = {}, body = '') {
 
 const URL_RE = /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i;
 const SOURCE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|tsx|json|md|ps1|psm1|psd1|sql|sqlite|py|go|rs|java|c|cpp|h|hpp|cs|rb|php|sh|bash|zsh|yml|yaml|toml|ini|env|css|scss|html|xml|txt|csv)$/i;
+const MIME_TYPE_RE = /^(?:application|text|image|audio|video|font|multipart|message|model)\/[a-z0-9.+-]+$/i;
+const KNOWN_ROOT_DIR_RE = /^(?:\.github|\.memory|\.claude|\.gemini|src|test|tests|docs|scripts|prompts|bin|lib|pkg|cmd|app|apps|packages|config|public|assets|internal)\//i;
 
 function stripFencedCodeBlocks(markdown) {
   const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n');
   const out = [];
   let inFence = false;
-  let fenceMarker = '';
+  let fenceChar = '';
+  let fenceLen = 0;
 
   for (const line of lines) {
-    const fenceMatch = /^\s*(`{3,}|~{3,})/.exec(line);
-    if (fenceMatch) {
-      const marker = fenceMatch[1][0];
-      if (!inFence) {
+    if (!inFence) {
+      const openMatch = /^\s*(`{3,}|~{3,})/.exec(line);
+      if (openMatch) {
         inFence = true;
-        fenceMarker = marker;
-      } else if (marker === fenceMarker) {
-        inFence = false;
-        fenceMarker = '';
+        fenceChar = openMatch[1][0];
+        fenceLen = openMatch[1].length;
+        continue;
       }
-      continue;
+      out.push(line);
+    } else {
+      const closeMatch = /^\s*(`{3,}|~{3,})\s*$/.exec(line);
+      if (closeMatch && closeMatch[1][0] === fenceChar && closeMatch[1].length >= fenceLen) {
+        inFence = false;
+        fenceChar = '';
+        fenceLen = 0;
+      }
     }
-    if (!inFence) out.push(line);
   }
   return out.join('\n');
 }
@@ -361,13 +384,29 @@ function isLikelyFilePath(candidate) {
   if (/\s/.test(candidate)) return false;
   if (candidate.startsWith('-')) return false;
   if (candidate.includes('://')) return false;
-  // Must have a path separator or a recognized source file extension
+  if (MIME_TYPE_RE.test(candidate)) return false;
+
   const hasSlash = candidate.includes('/') || candidate.includes('\\');
   const hasExt = SOURCE_EXT_RE.test(candidate);
   if (!hasSlash && !hasExt) return false;
-  // Filter out things like "a/b" that are clearly ratios or dates like "2026/11/22"
-  if (/^\d{2,4}\/\d{1,2}(?:\/\d{1,4})?$/.test(candidate)) return false;
-  if (!hasExt && !/^[a-zA-Z0-9._-]+(?:[\\/][a-zA-Z0-9가-힣._-]+)+$/.test(candidate)) return false;
+
+  // Filter out dates like "2026/11/22" or numeric ratios like "3/4"
+  if (/^\d{1,4}\/\d{1,2}(?:\/\d{1,4})?$/.test(candidate)) return false;
+
+  if (!hasExt) {
+    if (!/^[a-zA-Z0-9._-]+(?:[\\/][a-zA-Z0-9가-힣._-]+)+$/.test(candidate)) return false;
+    const normalized = candidate.replace(/\\/g, '/');
+    const parts = normalized.split('/');
+    // Reject ALL-CAPS slash pairs like "GET/POST", "CI/CD", "I/O"
+    if (parts.length === 2 && /^[A-Z0-9_-]+$/.test(parts[0]) && /^[A-Z0-9_-]+$/.test(parts[1])) {
+      return false;
+    }
+    // For extensionless 2-segment tokens like "in/out", "read/write", "true/false",
+    // require either a known project root directory prefix or a dot-segment (e.g. ".github/workflows")
+    if (parts.length === 2 && !KNOWN_ROOT_DIR_RE.test(normalized) && !parts.some((p) => p.includes('.'))) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -441,23 +480,23 @@ export function extractReferences(content, frontmatter = {}) {
     }
   }
 
-  if (typeof frontmatter.supersedes === 'string' && frontmatter.supersedes.trim()) {
-    const id = frontmatter.supersedes.trim();
-    if (isValidId(id)) supersedes.add(id);
+  if (typeof frontmatter.supersedes === 'string' || typeof frontmatter.supersedes === 'number') {
+    const id = String(frontmatter.supersedes).trim();
+    if (id && isValidId(id)) supersedes.add(id);
   } else if (Array.isArray(frontmatter.supersedes)) {
     for (const s of frontmatter.supersedes) {
       const id = String(s).trim();
-      if (isValidId(id)) supersedes.add(id);
+      if (id && isValidId(id)) supersedes.add(id);
     }
   }
 
-  if (typeof frontmatter.derived_from === 'string' && frontmatter.derived_from.trim()) {
-    const id = frontmatter.derived_from.trim();
-    if (isValidId(id)) derivedFrom.add(id);
+  if (typeof frontmatter.derived_from === 'string' || typeof frontmatter.derived_from === 'number') {
+    const id = String(frontmatter.derived_from).trim();
+    if (id && isValidId(id)) derivedFrom.add(id);
   } else if (Array.isArray(frontmatter.derived_from)) {
     for (const d of frontmatter.derived_from) {
       const id = String(d).trim();
-      if (isValidId(id)) derivedFrom.add(id);
+      if (id && isValidId(id)) derivedFrom.add(id);
     }
   }
 
@@ -471,10 +510,10 @@ export function extractReferences(content, frontmatter = {}) {
   };
 }
 
-function splitLongText(text, maxChars, overlap) {
+export function splitLongText(text, maxChars, overlap) {
   const chunks = [];
-  const safeMax = Math.max(64, maxChars);
-  const safeOverlap = Math.max(0, Math.min(overlap, Math.floor(safeMax / 2)));
+  const safeMax = Math.max(32, maxChars);
+  const safeOverlap = Math.max(0, Math.min(overlap ?? 0, Math.floor(safeMax / 2)));
 
   let start = 0;
   while (start < text.length) {
@@ -519,6 +558,7 @@ export function chunkMarkdown(content, { maxChars = 800, overlap = 100 } = {}) {
   let currentLines = [];
   let inFence = false;
   let fenceChar = '';
+  let fenceLen = 0;
 
   const pushSection = () => {
     const text = currentLines.join('\n').trim();
@@ -529,27 +569,28 @@ export function chunkMarkdown(content, { maxChars = 800, overlap = 100 } = {}) {
   };
 
   for (const line of lines) {
-    const fenceMatch = /^\s*(`{3,}|~{3,})/.exec(line);
-    if (fenceMatch) {
-      const ch = fenceMatch[1][0];
-      if (!inFence) {
-        inFence = true;
-        fenceChar = ch;
-      } else if (ch === fenceChar) {
-        inFence = false;
-        fenceChar = '';
-      }
-      currentLines.push(line);
-      continue;
-    }
-
     if (!inFence) {
+      const openMatch = /^\s*(`{3,}|~{3,})/.exec(line);
+      if (openMatch) {
+        inFence = true;
+        fenceChar = openMatch[1][0];
+        fenceLen = openMatch[1].length;
+        currentLines.push(line);
+        continue;
+      }
       const headingMatch = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
       if (headingMatch) {
         pushSection();
         currentHeading = headingMatch[2].trim();
         currentLines.push(line);
         continue;
+      }
+    } else {
+      const closeMatch = /^\s*(`{3,}|~{3,})\s*$/.exec(line);
+      if (closeMatch && closeMatch[1][0] === fenceChar && closeMatch[1].length >= fenceLen) {
+        inFence = false;
+        fenceChar = '';
+        fenceLen = 0;
       }
     }
 

@@ -51,11 +51,18 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
     assert.equal(coreDefault.isError, false);
     assert.equal(coreDefault.data.path, 'HEAD_CORE.md');
     const coreLines = coreDefault.data.content.trim().split(/\r?\n/);
-    assert.ok(coreLines.length >= 25 && coreLines.length <= 50, `HEAD_CORE.md expected ~35-45 lines, got ${coreLines.length}`);
+    assert.ok(coreLines.length >= 25 && coreLines.length <= 40, `HEAD_CORE.md expected ~28-36 lines, got ${coreLines.length}`);
     assert.match(coreDefault.data.content, /해상도 분리/);
+    assert.match(coreDefault.data.content, /시야 협소화 예방/);
+    assert.match(coreDefault.data.content, /Open Facts/);
     assert.match(coreDefault.data.content, /독립 검수/);
     assert.match(coreDefault.data.content, /실제 실행으로 증명/);
+    assert.match(coreDefault.data.content, /Canon Protection/);
     assert.match(coreDefault.data.content, /supersedes/);
+    assert.match(coreDefault.data.content, /cortex_prompt/);
+    // Deduplicated from SERVER_INSTRUCTIONS: no redundant tool-by-tool relay/skill catalog in HEAD_CORE
+    assert.doesNotMatch(coreDefault.data.content, /relay_tabs/);
+    assert.doesNotMatch(coreDefault.data.content, /kind: "skill"/);
 
     const coreExplicit = await registry.callTool('cortex_prompt', { kind: 'core', name: 'HEAD_CORE' });
     assert.equal(coreExplicit.isError, false);
@@ -72,11 +79,11 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
 
     // 3. All 5 unified skills
     const expectedSkills = [
-      { name: 'start-job', mustMatch: [/직접 실행/, /delegate/, /independent-review/, /plan-run/, /memory_overview/, /memory_search/] },
+      { name: 'start-job', mustMatch: [/직접 실행/, /delegate/, /independent-review/, /plan-run/, /memory_overview/, /memory_search/, /프로젝트 상대 경로/, /category: "preferences"/] },
       { name: 'product-planning', mustMatch: [/1단계: 문제 정의/, /2단계: 사용자 가치/, /3단계: 유저플로우/, /사용자 통제/] },
-      { name: 'delegate', mustMatch: [/Entry Contract/, /contract_conflict/, /coder/, /developer/, /reviewer/, /cortex_prompt/] },
-      { name: 'independent-review', mustMatch: [/Verified Facts/, /Blockers/, /Minor Notes/, /ACCEPT/, /NEEDS_FIX/, /P0/] },
-      { name: 'plan-run', mustMatch: [/P0/, /SEED/, /PN/, /derived_from/, /memory_graph/, /01-ideation/, /08-next-direction/] },
+      { name: 'delegate', mustMatch: [/Entry Contract/, /contract_conflict/, /coder/, /developer/, /reviewer/, /cortex_prompt/, /프로젝트 상대 경로/, /category: "preferences"/] },
+      { name: 'independent-review', mustMatch: [/Verified Facts/, /Open Facts/, /Blockers/, /Minor Notes/, /Verdict/, /ACCEPT/, /NEEDS_FIX/, /P0/] },
+      { name: 'plan-run', mustMatch: [/P0/, /C\{k\}-IDEATION/, /C\{k\}-PLAN/, /C\{k\}-PN/, /C\{k\}-R\{k\}/, /C\{k\}-SEED/, /C1-PLAN/, /derived_from/, /memory_graph/, /depth: 8/, /attempt: N\/2/, /01-ideation/, /08-next-direction/] },
     ];
 
     for (const skill of expectedSkills) {
@@ -293,7 +300,167 @@ test('plan-run baseline lineage E2E: P0 -> PLAN -> PN -> RESULT traced bidirecti
   }
 });
 
-test('repository purity: prompts/ and src/core/ contain zero hardcoded personal paths, legacy hacks, or private product leaks', () => {
+test('Open Facts 5-section parity, step 04 isolation from step 03, and plan-run multi-cycle C{k}-* contracts', async () => {
+  const env = makeTempEnv();
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  const registry = createToolRegistry(store, {
+    promptsDir: path.join(REPO_ROOT, 'prompts'),
+  });
+
+  try {
+    // 1. 5-section reviewer schema parity across reviewer.md, independent-review, and plan-run steps 03, 04, 06
+    const reviewPrompts = [
+      { kind: 'agent', name: 'reviewer' },
+      { kind: 'skill', name: 'independent-review' },
+      { kind: 'skill', name: 'plan-run/steps/03-minimum-plan-review' },
+      { kind: 'skill', name: 'plan-run/steps/04-plan-acceptance' },
+      { kind: 'skill', name: 'plan-run/steps/06-result-review' },
+    ];
+    const fiveSections = [/Verified Facts/, /Open Facts/, /Blockers/, /Minor Notes/, /Verdict/];
+
+    for (const req of reviewPrompts) {
+      const res = await registry.callTool('cortex_prompt', req);
+      assert.equal(res.isError, false, `Failed loading ${req.kind}:${req.name}`);
+      for (const pat of fiveSections) {
+        assert.match(res.data.content, pat, `${req.name} missing required 5-section key ${pat}`);
+      }
+    }
+
+    // 2. Step 04 Inputs must remain strictly isolated from Step 03 review narrative (anti-anchoring)
+    const step04 = await registry.callTool('cortex_prompt', { kind: 'skill', name: 'plan-run/steps/04-plan-acceptance' });
+    const inputsBlockMatch = step04.data.content.match(/## Inputs[\s\S]*?(?=## Execution)/);
+    assert.ok(inputsBlockMatch, '04-plan-acceptance.md missing ## Inputs section');
+    assert.doesNotMatch(inputsBlockMatch[0], /03[- ]?minimum|03\s*리뷰|03\s*검수/, '04 Inputs must not inject 03 review narrative');
+    assert.match(step04.data.content, /`?03`? 리뷰 맥락과도 분리/);
+
+    // 3. Cycle-numbered branch naming across plan-run steps
+    const stepBranchContracts = [
+      { step: 'plan-run/steps/01-ideation', patterns: [/branch: "P0"/, /branch: "C\{k\}-IDEATION"/, /C1-IDEATION/] },
+      { step: 'plan-run/steps/02-execution-planning', patterns: [/branch: "C\{k\}-PLAN"/, /C1-PLAN/] },
+      { step: 'plan-run/steps/04-plan-acceptance', patterns: [/branch: "C\{k\}-PN"/, /C1-PN/] },
+      { step: 'plan-run/steps/05-execution', patterns: [/branch: "C\{k\}-R\{k\}"/, /C1-R1/, /attempt: N\/2/] },
+      { step: 'plan-run/steps/07-progress-review', patterns: [/depth: 8/, /direction: "out"/, /C\{k\}-IDEATION/, /C\{k\}-R\{k\}/] },
+      { step: 'plan-run/steps/08-next-direction', patterns: [/단축 경로/, /LOCAL_CORRECTION/, /attempt: N\/2/, /status: "archived"/, /branch: "C\{k\}-SEED"/, /C1-SEED/] },
+    ];
+
+    for (const { step, patterns } of stepBranchContracts) {
+      const res = await registry.callTool('cortex_prompt', { kind: 'skill', name: step });
+      assert.equal(res.isError, false);
+      for (const pat of patterns) {
+        assert.match(res.data.content, pat, `${step} missing contract pattern ${pat}`);
+      }
+    }
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('plan-run multi-cycle 5-hop lineage (P0 -> C1-IDEATION -> C1-PLAN -> C1-PN -> C1-R1 -> C1-SEED) and DONE baseline archival', async () => {
+  const env = makeTempEnv();
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  const registry = createToolRegistry(store, {
+    promptsDir: path.join(REPO_ROOT, 'prompts'),
+  });
+
+  try {
+    // 1. Canonical plan-run cycle 1 lineage with C{k}-* branch naming
+    const docs = [
+      { id: 'base-mc-p0', branch: 'P0', derived_from: [], title: 'P0 최초 목적' },
+      { id: 'base-mc-c1-ideation', branch: 'C1-IDEATION', derived_from: ['base-mc-p0'], title: 'C1 단기 목표' },
+      { id: 'base-mc-c1-plan', branch: 'C1-PLAN', derived_from: ['base-mc-c1-ideation'], title: 'C1 실행 규격' },
+      { id: 'base-mc-c1-pn', branch: 'C1-PN', derived_from: ['base-mc-p0', 'base-mc-c1-plan'], title: 'C1 수용 기준선' },
+      { id: 'base-mc-c1-r1', branch: 'C1-R1', derived_from: ['base-mc-c1-pn'], title: 'C1 실행 결과' },
+      { id: 'base-mc-c1-seed', branch: 'C1-SEED', derived_from: ['base-mc-c1-pn', 'base-mc-c1-r1'], title: 'C1 다음 시드' },
+    ];
+
+    for (const d of docs) {
+      const saved = await registry.callTool('memory_save', {
+        id: d.id,
+        type: 'baseline',
+        session: 'multi-cycle-e2e',
+        branch: d.branch,
+        derived_from: d.derived_from,
+        title: d.title,
+        summary: `${d.title} 요약`,
+        content: `${d.title} 상세 본문.`,
+      });
+      assert.equal(saved.isError, false, `Failed saving ${d.id}: ${JSON.stringify(saved)}`);
+    }
+
+    // Trace upstream from C1-SEED -> reaches all 5 ancestors including C1-IDEATION and P0
+    const upstream = await registry.callTool('memory_graph', {
+      target: 'base-mc-c1-seed',
+      scope: 'project',
+      depth: 8,
+      direction: 'out',
+    });
+    assert.equal(upstream.isError, false);
+    const upIds = upstream.data.nodes.map((n) => n.id);
+    for (const expected of ['base-mc-c1-r1', 'base-mc-c1-pn', 'base-mc-c1-plan', 'base-mc-c1-ideation', 'base-mc-p0']) {
+      assert.ok(upIds.includes(expected), `Expected ${expected} in C1-SEED upstream lineage, got ${JSON.stringify(upIds)}`);
+    }
+
+    // Strict linear 5-hop derived_from chain (no session_next shortcut edges): verifies deep traversal cleanly across depth caps
+    const linearChain = [
+      { id: 'lin-p0', branch: 'P0', derived_from: [] },
+      { id: 'lin-c1-ideation', branch: 'C1-IDEATION', derived_from: ['lin-p0'] },
+      { id: 'lin-c1-plan', branch: 'C1-PLAN', derived_from: ['lin-c1-ideation'] },
+      { id: 'lin-c1-pn', branch: 'C1-PN', derived_from: ['lin-c1-plan'] },
+      { id: 'lin-c1-r1', branch: 'C1-R1', derived_from: ['lin-c1-pn'] },
+      { id: 'lin-c1-seed', branch: 'C1-SEED', derived_from: ['lin-c1-r1'] },
+    ];
+    for (const item of linearChain) {
+      const res = await registry.callTool('memory_save', {
+        id: item.id,
+        type: 'baseline',
+        branch: item.branch,
+        derived_from: item.derived_from,
+        title: `Linear ${item.branch}`,
+        summary: `Linear ${item.branch} summary`,
+      });
+      assert.equal(res.isError, false);
+    }
+
+    const linUp = await registry.callTool('memory_graph', {
+      target: 'lin-c1-seed',
+      scope: 'project',
+      depth: 8,
+      direction: 'out',
+    });
+    assert.equal(linUp.isError, false);
+    const linIds = linUp.data.nodes.map((n) => n.id);
+    assert.ok(linIds.includes('lin-c1-r1'));
+    assert.ok(linIds.includes('lin-c1-pn'));
+    assert.ok(linIds.includes('lin-c1-plan'));
+    if (linUp.data.depth >= 5) {
+      assert.ok(linIds.includes('lin-c1-ideation'), 'depth >= 5 must reach hop-4 C1-IDEATION');
+      assert.ok(linIds.includes('lin-p0'), 'depth >= 5 must reach hop-5 P0');
+      assert.equal(linUp.data.nodes.find((n) => n.id === 'lin-p0').hop, 5);
+    }
+
+    // 2. DONE baseline archival removes intermediate baselines from active memory_overview
+    for (const id of ['base-mc-c1-ideation', 'base-mc-c1-plan', 'base-mc-c1-pn', 'base-mc-c1-r1', 'base-mc-c1-seed']) {
+      const arch = await registry.callTool('memory_update', { id, status: 'archived' });
+      assert.equal(arch.isError, false);
+      assert.equal(arch.data.status, 'archived');
+    }
+
+    const overview = await registry.callTool('memory_overview', { session: 'multi-cycle-e2e', include_global: false });
+    assert.equal(overview.isError, false);
+    const activeIds = [
+      ...(overview.data.recentDecisions || []),
+      ...(overview.data.activeBaselines || []),
+    ].map((d) => d.id);
+    assert.ok(!activeIds.includes('base-mc-c1-plan'), 'Archived intermediate baseline must not clutter active overview');
+    assert.ok(!activeIds.includes('base-mc-c1-seed'), 'Archived intermediate baseline must not clutter active overview');
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('repository purity: prompts/, src/core/, and README.md contain zero hardcoded personal paths, legacy hacks, or private product leaks', () => {
   const scanDirs = [
     path.join(REPO_ROOT, 'prompts'),
     path.join(REPO_ROOT, 'src', 'core'),
@@ -311,14 +478,18 @@ test('repository purity: prompts/ and src/core/ contain zero hardcoded personal 
     }
   })();
 
-  const forbiddenPatterns = [
+  const personalPatterns = [
     { label: 'POSIX /Users/ path', re: /\/Users\/[A-Za-z0-9._-]+/ },
     { label: 'POSIX /home/ path', re: /\/home\/[A-Za-z0-9._-]+/ },
     { label: 'Windows C:\\Users\\ path', re: /C:[\\/]Users[\\/]/i },
     { label: 'Hardcoded workspace path', re: /G:[\\/]herdr-custom-app/i },
     { label: 'Legacy claude -p --resume recursion hack', re: /claude\s+-p\b[^\n]*--resume/i },
-    { label: 'Legacy head-agent-core product leak', re: /head-agent-core/i },
     ...(currentUser ? [{ label: 'Current OS username leak', re: new RegExp(`\\b${currentUser}\\b`, 'i') }] : []),
+  ];
+
+  const forbiddenPatterns = [
+    ...personalPatterns,
+    { label: 'Legacy head-agent-core product leak', re: /head-agent-core/i },
   ];
 
   const violations = [];
@@ -330,6 +501,16 @@ test('repository purity: prompts/ and src/core/ contain zero hardcoded personal 
       if (match) {
         violations.push(`${relFile}: matched [${label}] -> "${match[0]}"`);
       }
+    }
+  }
+
+  // README.md allows MIT attribution link to upstream reference, but must have zero personal paths or usernames
+  const readmePath = path.join(REPO_ROOT, 'README.md');
+  const readmeText = fs.readFileSync(readmePath, 'utf8');
+  for (const { label, re } of personalPatterns) {
+    const match = readmeText.match(re);
+    if (match) {
+      violations.push(`README.md: matched [${label}] -> "${match[0]}"`);
     }
   }
 

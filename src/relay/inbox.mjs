@@ -12,6 +12,27 @@ import { validateTerminalId } from '../revive/tracker.mjs';
 const TAKING_DIR_RE = /^\.taking-(\d+)-([a-zA-Z0-9_-]+)$/;
 const SAFE_MSG_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
 
+const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(ms) {
+  Atomics.wait(SLEEP_BUF, 0, 0, ms);
+}
+
+function renameSyncWithRetry(srcPath, dstPath, maxRetries = 6) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      fs.renameSync(srcPath, dstPath);
+      return;
+    } catch (err) {
+      const retryable = err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES');
+      if (!retryable || attempt === maxRetries) {
+        throw err;
+      }
+      sleepSync(15 * (attempt + 1));
+    }
+  }
+}
+
 export function defaultIsPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -52,7 +73,7 @@ function moveFileUnique(srcPath, destDir, preferredName) {
     const suffix = crypto.randomBytes(3).toString('hex');
     candidate = assertInsideDir(destDir, `${stem}-${suffix}${ext}`);
   }
-  fs.renameSync(srcPath, candidate);
+  renameSyncWithRetry(srcPath, candidate);
   return candidate;
 }
 
@@ -237,9 +258,9 @@ export function drainInbox(
     const srcPath = assertInsideDir(targetDir, fileName);
     const dstPath = assertInsideDir(claimDir, fileName);
     try {
-      fs.renameSync(srcPath, dstPath);
+      renameSyncWithRetry(srcPath, dstPath, 3);
     } catch (err) {
-      if (err && (err.code === 'ENOENT' || err.code === 'EBUSY' || err.code === 'EPERM')) {
+      if (err && (err.code === 'ENOENT' || err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES')) {
         continue; // claimed or transiently locked by another reader
       }
       throw err;
@@ -274,11 +295,27 @@ export function drainInbox(
   }
 
   let acked = false;
-  const ack = () => {
-    if (acked) return { acked: 0, alreadyAcked: true };
+  const ack = (onlyIds) => {
+    if (acked) return { acked: 0, restored: 0, alreadyAcked: true };
     acked = true;
+    const isPartial = Array.isArray(onlyIds);
+    const idSet = isPartial ? new Set(onlyIds.map((id) => String(id))) : null;
     let removed = 0;
+    let restored = 0;
+    let restoreFailed = 0;
     for (const entry of claimedEntries) {
+      if (isPartial && !idSet.has(entry.record.id)) {
+        try {
+          if (fs.existsSync(entry.filePath)) {
+            moveFileUnique(entry.filePath, targetDir, entry.fileName);
+            restored++;
+          }
+        } catch {
+          // leave file in claim dir for stale recovery if move fails
+          restoreFailed++;
+        }
+        continue;
+      }
       try {
         if (fs.existsSync(entry.filePath)) {
           fs.unlinkSync(entry.filePath);
@@ -288,12 +325,14 @@ export function drainInbox(
         // ignore
       }
     }
-    try {
-      fs.rmSync(claimDir, { recursive: true, force: true });
-    } catch {
-      // ignore
+    if (restoreFailed === 0) {
+      try {
+        fs.rmSync(claimDir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
     }
-    return { acked: removed };
+    return { acked: removed, restored, restoreFailed };
   };
 
   return {
@@ -382,20 +421,33 @@ export function ackMessage(projectDir, terminalId, messageId) {
 }
 
 /**
- * Format drained relay messages concisely for hook injection.
- * Strictly guarantees returned length <= maxChars (including any footer/trim notice).
+ * Format drained relay messages concisely for hook injection and report exactly
+ * which message IDs were fully included vs omitted or truncated so hooks only ACK
+ * messages delivered intact.
+ * Strictly guarantees returned text.length <= maxChars.
  */
-export function formatInboxForHook(messages, { maxChars = 2500 } = {}) {
-  if (!Array.isArray(messages) || messages.length === 0 || maxChars <= 0) return '';
+export function formatInboxForHookDetailed(messages, { maxChars = 2500 } = {}) {
+  if (!Array.isArray(messages) || messages.length === 0 || maxChars <= 0) {
+    return { text: '', includedIds: [], omittedIds: [], truncatedIds: [] };
+  }
 
+  const allIds = messages.map((m) => m.id);
   const header = `## Incoming Herdr Relay Messages (${messages.length})`;
   if (header.length >= maxChars) {
-    return header.slice(0, maxChars).trimEnd();
+    return {
+      text: header.slice(0, maxChars).trimEnd(),
+      includedIds: [],
+      omittedIds: allIds,
+      truncatedIds: [],
+    };
   }
 
   const footer = '(+remaining relay messages available via relay_inbox)';
   const trimSuffix = '\n[...trimmed, inspect via relay_inbox]';
   const blocks = [header];
+  const includedIds = [];
+  const omittedIds = [];
+  const truncatedIds = [];
   let total = header.length;
 
   for (let i = 0; i < messages.length; i++) {
@@ -409,11 +461,15 @@ export function formatInboxForHook(messages, { maxChars = 2500 } = {}) {
 
     if (total + 2 + entry.length <= maxChars) {
       blocks.push(entry);
+      includedIds.push(m.id);
       total += 2 + entry.length;
       continue;
     }
 
     if (blocks.length > 1) {
+      for (let j = i; j < messages.length; j++) {
+        omittedIds.push(messages[j].id);
+      }
       if (total + 2 + footer.length <= maxChars) {
         blocks.push(footer);
       }
@@ -421,17 +477,34 @@ export function formatInboxForHook(messages, { maxChars = 2500 } = {}) {
     }
 
     // First message alone exceeds remaining budget -> trim cleanly inside maxChars
+    // and mark as truncated (NOT includedIds) so it remains in inbox for relay_inbox.
     const avail = maxChars - total - 2;
     if (avail > trimSuffix.length) {
       const bodyLimit = avail - trimSuffix.length;
       const clipped = entry.slice(0, bodyLimit).trimEnd();
       blocks.push(`${clipped}${trimSuffix}`);
+      truncatedIds.push(m.id);
     } else if (avail > 0) {
       blocks.push(entry.slice(0, avail).trimEnd());
+      truncatedIds.push(m.id);
+    } else {
+      omittedIds.push(m.id);
+    }
+    for (let j = i + 1; j < messages.length; j++) {
+      omittedIds.push(messages[j].id);
     }
     break;
   }
 
-  const out = blocks.join('\n\n');
-  return out.length <= maxChars ? out : out.slice(0, maxChars).trimEnd();
+  const joined = blocks.join('\n\n');
+  const text = joined.length <= maxChars ? joined : joined.slice(0, maxChars).trimEnd();
+  return { text, includedIds, omittedIds, truncatedIds };
+}
+
+/**
+ * Format drained relay messages concisely for hook injection.
+ * Strictly guarantees returned length <= maxChars (including any footer/trim notice).
+ */
+export function formatInboxForHook(messages, options = {}) {
+  return formatInboxForHookDetailed(messages, options).text;
 }

@@ -3,10 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
 import { CortexStore } from '../src/core/store.mjs';
-import { createMcpServer } from '../src/mcp/server.mjs';
+import {
+  EXCLUDED_SERVER_INSTRUCTIONS,
+  SERVER_INSTRUCTIONS,
+  createMcpServer,
+} from '../src/mcp/server.mjs';
 import { recordSession } from '../src/revive/tracker.mjs';
 import { createHcClient, sanitizeSingleLineTrigger } from '../src/relay/hc.mjs';
 import {
@@ -14,6 +19,7 @@ import {
   drainInbox,
   enqueueMessage,
   formatInboxForHook,
+  formatInboxForHookDetailed,
   getTerminalInboxDir,
   peekInbox,
 } from '../src/relay/inbox.mjs';
@@ -263,7 +269,11 @@ test('relay/tools + MCP server: exposes all 10 tools and runs relay_tabs, relay_
           return JSON.stringify({ address: 't3', state: 'live', agent: 'claude', busy: true });
         }
         if (args[0] === 'send') {
-          sentTriggers.push({ to: args[1], trigger: args[2] });
+          if (args[1] === '--if') {
+            sentTriggers.push({ ifCond: args[2], to: args[3], trigger: args[4] });
+          } else {
+            sentTriggers.push({ ifCond: null, to: args[1], trigger: args[2] });
+          }
           return '';
         }
         throw new Error(`Unexpected hc call: ${args.join(' ')}`);
@@ -328,6 +338,7 @@ test('relay/tools + MCP server: exposes all 10 tools and runs relay_tabs, relay_
     assert.equal(sendIdleData.woke, true);
     assert.equal(sendIdleData.wakeReason, 'sent_auto_idle');
     assert.equal(sentTriggers.length, 1);
+    assert.equal(sentTriggers[0].ifCond, 'idle');
     assert.equal(sentTriggers[0].to, 't2');
     // NEVER sends raw multiline body via hc send!
     assert.equal(sentTriggers[0].trigger.includes('\n'), false);
@@ -511,6 +522,368 @@ test('regression: cross-project relay_send and relay_tabs route messages to targ
     else process.env.HC_TERMINAL_ID = prevTerminalId;
     storeX.close();
     storeY.close();
+    env.cleanup();
+  }
+});
+
+test('P0-5 regression: inbox partial ACK preserves omitted and truncated messages in inbox', () => {
+  const env = makeTempEnv('cortex-partial-ack-');
+  try {
+    // Case 1: 2 messages where only the 1st fits -> 1st is acked, 2nd is restored back into inbox
+    enqueueMessage(env.projectDir, 'tab-p1', { id: 'msg-fit', from_terminal_id: 'tab-0', message: 'Short message 1' });
+    enqueueMessage(env.projectDir, 'tab-p1', { id: 'msg-omit', from_terminal_id: 'tab-0', message: 'Second message '.repeat(20) });
+
+    const d1 = drainInbox(env.projectDir, 'tab-p1');
+    assert.equal(d1.messages.length, 2);
+    const det1 = formatInboxForHookDetailed(d1.messages, { maxChars: 170 });
+    assert.deepEqual(det1.includedIds, ['msg-fit']);
+    assert.deepEqual(det1.omittedIds, ['msg-omit']);
+    assert.deepEqual(det1.truncatedIds, []);
+    assert.ok(det1.text.length <= 170);
+
+    const ack1 = d1.ack(det1.includedIds);
+    assert.equal(ack1.acked, 1);
+    assert.equal(ack1.restored, 1);
+    assert.equal(fs.existsSync(d1.claimDir), false);
+
+    // Omitted message MUST still be present in inbox
+    const remaining1 = peekInbox(env.projectDir, 'tab-p1');
+    assert.equal(remaining1.count, 1);
+    assert.equal(remaining1.messages[0].id, 'msg-omit');
+
+    // Case 2: Single oversized message is truncated -> includedIds is [] -> message restored for relay_inbox!
+    const d2 = drainInbox(env.projectDir, 'tab-p1');
+    const det2 = formatInboxForHookDetailed(d2.messages, { maxChars: 140 });
+    assert.deepEqual(det2.includedIds, []);
+    assert.deepEqual(det2.truncatedIds, ['msg-omit']);
+    assert.match(det2.text, /\[\.\.\.trimmed, inspect via relay_inbox\]/);
+
+    const ack2 = d2.ack(det2.includedIds);
+    assert.equal(ack2.acked, 0);
+    assert.equal(ack2.restored, 1);
+    assert.equal(peekInbox(env.projectDir, 'tab-p1').count, 1);
+    assert.equal(peekInbox(env.projectDir, 'tab-p1').messages[0].id, 'msg-omit');
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('P0-6 & P0-7 regression: hc blocked/error/done/isBareShell/foreground.cwd/error-json/--if fallback, and subagent relay denial', async () => {
+  const env = makeTempEnv('cortex-hc-guard-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  const prevTid = process.env.HC_TERMINAL_ID;
+  try {
+    process.env.HC_TERMINAL_ID = 't1';
+    const sendLog = [];
+    let rejectIfFlag = false;
+
+    const mockHc = createHcClient({
+      execFileSync(_bin, args) {
+        if (args[0] === 'ls') {
+          return JSON.stringify({
+            terminals: [
+              { address: 't-blocked', state: 'live', foreground: { name: 'claude', status: 'blocked', cwd: 'G:\\fg-cwd' }, cwd: 'G:\\outer-cwd' },
+              { address: 't-error', state: 'live', foreground: { name: 'claude', status: 'error' } },
+              { address: 't-unknown', state: 'live', foreground: { name: 'claude' } },
+              { address: 't-done', state: 'live', foreground: { name: 'claude', status: 'done' } },
+              { address: 't-shell', state: 'live', foreground: { name: 'powershell.exe', status: 'idle' } },
+            ],
+          });
+        }
+        if (args[0] === 'get' && args[1] === 't-shell') {
+          return JSON.stringify({ address: 't-shell', state: 'live', foreground: { name: 'powershell.exe', status: 'idle', cwd: env.projectDir } });
+        }
+        if (args[0] === 'get' && args[1] === 't-blocked') {
+          return JSON.stringify({ address: 't-blocked', state: 'live', foreground: { name: 'claude', status: 'blocked', cwd: env.projectDir } });
+        }
+        if (args[0] === 'get' && args[1] === 't-done') {
+          return JSON.stringify({ address: 't-done', state: 'live', foreground: { name: 'claude', status: 'done', cwd: env.projectDir } });
+        }
+        if (args[0] === 'get' && args[1] === 't-api-err') {
+          return JSON.stringify({ error: 'terminal not found' });
+        }
+        if (args[0] === 'send') {
+          sendLog.push([...args]);
+          if (rejectIfFlag && args[1] === '--if') {
+            const err = new Error('unknown flag: --if');
+            err.stderr = 'unknown flag: --if';
+            throw err;
+          }
+          return '';
+        }
+        throw new Error(`Unexpected hc call: ${args.join(' ')}`);
+      },
+    });
+
+    // 1. detectTerminalActivity: blocked, error, unknown, isBareShell are NOT idle; done IS idle; foreground.cwd wins
+    const ls = mockHc.listTerminals();
+    assert.equal(ls.ok, true);
+    const byId = new Map(ls.terminals.map((t) => [t.terminalId, t]));
+    assert.equal(byId.get('t-blocked').idle, false);
+    assert.equal(byId.get('t-blocked').blocked, true);
+    assert.equal(byId.get('t-blocked').cwd, 'G:\\fg-cwd');
+    assert.equal(byId.get('t-error').idle, false);
+    assert.equal(byId.get('t-error').error, true);
+    assert.equal(byId.get('t-unknown').idle, false);
+    assert.equal(byId.get('t-done').idle, true);
+    assert.equal(byId.get('t-shell').isBareShell, true);
+    assert.equal(byId.get('t-shell').idle, false);
+
+    // 2. parsed.error returns ok: false
+    const apiErr = mockHc.getTerminal('t-api-err');
+    assert.equal(apiErr.ok, false);
+    assert.equal(apiErr.code, 'HC_API_ERROR');
+
+    // 3. sendTrigger --if idle fallback when flag rejected
+    rejectIfFlag = true;
+    const fbRes = mockHc.sendTrigger('t-done', 'ping', { ifIdle: true });
+    assert.equal(fbRes.ok, true);
+    assert.deepEqual(sendLog[0], ['send', '--if', 'idle', 't-done', 'ping']);
+    assert.deepEqual(sendLog[1], ['send', 't-done', 'ping']);
+    rejectIfFlag = false;
+
+    const server = createMcpServer({ store, hcClient: mockHc });
+
+    // 4. wake="auto" blocks bare shell with target_is_bare_shell and does NOT call hc send
+    const sendLogCountBefore = sendLog.length;
+    const bareRes = await server.handleMessage({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'relay_send', arguments: { to_terminal_id: 't-shell', message: 'Do not type in bare shell', wake: 'auto' } },
+    });
+    const bareData = JSON.parse(bareRes.result.content[0].text);
+    assert.equal(bareData.queued, true);
+    assert.equal(bareData.woke, false);
+    assert.equal(bareData.wakeReason, 'target_is_bare_shell');
+    assert.equal(sendLog.length, sendLogCountBefore);
+
+    // 5. from_terminal_id validated strictly
+    const badFrom = await server.handleMessage({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'relay_send', arguments: { to_terminal_id: 't-done', from_terminal_id: '../escape', message: 'hi', wake: 'never' } },
+    });
+    assert.equal(badFrom.result.isError, true);
+
+    // 6. Subagent (including camelCase meta.isSubagent: true) cannot call relay_send or relay_inbox(ack), CAN call relay_inbox(peek)
+    const subSend = await server.handleMessage({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: {
+        name: 'relay_send',
+        arguments: { to_terminal_id: 't-done', message: 'subagent unauthorized' },
+        _meta: { isSubagent: true },
+      },
+    });
+    assert.equal(subSend.result.isError, true);
+    assert.equal(JSON.parse(subSend.result.content[0].text).error, 'SUBAGENT_WRITE_DENIED');
+
+    const subAck = await server.handleMessage({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: {
+        name: 'relay_inbox',
+        arguments: { action: 'ack', message_id: 'all', terminal_id: 't-shell' },
+        _meta: { isSubagent: true },
+      },
+    });
+    assert.equal(subAck.result.isError, true);
+    assert.equal(JSON.parse(subAck.result.content[0].text).error, 'SUBAGENT_WRITE_DENIED');
+
+    const subPeek = await server.handleMessage({
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'tools/call',
+      params: {
+        name: 'relay_inbox',
+        arguments: { action: 'peek', terminal_id: 't-shell' },
+        _meta: { isSubagent: true },
+      },
+    });
+    assert.ok(!subPeek.result.isError);
+    assert.equal(JSON.parse(subPeek.result.content[0].text).count, 1);
+  } finally {
+    if (prevTid === undefined) delete process.env.HC_TERMINAL_ID;
+    else process.env.HC_TERMINAL_ID = prevTid;
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('P0-3, P0-11, P1-8, P1-11, P2-5 regression: MCP excludedProjects enforcement, derived_from array schema, depth<=10, project_dir, and -32603 error safety', async () => {
+  const env = makeTempEnv('cortex-mcp-p0-');
+  const excludedProj = path.join(env.root, 'excluded_mcp_proj');
+  const otherEnabledProj = path.join(env.root, 'other_enabled_proj');
+  fs.mkdirSync(excludedProj, { recursive: true });
+  fs.mkdirSync(otherEnabledProj, { recursive: true });
+
+  atomicWriteJson(path.join(env.globalDir, 'config.json'), {
+    mode: 'all',
+    excludedProjects: ['excluded_mcp_proj'],
+  });
+
+  const excludedStore = new CortexStore({ projectDir: excludedProj, globalDir: env.globalDir, disableVec: true });
+  const enabledStore = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+
+  try {
+    // 1. Check schema fixes & SERVER_INSTRUCTIONS
+    const enabledServer = createMcpServer({ store: enabledStore });
+    const initEnabled = await enabledServer.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+    assert.equal(initEnabled.result.instructions, SERVER_INSTRUCTIONS);
+    assert.match(SERVER_INSTRUCTIONS, /preferences/);
+    assert.match(SERVER_INSTRUCTIONS, /relay_inbox/);
+    assert.match(SERVER_INSTRUCTIONS, /product-planning/);
+    assert.match(SERVER_INSTRUCTIONS, /DEVELOPMENT_STANDARD/);
+
+    const listResp = await enabledServer.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    const saveTool = listResp.result.tools.find((t) => t.name === 'memory_save');
+    const updateTool = listResp.result.tools.find((t) => t.name === 'memory_update');
+    const graphTool = listResp.result.tools.find((t) => t.name === 'memory_graph');
+
+    assert.deepEqual(saveTool.inputSchema.properties.derived_from, { type: 'array', items: { type: 'string' } });
+    assert.deepEqual(updateTool.inputSchema.properties.derived_from, { type: 'array', items: { type: 'string' } });
+    assert.equal(graphTool.inputSchema.properties.depth.maximum, 10);
+
+    // notifications/roots/list_changed handled cleanly (returns null)
+    const rootsNotif = await enabledServer.handleMessage({ jsonrpc: '2.0', method: 'notifications/roots/list_changed' });
+    assert.equal(rootsNotif, null);
+
+    // 2. Excluded project server: instructions, PROJECT_EXCLUDED blocks, global reads/writes allowed, NEVER creates .memory/
+    const excludedServer = createMcpServer({ store: excludedStore });
+    const initExcluded = await excludedServer.handleMessage({ jsonrpc: '2.0', id: 3, method: 'initialize', params: {} });
+    assert.equal(initExcluded.result.instructions, EXCLUDED_SERVER_INSTRUCTIONS);
+
+    const saveProjBlocked = await excludedServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: { name: 'memory_save', arguments: { type: 'decision', title: 'Blocked', summary: 'Must fail' } },
+    });
+    assert.equal(saveProjBlocked.result.isError, true);
+    assert.equal(JSON.parse(saveProjBlocked.result.content[0].text).error, 'PROJECT_EXCLUDED');
+
+    const updateProjBlocked = await excludedServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'tools/call',
+      params: { name: 'memory_update', arguments: { id: 'dec-1', status: 'done' } },
+    });
+    assert.equal(updateProjBlocked.result.isError, true);
+    assert.equal(JSON.parse(updateProjBlocked.result.content[0].text).error, 'PROJECT_EXCLUDED');
+
+    const relayBlocked = await excludedServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 6,
+      method: 'tools/call',
+      params: { name: 'relay_send', arguments: { to_terminal_id: 't2', message: 'blocked' } },
+    });
+    assert.equal(relayBlocked.result.isError, true);
+    assert.equal(JSON.parse(relayBlocked.result.content[0].text).error, 'PROJECT_EXCLUDED');
+
+    // Global save + overview + search work on excluded project without EVER creating <excluded>/.memory/
+    const saveGlobal = await excludedServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'tools/call',
+      params: {
+        name: 'memory_save',
+        arguments: { scope: 'global', type: 'knowledge', category: 'preferences', title: 'Global Pref', summary: 'Use Korean' },
+      },
+    });
+    assert.ok(!saveGlobal.result.isError);
+
+    const ovExcluded = await excludedServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 8,
+      method: 'tools/call',
+      params: { name: 'memory_overview', arguments: { format: 'json' } },
+    });
+    const ovExData = JSON.parse(ovExcluded.result.content[0].text);
+    assert.equal(ovExData.projectExcluded, true);
+    assert.equal(ovExData.globalPreferences.length, 1);
+
+    const searchExcluded = await excludedServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 9,
+      method: 'tools/call',
+      params: { name: 'memory_search', arguments: { query: 'Korean', scope: 'all' } },
+    });
+    assert.ok(JSON.parse(searchExcluded.result.content[0].text).results.length >= 1);
+    assert.equal(fs.existsSync(path.join(excludedProj, '.memory')), false);
+
+    // 3. Cross-project relay_send targeting excluded project returns TARGET_PROJECT_EXCLUDED & never creates .memory/
+    const mockHcTargetExcl = createHcClient({
+      execFileSync(_bin, args) {
+        if (args[0] === 'get' && args[1] === 't-excl') {
+          return JSON.stringify({ address: 't-excl', state: 'live', foreground: { name: 'claude', status: 'idle', cwd: excludedProj } });
+        }
+        return '';
+      },
+    });
+    const xprojServer = createMcpServer({ store: enabledStore, hcClient: mockHcTargetExcl });
+    const targetExclResp = await xprojServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 10,
+      method: 'tools/call',
+      params: { name: 'relay_send', arguments: { to_terminal_id: 't-excl', message: 'Cannot land in excluded project' } },
+    });
+    assert.equal(targetExclResp.result.isError, true);
+    assert.equal(JSON.parse(targetExclResp.result.content[0].text).error, 'TARGET_PROJECT_EXCLUDED');
+    assert.equal(fs.existsSync(path.join(excludedProj, '.memory')), false);
+
+    // 4. Optional project_dir override works cleanly on memory_save & memory_search
+    const saveOther = await enabledServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'tools/call',
+      params: {
+        name: 'memory_save',
+        arguments: { id: 'other-doc-1', type: 'decision', title: 'Other workspace doc', summary: 'Stored via project_dir', project_dir: otherEnabledProj },
+      },
+    });
+    assert.ok(!saveOther.result.isError);
+    assert.equal(fs.existsSync(path.join(otherEnabledProj, '.memory', 'docs')), true);
+
+    const readOther = await enabledServer.handleMessage({
+      jsonrpc: '2.0',
+      id: 12,
+      method: 'tools/call',
+      params: { name: 'memory_read', arguments: { id: 'other-doc-1', scope: 'project', project_dir: otherEnabledProj } },
+    });
+    assert.equal(JSON.parse(readOther.result.content[0].text).id, 'other-doc-1');
+
+    // 5. P1-8: Stdio start() sends JSON-RPC -32603 error response if internal handleMessage throws (never hangs client)
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let outBuf = '';
+    output.on('data', (chunk) => { outBuf += chunk.toString('utf8'); });
+
+    const crashingServer = createMcpServer({
+      store: enabledStore,
+      input,
+      output,
+      extraTools: [],
+    });
+    // Force registry.listTools to throw to exercise start() catch path
+    crashingServer.registry.listTools = () => {
+      throw new Error('Simulated internal crash');
+    };
+    const handle = crashingServer.start();
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/list' })}\n`);
+    input.end();
+    await handle.done;
+
+    const errResp = JSON.parse(outBuf.trim());
+    assert.equal(errResp.id, 99);
+    assert.equal(errResp.error.code, -32603);
+    assert.match(errResp.error.message, /Simulated internal crash/);
+  } finally {
+    excludedStore.close();
+    enabledStore.close();
     env.cleanup();
   }
 });

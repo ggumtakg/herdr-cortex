@@ -17,11 +17,11 @@
    - `PN`의 모든 요구사항과 변경 경계가 실제 파일에 충실히 반영되었는가.
    - 대표 실행 증명이 실제 환경의 실제 입력→출력으로 성립하며 실패·누락이 없는가.
    - `DEVELOPMENT_STANDARD` 기준(불필요한 추가, 경계 검증, 영속 상태 소유권, 테스트 과잉/누락)에 어긋나지 않는가.
-4. 리뷰어는 `Verified Facts` / `Blockers` / `Minor Notes` / `Verdict`(`ACCEPT` 또는 `NEEDS_FIX`)를 구조화해 반환한다.
+4. 리뷰어는 `Verified Facts (확인된 사실)` / `Open Facts (미결 사실)` / `Blockers (필수 수정)` / `Minor Notes (참고 사항)` / `Verdict (판정: ACCEPT | NEEDS_FIX)` 5개 구획으로 구조화해 반환한다.
 
 ## Output (`memory_save` 기준선 계약)
 
-- HEAD가 `06` 결과 검수 판정(`Verdict`, 핵심 `Verified Facts` 및 `Blockers`)을 정리해 `memory_update(id: RESULT_ID, append_content: "...")`로 1차 검수 기록을 남긴다.
+- HEAD가 `06` 결과 검수 판정(`Verdict`, 핵심 `Verified Facts`, 미결 `Open Facts`, `Blockers`)을 정리해 `memory_update(id: RESULT_ID, append_content: "...")`로 1차 검수 기록을 남긴다.
 
 ## Next Step (다음 단계)
 

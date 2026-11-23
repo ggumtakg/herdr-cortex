@@ -3,10 +3,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
-  atomicWriteJson,
   ensureTierDirs,
   formatIsoTimestamp,
   getTierPaths,
+  isValidId,
   normalizeRelPath,
 } from './config.mjs';
 import { extractReferences, parseMarkdownDoc } from './frontmatter.mjs';
@@ -20,31 +20,39 @@ try {
 
 const vecEnabledDbs = new WeakSet();
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const CORE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS docs (
-  id           TEXT PRIMARY KEY,
-  path         TEXT NOT NULL UNIQUE,
-  type         TEXT NOT NULL,
-  status       TEXT NOT NULL,
-  session      TEXT NOT NULL DEFAULT '',
-  branch       TEXT NOT NULL DEFAULT '',
-  title        TEXT NOT NULL,
-  summary      TEXT NOT NULL,
-  tags         TEXT NOT NULL DEFAULT '[]',
-  due          TEXT NOT NULL DEFAULT '',
-  content      TEXT NOT NULL,
-  mtime_ms     REAL NOT NULL,
-  size         INTEGER NOT NULL,
-  hash         TEXT NOT NULL,
-  embed_status TEXT NOT NULL DEFAULT 'pending',
-  embed_model  TEXT NOT NULL DEFAULT '',
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL
+  id             TEXT PRIMARY KEY,
+  path           TEXT NOT NULL UNIQUE,
+  type           TEXT NOT NULL,
+  status         TEXT NOT NULL,
+  session        TEXT NOT NULL DEFAULT '',
+  branch         TEXT NOT NULL DEFAULT '',
+  title          TEXT NOT NULL,
+  summary        TEXT NOT NULL,
+  tags           TEXT NOT NULL DEFAULT '[]',
+  due            TEXT NOT NULL DEFAULT '',
+  content        TEXT NOT NULL,
+  mtime_ms       REAL NOT NULL,
+  size           INTEGER NOT NULL,
+  hash           TEXT NOT NULL,
+  content_hash   TEXT NOT NULL DEFAULT '',
+  embed_status   TEXT NOT NULL DEFAULT 'pending',
+  embed_model    TEXT NOT NULL DEFAULT '',
+  embed_attempts INTEGER NOT NULL DEFAULT 0,
+  embed_error    TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_docs_filter ON docs(status, type, session, branch, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_docs_embed  ON docs(embed_status, embed_model);
+
+CREATE TABLE IF NOT EXISTS index_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
   doc_id UNINDEXED,
@@ -65,6 +73,14 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src, kind);
 `;
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex');
+}
+
+export function computeContentHash(title, summary, content) {
+  return sha256(`${String(title ?? '')}\n${String(summary ?? '')}\n${String(content ?? '')}`);
+}
 
 function isCorruptionError(err) {
   if (!err) return false;
@@ -95,47 +111,108 @@ export function withTransaction(db, fn) {
   }
 }
 
-export function readIndexMeta(tierDir) {
-  const { indexMetaPath } = getTierPaths(tierDir);
+function defaultIndexMeta(schemaVersion = SCHEMA_VERSION) {
+  return {
+    schemaVersion,
+    embedProvider: '',
+    embedModel: '',
+    dimensions: 0,
+    updatedAt: '',
+  };
+}
+
+function readLegacyIndexMetaFile(tierDir) {
   try {
-    if (!fs.existsSync(indexMetaPath)) {
-      return {
-        schemaVersion: SCHEMA_VERSION,
-        embedProvider: '',
-        embedModel: '',
-        dimensions: 0,
-        updatedAt: '',
-      };
-    }
+    const { indexMetaPath } = getTierPaths(tierDir);
+    if (!fs.existsSync(indexMetaPath)) return null;
     const parsed = JSON.parse(fs.readFileSync(indexMetaPath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object') return null;
     return {
-      schemaVersion: Number(parsed.schemaVersion) || SCHEMA_VERSION,
+      schemaVersion: Number(parsed.schemaVersion) || 1,
       embedProvider: String(parsed.embedProvider || ''),
       embedModel: String(parsed.embedModel || ''),
       dimensions: Number(parsed.dimensions) || 0,
       updatedAt: String(parsed.updatedAt || ''),
     };
   } catch {
-    return {
-      schemaVersion: SCHEMA_VERSION,
-      embedProvider: '',
-      embedModel: '',
-      dimensions: 0,
-      updatedAt: '',
-    };
+    return null;
   }
 }
 
-export function writeIndexMeta(tierDir, meta) {
-  const { indexMetaPath } = getTierPaths(tierDir);
+function readIndexMetaFromDb(db) {
+  try {
+    const rows = db.prepare('SELECT key, value FROM index_meta').all();
+    if (!rows || rows.length === 0) {
+      return null;
+    }
+    const map = new Map();
+    for (const r of rows) {
+      map.set(r.key, r.value);
+    }
+    return {
+      schemaVersion: Number(map.get('schemaVersion')) || 1,
+      embedProvider: String(map.get('embedProvider') || ''),
+      embedModel: String(map.get('embedModel') || ''),
+      dimensions: Number(map.get('dimensions')) || 0,
+      updatedAt: String(map.get('updatedAt') || ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read index metadata from the SQLite `index_meta` table.
+ * Accepts either an open `DatabaseSync` instance (preferred) or a `tierDir` string for compatibility.
+ */
+export function readIndexMeta(dbOrTierDir) {
+  if (dbOrTierDir && typeof dbOrTierDir.prepare === 'function') {
+    return readIndexMetaFromDb(dbOrTierDir) || defaultIndexMeta(SCHEMA_VERSION);
+  }
+  if (typeof dbOrTierDir === 'string' && dbOrTierDir.trim()) {
+    const { dbPath } = getTierPaths(dbOrTierDir);
+    if (fs.existsSync(dbPath)) {
+      let tmpDb = null;
+      try {
+        tmpDb = new DatabaseSync(dbPath, { readOnly: true });
+        tmpDb.exec('PRAGMA busy_timeout = 2000;');
+        const fromDb = readIndexMetaFromDb(tmpDb);
+        if (fromDb) return fromDb;
+      } catch {
+        // fallback below
+      } finally {
+        if (tmpDb) {
+          try { tmpDb.close(); } catch { /* ignore */ }
+        }
+      }
+    }
+    const legacy = readLegacyIndexMetaFile(dbOrTierDir);
+    if (legacy) return legacy;
+  }
+  return defaultIndexMeta(SCHEMA_VERSION);
+}
+
+/**
+ * Write index metadata into the SQLite `index_meta` table.
+ * Safe to invoke inside an active transaction.
+ */
+export function writeIndexMeta(db, meta = {}) {
   const payload = {
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: Number(meta.schemaVersion) || SCHEMA_VERSION,
     embedProvider: String(meta.embedProvider || ''),
     embedModel: String(meta.embedModel || ''),
     dimensions: Number(meta.dimensions) || 0,
-    updatedAt: formatIsoTimestamp(),
+    updatedAt: meta.updatedAt ? String(meta.updatedAt) : formatIsoTimestamp(),
   };
-  atomicWriteJson(indexMetaPath, payload);
+
+  if (db && typeof db.prepare === 'function') {
+    const upsert = db.prepare('INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)');
+    upsert.run('schemaVersion', String(payload.schemaVersion));
+    upsert.run('embedProvider', payload.embedProvider);
+    upsert.run('embedModel', payload.embedModel);
+    upsert.run('dimensions', String(payload.dimensions));
+    upsert.run('updatedAt', payload.updatedAt);
+  }
   return payload;
 }
 
@@ -146,22 +223,54 @@ export function hasVectorTable(db) {
   return Boolean(row);
 }
 
+function isVectorTableSchemaCurrent(db) {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'doc_chunks_vec'")
+    .get();
+  if (!row || typeof row.sql !== 'string') return false;
+  const sql = row.sql;
+  if (/partition\s+key/i.test(sql)) return false;
+  if (!/\bstatus\s+TEXT\b/i.test(sql) || !/\btype\s+TEXT\b/i.test(sql)) return false;
+  return true;
+}
+
+function createVecTableSql(safeDims) {
+  return `
+    CREATE VIRTUAL TABLE doc_chunks_vec USING vec0(
+      doc_id TEXT,
+      status TEXT,
+      type TEXT,
+      embedding float[${safeDims}] distance_metric=cosine,
+      +chunk_index INTEGER,
+      +heading TEXT,
+      +snippet TEXT,
+      chunk_size=64
+    );
+  `;
+}
+
 /**
- * Create or rebuild doc_chunks_vec if embedModel or dimensions changed.
+ * Create or rebuild doc_chunks_vec if embedModel, dimensions, or vec0 schema changed.
+ * Updates `doc_chunks_vec`, `docs`, and `index_meta` atomically in ONE SQLite transaction.
+ * Supports both `ensureVectorTable(db, tierDir, opts)` and `ensureVectorTable(db, opts)`.
  * Returns { ready, rebuilt, dimensions, embedModel }.
  */
-export function ensureVectorTable(db, tierDir, { provider = '', model = '', dimensions = 0, vecAvailable = true } = {}) {
+export function ensureVectorTable(db, tierDirOrOpts = {}, maybeOpts) {
+  const opts = typeof tierDirOrOpts === 'string' ? (maybeOpts || {}) : (tierDirOrOpts || {});
+  const { provider = '', model = '', dimensions = 0, vecAvailable = true } = opts;
+
   const dims = Number(dimensions) || 0;
   if (!vecAvailable || dims <= 0) {
     return { ready: false, rebuilt: false, dimensions: 0, embedModel: model };
   }
 
-  const meta = readIndexMeta(tierDir);
+  const meta = readIndexMeta(db);
   const tableExists = hasVectorTable(db);
+  const schemaOutdated = tableExists && !isVectorTableSchemaCurrent(db);
   const metaMissing = tableExists && meta.dimensions === 0;
   const modelChanged = Boolean(meta.embedModel && model && meta.embedModel !== model);
   const dimsChanged = Boolean(meta.dimensions && meta.dimensions !== dims);
-  const needsRebuild = !tableExists || metaMissing || modelChanged || dimsChanged;
+  const needsRebuild = !tableExists || schemaOutdated || metaMissing || modelChanged || dimsChanged;
 
   if (needsRebuild) {
     const safeDims = Math.trunc(dims);
@@ -171,40 +280,54 @@ export function ensureVectorTable(db, tierDir, { provider = '', model = '', dime
 
     withTransaction(db, () => {
       db.exec('DROP TABLE IF EXISTS doc_chunks_vec;');
-      db.exec(`
-        CREATE VIRTUAL TABLE doc_chunks_vec USING vec0(
-          doc_id TEXT PARTITION KEY,
-          embedding float[${safeDims}] distance_metric=cosine,
-          +chunk_index INTEGER,
-          +heading TEXT,
-          +snippet TEXT
-        );
-      `);
-      db.exec("UPDATE docs SET embed_status = 'pending', embed_model = '';");
-    });
-
-    writeIndexMeta(tierDir, {
-      embedProvider: provider || meta.embedProvider,
-      embedModel: model || meta.embedModel,
-      dimensions: safeDims,
+      db.exec(createVecTableSql(safeDims));
+      db.exec("UPDATE docs SET embed_status = 'pending', embed_model = '', embed_attempts = 0, embed_error = '';");
+      writeIndexMeta(db, {
+        schemaVersion: SCHEMA_VERSION,
+        embedProvider: provider || meta.embedProvider,
+        embedModel: model || meta.embedModel,
+        dimensions: safeDims,
+      });
     });
 
     return { ready: true, rebuilt: true, dimensions: safeDims, embedModel: model };
   }
 
-  if (provider !== meta.embedProvider || model !== meta.embedModel) {
-    writeIndexMeta(tierDir, {
-      embedProvider: provider || meta.embedProvider,
-      embedModel: model || meta.embedModel,
-      dimensions: dims,
+  if (provider !== meta.embedProvider || model !== meta.embedModel || meta.schemaVersion !== SCHEMA_VERSION) {
+    withTransaction(db, () => {
+      writeIndexMeta(db, {
+        schemaVersion: SCHEMA_VERSION,
+        embedProvider: provider || meta.embedProvider,
+        embedModel: model || meta.embedModel,
+        dimensions: dims,
+      });
     });
   }
 
   return { ready: true, rebuilt: false, dimensions: dims, embedModel: model };
 }
 
-function unlinkDbFiles(dbPath) {
-  for (const suffix of ['', '-wal', '-shm']) {
+/**
+ * Safely unlink SQLite DB files during corruption recovery.
+ * Attempts to unlink `index.sqlite` FIRST; if locked (EBUSY/EPERM/EACCES),
+ * rethrows immediately WITHOUT deleting `-wal` or `-shm` so active readers/writers are not corrupted.
+ */
+export function unlinkDbFiles(dbPath) {
+  try {
+    if (fs.existsSync(dbPath)) {
+      fs.unlinkSync(dbPath);
+    }
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      // already gone, safe to clean sidecars
+    } else if (err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES')) {
+      throw err;
+    } else {
+      throw err;
+    }
+  }
+
+  for (const suffix of ['-wal', '-shm']) {
     const candidate = `${dbPath}${suffix}`;
     try {
       if (fs.existsSync(candidate)) fs.unlinkSync(candidate);
@@ -214,7 +337,105 @@ function unlinkDbFiles(dbPath) {
   }
 }
 
-function initDatabaseInstance(dbPath, { disableVec = false } = {}) {
+function migrateSchemaIfNeeded(db, tierDir, vecAvailable) {
+  // 1. Add missing v2 columns to existing docs tables
+  const colRows = db.prepare('PRAGMA table_info(docs)').all();
+  const cols = new Set(colRows.map((c) => c.name));
+  const needsContentHashBackfill = !cols.has('content_hash');
+
+  if (!cols.has('content_hash')) {
+    db.exec("ALTER TABLE docs ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';");
+  }
+  if (!cols.has('embed_attempts')) {
+    db.exec('ALTER TABLE docs ADD COLUMN embed_attempts INTEGER NOT NULL DEFAULT 0;');
+  }
+  if (!cols.has('embed_error')) {
+    db.exec("ALTER TABLE docs ADD COLUMN embed_error TEXT NOT NULL DEFAULT '';");
+  }
+
+  if (needsContentHashBackfill) {
+    const rows = db.prepare("SELECT id, title, summary, content FROM docs WHERE content_hash = ''").all();
+    if (rows.length > 0) {
+      withTransaction(db, () => {
+        const upd = db.prepare('UPDATE docs SET content_hash = ? WHERE id = ?');
+        for (const r of rows) {
+          upd.run(computeContentHash(r.title, r.summary, r.content), r.id);
+        }
+      });
+    }
+  }
+
+  // 2. Migrate legacy state/index-meta.json into SQLite index_meta table if empty
+  let dbMeta = readIndexMetaFromDb(db);
+  if (!dbMeta) {
+    const legacy = tierDir ? readLegacyIndexMetaFile(tierDir) : null;
+    if (legacy) {
+      withTransaction(db, () => {
+        writeIndexMeta(db, {
+          schemaVersion: legacy.schemaVersion || 1,
+          embedProvider: legacy.embedProvider,
+          embedModel: legacy.embedModel,
+          dimensions: legacy.dimensions,
+          updatedAt: legacy.updatedAt || formatIsoTimestamp(),
+        });
+      });
+      dbMeta = readIndexMetaFromDb(db);
+    } else {
+      const hasVec = hasVectorTable(db);
+      const initialVer = hasVec && !isVectorTableSchemaCurrent(db) ? 1 : SCHEMA_VERSION;
+      withTransaction(db, () => {
+        writeIndexMeta(db, { schemaVersion: initialVer });
+      });
+      dbMeta = readIndexMetaFromDb(db);
+    }
+  }
+
+  // 3. Upgrade outdated v1 doc_chunks_vec (with PARTITION KEY) automatically when vecAvailable
+  const hasVec = hasVectorTable(db);
+  const outdatedVec = hasVec && !isVectorTableSchemaCurrent(db);
+
+  if (vecAvailable && (outdatedVec || (dbMeta && dbMeta.schemaVersion < SCHEMA_VERSION))) {
+    if (dbMeta && dbMeta.dimensions > 0) {
+      ensureVectorTable(db, {
+        provider: dbMeta.embedProvider,
+        model: dbMeta.embedModel,
+        dimensions: dbMeta.dimensions,
+        vecAvailable: true,
+      });
+    } else if (outdatedVec) {
+      withTransaction(db, () => {
+        db.exec('DROP TABLE IF EXISTS doc_chunks_vec;');
+        db.exec("UPDATE docs SET embed_status = 'pending', embed_model = '', embed_attempts = 0, embed_error = '';");
+        writeIndexMeta(db, {
+          schemaVersion: SCHEMA_VERSION,
+          embedProvider: dbMeta?.embedProvider || '',
+          embedModel: dbMeta?.embedModel || '',
+          dimensions: 0,
+        });
+      });
+    } else {
+      withTransaction(db, () => {
+        writeIndexMeta(db, {
+          schemaVersion: SCHEMA_VERSION,
+          embedProvider: dbMeta?.embedProvider || '',
+          embedModel: dbMeta?.embedModel || '',
+          dimensions: dbMeta?.dimensions || 0,
+        });
+      });
+    }
+  } else if (!outdatedVec && dbMeta && dbMeta.schemaVersion < SCHEMA_VERSION) {
+    withTransaction(db, () => {
+      writeIndexMeta(db, {
+        schemaVersion: SCHEMA_VERSION,
+        embedProvider: dbMeta.embedProvider,
+        embedModel: dbMeta.embedModel,
+        dimensions: dbMeta.dimensions,
+      });
+    });
+  }
+}
+
+function initDatabaseInstance(dbPath, { disableVec = false, tierDir = '' } = {}) {
   const db = new DatabaseSync(dbPath, { allowExtension: true });
   try {
     db.exec('PRAGMA busy_timeout = 5000;');
@@ -240,6 +461,7 @@ function initDatabaseInstance(dbPath, { disableVec = false } = {}) {
     }
 
     db.exec(CORE_SCHEMA_SQL);
+    migrateSchemaIfNeeded(db, tierDir, vecAvailable);
     return { db, vecAvailable };
   } catch (err) {
     try {
@@ -264,7 +486,7 @@ export function openTierDb(tierDir, options = {}) {
   let recovered = false;
 
   try {
-    const opened = initDatabaseInstance(paths.dbPath, { disableVec });
+    const opened = initDatabaseInstance(paths.dbPath, { disableVec, tierDir: paths.root });
     db = opened.db;
     vecAvailable = opened.vecAvailable;
   } catch (err) {
@@ -276,16 +498,16 @@ export function openTierDb(tierDir, options = {}) {
       throw err;
     }
     unlinkDbFiles(paths.dbPath);
-    const opened = initDatabaseInstance(paths.dbPath, { disableVec });
+    const opened = initDatabaseInstance(paths.dbPath, { disableVec, tierDir: paths.root });
     db = opened.db;
     vecAvailable = opened.vecAvailable;
     recovered = true;
   }
 
-  // Restore vector table if index-meta.json already records dimensions
-  const meta = readIndexMeta(tierDir);
+  // Restore vector table if index_meta already records dimensions
+  const meta = readIndexMeta(db);
   if (vecAvailable && meta.dimensions > 0 && !hasVectorTable(db)) {
-    ensureVectorTable(db, tierDir, {
+    ensureVectorTable(db, {
       provider: meta.embedProvider,
       model: meta.embedModel,
       dimensions: meta.dimensions,
@@ -324,18 +546,45 @@ function collectMarkdownFiles(docsDir) {
       }
     }
   }
+  files.sort((a, b) => a.localeCompare(b));
   return files;
 }
 
-function sha256(text) {
-  return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+function sanitizeManualDocId(rawId, fallbackId, relPath) {
+  const trimmed = String(rawId || '').trim();
+  if (trimmed && isValidId(trimmed)) {
+    return trimmed;
+  }
+  if (trimmed) {
+    console.error(`[herdr-cortex] Warning: invalid frontmatter id "${trimmed}" in "${relPath}"; falling back to filename.`);
+  }
+  const fb = String(fallbackId || '').trim();
+  if (fb && isValidId(fb)) {
+    return fb;
+  }
+  const cleaned = fb
+    .replace(/[^a-zA-Z0-9가-힣._-]+/g, '-')
+    .replace(/\.{2,}/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '')
+    .slice(0, 120);
+  if (cleaned && isValidId(cleaned)) {
+    console.error(`[herdr-cortex] Warning: sanitized invalid doc filename id "${fb}" -> "${cleaned}" in "${relPath}".`);
+    return cleaned;
+  }
+  const prefixed = `doc-${cleaned || sha256(relPath).slice(0, 12)}`.slice(0, 128);
+  if (isValidId(prefixed)) {
+    console.error(`[herdr-cortex] Warning: sanitized invalid doc id in "${relPath}" -> "${prefixed}".`);
+    return prefixed;
+  }
+  return null;
 }
 
 function normalizeDocRecord(absPath, tierDir, rawText, stat) {
   const relPath = normalizeRelPath(path.relative(tierDir, absPath));
   const { frontmatter, body } = parseMarkdownDoc(rawText);
   const fallbackId = path.basename(absPath, path.extname(absPath));
-  const id = String(frontmatter.id || fallbackId).trim() || fallbackId;
+  const id = sanitizeManualDocId(frontmatter.id, fallbackId, relPath);
+  if (!id) return null;
 
   const type = String(frontmatter.type || 'knowledge').trim() || 'knowledge';
   const status = String(frontmatter.status || 'active').trim() || 'active';
@@ -356,6 +605,7 @@ function normalizeDocRecord(absPath, tierDir, rawText, stat) {
   const updated_at = String(frontmatter.updated_at || created_at).trim();
 
   const refs = extractReferences(body, frontmatter);
+  const contentHash = computeContentHash(title, summary, body);
 
   return {
     doc: {
@@ -374,6 +624,7 @@ function normalizeDocRecord(absPath, tierDir, rawText, stat) {
       mtime_ms: stat.mtimeMs,
       size: stat.size,
       hash: sha256(rawText),
+      content_hash: contentHash,
       created_at,
       updated_at,
     },
@@ -381,24 +632,41 @@ function normalizeDocRecord(absPath, tierDir, rawText, stat) {
   };
 }
 
-function prepareVecDelete(db) {
-  if (!vecEnabledDbs.has(db) || !hasVectorTable(db)) return null;
-  try {
-    return db.prepare('DELETE FROM doc_chunks_vec WHERE doc_id = ?');
-  } catch {
-    return null;
+function prepareVecStatements(db) {
+  if (!vecEnabledDbs.has(db) || !hasVectorTable(db)) {
+    return { deleteVecById: null, updateVecMeta: null };
   }
+  let deleteVecById = null;
+  let updateVecMeta = null;
+  try {
+    deleteVecById = db.prepare('DELETE FROM doc_chunks_vec WHERE doc_id = ?');
+  } catch {
+    deleteVecById = null;
+  }
+  try {
+    if (isVectorTableSchemaCurrent(db)) {
+      updateVecMeta = db.prepare('UPDATE doc_chunks_vec SET status = ?, type = ? WHERE doc_id = ?');
+    }
+  } catch {
+    updateVecMeta = null;
+  }
+  return { deleteVecById, updateVecMeta };
 }
 
 function upsertDocStatements(db) {
+  const vecStmts = prepareVecStatements(db);
   return {
     upsertDoc: db.prepare(`
       INSERT INTO docs (
         id, path, type, status, session, branch, title, summary, tags, due,
-        content, mtime_ms, size, hash, embed_status, embed_model, created_at, updated_at
+        content, mtime_ms, size, hash, content_hash,
+        embed_status, embed_model, embed_attempts, embed_error,
+        created_at, updated_at
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, 'pending', '', ?, ?
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?
       )
       ON CONFLICT(id) DO UPDATE SET
         path = excluded.path,
@@ -414,8 +682,11 @@ function upsertDocStatements(db) {
         mtime_ms = excluded.mtime_ms,
         size = excluded.size,
         hash = excluded.hash,
-        embed_status = 'pending',
-        embed_model = '',
+        content_hash = excluded.content_hash,
+        embed_status = excluded.embed_status,
+        embed_model = excluded.embed_model,
+        embed_attempts = excluded.embed_attempts,
+        embed_error = excluded.embed_error,
         created_at = excluded.created_at,
         updated_at = excluded.updated_at
     `),
@@ -423,7 +694,8 @@ function upsertDocStatements(db) {
     deleteDocById: db.prepare('DELETE FROM docs WHERE id = ?'),
     deleteFtsById: db.prepare('DELETE FROM docs_fts WHERE doc_id = ?'),
     insertFts: db.prepare('INSERT INTO docs_fts (doc_id, title, summary, tags, content) VALUES (?, ?, ?, ?, ?)'),
-    deleteVecById: prepareVecDelete(db),
+    deleteVecById: vecStmts.deleteVecById,
+    updateVecMeta: vecStmts.updateVecMeta,
     deleteOutEdges: db.prepare("DELETE FROM edges WHERE src = ? AND kind != 'session_next'"),
     deleteSessionNextForDoc: db.prepare("DELETE FROM edges WHERE (src = ? OR dst = ?) AND kind = 'session_next'"),
     deleteAllDocEdges: db.prepare('DELETE FROM edges WHERE src = ? OR dst = ?'),
@@ -431,8 +703,19 @@ function upsertDocStatements(db) {
   };
 }
 
-function writeDocAndEdges(stmts, record) {
+function writeDocAndEdges(stmts, record, prevDoc = null) {
   const { doc, refs } = record;
+  const preserveVectors = Boolean(
+    prevDoc
+    && prevDoc.id === doc.id
+    && prevDoc.content_hash
+    && prevDoc.content_hash === doc.content_hash,
+  );
+
+  const embedStatus = preserveVectors ? (prevDoc.embed_status || 'pending') : 'pending';
+  const embedModel = preserveVectors ? (prevDoc.embed_model || '') : '';
+  const embedAttempts = preserveVectors ? (Number(prevDoc.embed_attempts) || 0) : 0;
+  const embedError = preserveVectors ? (prevDoc.embed_error || '') : '';
 
   stmts.upsertDoc.run(
     doc.id,
@@ -449,14 +732,30 @@ function writeDocAndEdges(stmts, record) {
     doc.mtime_ms,
     doc.size,
     doc.hash,
+    doc.content_hash,
+    embedStatus,
+    embedModel,
+    embedAttempts,
+    embedError,
     doc.created_at,
     doc.updated_at,
   );
 
+  doc.embed_status = embedStatus;
+  doc.embed_model = embedModel;
+
   stmts.deleteFtsById.run(doc.id);
   stmts.insertFts.run(doc.id, doc.title, doc.summary, doc.tagsText, doc.content);
 
-  if (stmts.deleteVecById) {
+  if (preserveVectors) {
+    if (stmts.updateVecMeta) {
+      try {
+        stmts.updateVecMeta.run(doc.status, doc.type, doc.id);
+      } catch {
+        // ignore if vec0 update unavailable
+      }
+    }
+  } else if (stmts.deleteVecById) {
     stmts.deleteVecById.run(doc.id);
   }
 
@@ -515,24 +814,38 @@ export function syncSingleFile(db, tierDir, absFilePath) {
   const stat = fs.statSync(resolvedFile);
   const rawText = fs.readFileSync(resolvedFile, 'utf8');
   const record = normalizeDocRecord(resolvedFile, root, rawText, stat);
-
-  const prev = db.prepare('SELECT id, session FROM docs WHERE path = ? OR id = ?').get(record.doc.path, record.doc.id);
-  const affectedSessions = new Set();
-  if (prev?.session) affectedSessions.add(prev.session);
-  if (record.doc.session) affectedSessions.add(record.doc.session);
+  if (!record) {
+    throw new Error(`Unable to derive valid document ID for "${resolvedFile}"`);
+  }
 
   withTransaction(db, () => {
+    const prevByPath = db
+      .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error FROM docs WHERE path = ?')
+      .get(record.doc.path);
+    const prevById = db
+      .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error FROM docs WHERE id = ?')
+      .get(record.doc.id);
+
+    const affectedSessions = new Set();
+    if (prevByPath?.session) affectedSessions.add(prevByPath.session);
+    if (prevById?.session) affectedSessions.add(prevById.session);
+    if (record.doc.session) affectedSessions.add(record.doc.session);
+
     const stmts = upsertDocStatements(db);
-    if (prev && prev.id !== record.doc.id) {
-      stmts.deleteDocById.run(prev.id);
-      stmts.deleteFtsById.run(prev.id);
-      if (stmts.deleteVecById) stmts.deleteVecById.run(prev.id);
-      stmts.deleteAllDocEdges.run(prev.id, prev.id);
+
+    if (prevByPath && prevByPath.id !== record.doc.id) {
+      stmts.deleteDocById.run(prevByPath.id);
+      stmts.deleteFtsById.run(prevByPath.id);
+      if (stmts.deleteVecById) stmts.deleteVecById.run(prevByPath.id);
+      stmts.deleteAllDocEdges.run(prevByPath.id, prevByPath.id);
     }
-    if (prev && prev.session !== record.doc.session) {
+
+    const prevForDoc = prevById || (prevByPath?.id === record.doc.id ? prevByPath : null);
+    if (prevForDoc && prevForDoc.session !== record.doc.session) {
       stmts.deleteSessionNextForDoc.run(record.doc.id, record.doc.id);
     }
-    writeDocAndEdges(stmts, record);
+
+    writeDocAndEdges(stmts, record, prevForDoc);
     rebuildSessionNextEdges(db, affectedSessions);
   });
 
@@ -541,74 +854,111 @@ export function syncSingleFile(db, tierDir, absFilePath) {
 
 /**
  * Incrementally sync all Markdown files in <tierDir>/docs/ into SQLite.
- * Checks (mtime_ms, size) first, then SHA-256 hash; removes deleted files.
+ * Reads existing state INSIDE a `BEGIN IMMEDIATE` transaction to prevent TOCTOU races.
+ * Checks (mtime_ms, size) first, then SHA-256 hash; detects duplicate IDs; removes deleted files.
  */
 export function syncFromDisk(db, tierDir) {
   const paths = ensureTierDirs(tierDir);
   const diskFiles = collectMarkdownFiles(paths.docsDir);
 
-  const existingRows = db
-    .prepare('SELECT id, path, mtime_ms, size, hash, session FROM docs')
-    .all();
-
-  const byPath = new Map();
-  for (const row of existingRows) {
-    byPath.set(row.path, row);
-  }
-
-  const seenPaths = new Set();
-  const toUpsert = [];
-  const toStatOnly = [];
-  const affectedSessions = new Set();
-
-  for (const absPath of diskFiles) {
-    let stat;
-    try {
-      stat = fs.statSync(absPath);
-    } catch {
-      continue;
-    }
-
-    const relPath = normalizeRelPath(path.relative(paths.root, absPath));
-    seenPaths.add(relPath);
-
-    const existing = byPath.get(relPath);
-    if (existing && existing.mtime_ms === stat.mtimeMs && existing.size === stat.size) {
-      continue;
-    }
-
-    let rawText;
-    try {
-      rawText = fs.readFileSync(absPath, 'utf8');
-    } catch {
-      continue;
-    }
-
-    const contentHash = sha256(rawText);
-    if (existing && existing.hash === contentHash) {
-      toStatOnly.push({ id: existing.id, mtime_ms: stat.mtimeMs, size: stat.size });
-      continue;
-    }
-
-    const record = normalizeDocRecord(absPath, paths.root, rawText, stat);
-    toUpsert.push({ record, prev: existing || null });
-    if (existing?.session) affectedSessions.add(existing.session);
-    if (record.doc.session) affectedSessions.add(record.doc.session);
-  }
-
-  const toDelete = [];
-  for (const row of existingRows) {
-    if (!seenPaths.has(row.path)) {
-      toDelete.push(row);
-      if (row.session) affectedSessions.add(row.session);
-    }
-  }
-
-  if (toUpsert.length === 0 && toStatOnly.length === 0 && toDelete.length === 0) {
-    return { addedOrUpdated: 0, statUpdated: 0, deleted: 0 };
-  }
+  let addedOrUpdated = 0;
+  let statUpdated = 0;
+  let deleted = 0;
 
   withTransaction(db, () => {
+    const existingRows = db
+      .prepare('SELECT id, path, mtime_ms, size, hash, content_hash, session, embed_status, embed_model, embed_attempts, embed_error FROM docs')
+      .all();
+
+    const byPath = new Map();
+    const byId = new Map();
+    for (const row of existingRows) {
+      byPath.set(row.path, row);
+      byId.set(row.id, row);
+    }
+
+    const seenPaths = new Set();
+    const seenIds = new Map(); // id -> winning relPath
+    const toUpsert = [];
+    const toStatOnly = [];
+    const affectedSessions = new Set();
+
+    for (const absPath of diskFiles) {
+      let stat;
+      try {
+        stat = fs.statSync(absPath);
+      } catch {
+        continue;
+      }
+
+      const relPath = normalizeRelPath(path.relative(paths.root, absPath));
+      const existing = byPath.get(relPath);
+
+      if (existing && existing.mtime_ms === stat.mtimeMs && existing.size === stat.size) {
+        if (seenIds.has(existing.id)) {
+          console.error(
+            `[herdr-cortex] Warning: duplicate document ID "${existing.id}" in "${relPath}" (already indexed at "${seenIds.get(existing.id)}"); skipping duplicate.`,
+          );
+          continue;
+        }
+        seenPaths.add(relPath);
+        seenIds.set(existing.id, relPath);
+        continue;
+      }
+
+      let rawText;
+      try {
+        rawText = fs.readFileSync(absPath, 'utf8');
+      } catch {
+        continue;
+      }
+
+      const fileHash = sha256(rawText);
+      if (existing && existing.hash === fileHash) {
+        if (seenIds.has(existing.id)) {
+          console.error(
+            `[herdr-cortex] Warning: duplicate document ID "${existing.id}" in "${relPath}" (already indexed at "${seenIds.get(existing.id)}"); skipping duplicate.`,
+          );
+          continue;
+        }
+        seenPaths.add(relPath);
+        seenIds.set(existing.id, relPath);
+        toStatOnly.push({ id: existing.id, mtime_ms: stat.mtimeMs, size: stat.size });
+        continue;
+      }
+
+      const record = normalizeDocRecord(absPath, paths.root, rawText, stat);
+      if (!record) continue;
+
+      if (seenIds.has(record.doc.id)) {
+        console.error(
+          `[herdr-cortex] Warning: duplicate document ID "${record.doc.id}" in "${relPath}" (already indexed at "${seenIds.get(record.doc.id)}"); skipping duplicate.`,
+        );
+        continue;
+      }
+
+      seenPaths.add(relPath);
+      seenIds.set(record.doc.id, relPath);
+
+      const prevById = byId.get(record.doc.id) || null;
+      toUpsert.push({ record, prevByPath: existing || null, prevById });
+      if (existing?.session) affectedSessions.add(existing.session);
+      if (prevById?.session) affectedSessions.add(prevById.session);
+      if (record.doc.session) affectedSessions.add(record.doc.session);
+    }
+
+    const toDelete = [];
+    for (const row of existingRows) {
+      if (!seenPaths.has(row.path)) {
+        toDelete.push(row);
+        if (row.session) affectedSessions.add(row.session);
+      }
+    }
+
+    if (toUpsert.length === 0 && toStatOnly.length === 0 && toDelete.length === 0) {
+      return;
+    }
+
     const stmts = upsertDocStatements(db);
 
     for (const item of toStatOnly) {
@@ -616,31 +966,39 @@ export function syncFromDisk(db, tierDir) {
     }
 
     for (const row of toDelete) {
+      // If the same doc ID moved to a new path in `toUpsert`, delete old row cleanly without losing vector check via prevById
       stmts.deleteDocById.run(row.id);
       stmts.deleteFtsById.run(row.id);
-      if (stmts.deleteVecById) stmts.deleteVecById.run(row.id);
+      if (!seenIds.has(row.id) && stmts.deleteVecById) {
+        stmts.deleteVecById.run(row.id);
+      }
       stmts.deleteAllDocEdges.run(row.id, row.id);
     }
 
-    for (const { record, prev } of toUpsert) {
-      if (prev && prev.id !== record.doc.id) {
-        stmts.deleteDocById.run(prev.id);
-        stmts.deleteFtsById.run(prev.id);
-        if (stmts.deleteVecById) stmts.deleteVecById.run(prev.id);
-        stmts.deleteAllDocEdges.run(prev.id, prev.id);
+    for (const { record, prevByPath, prevById } of toUpsert) {
+      if (prevByPath && prevByPath.id !== record.doc.id) {
+        stmts.deleteDocById.run(prevByPath.id);
+        stmts.deleteFtsById.run(prevByPath.id);
+        if (stmts.deleteVecById) stmts.deleteVecById.run(prevByPath.id);
+        stmts.deleteAllDocEdges.run(prevByPath.id, prevByPath.id);
       }
-      if (prev && prev.session !== record.doc.session) {
+      const prevForDoc = prevById || (prevByPath?.id === record.doc.id ? prevByPath : null);
+      if (prevForDoc && prevForDoc.session !== record.doc.session) {
         stmts.deleteSessionNextForDoc.run(record.doc.id, record.doc.id);
       }
-      writeDocAndEdges(stmts, record);
+      writeDocAndEdges(stmts, record, prevForDoc);
     }
 
     rebuildSessionNextEdges(db, affectedSessions);
+
+    addedOrUpdated = toUpsert.length;
+    statUpdated = toStatOnly.length;
+    deleted = toDelete.filter((r) => !seenIds.has(r.id)).length;
   });
 
   return {
-    addedOrUpdated: toUpsert.length,
-    statUpdated: toStatOnly.length,
-    deleted: toDelete.length,
+    addedOrUpdated,
+    statUpdated,
+    deleted,
   };
 }

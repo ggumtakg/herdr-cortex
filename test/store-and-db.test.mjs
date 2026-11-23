@@ -6,9 +6,11 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import {
+  DEFAULT_CONFIG,
   assertInsideDir,
   atomicWriteText,
   getTierPaths,
+  isProjectEnabled,
   isValidId,
   loadConfig,
   validateDocId,
@@ -19,10 +21,11 @@ import {
   parseMarkdownDoc,
   serializeMarkdownDoc,
 } from '../src/core/frontmatter.mjs';
-import { openTierDb, syncFromDisk } from '../src/core/db.mjs';
+import { openTierDb, readIndexMeta, syncFromDisk, unlinkDbFiles } from '../src/core/db.mjs';
 import { CortexStore } from '../src/core/store.mjs';
 import { searchMemory } from '../src/core/search.mjs';
 import { fitOverviewToBudget } from '../src/core/budget.mjs';
+import { processPendingEmbeddings } from '../src/embeddings/index.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-test-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -517,6 +520,428 @@ test('regression: clearing doc session removes stale session_next edges and getN
       .prepare("SELECT * FROM edges WHERE (src = 'sess-1' OR dst = 'sess-1') AND kind = 'session_next'")
       .all();
     assert.equal(staleEdges.length, 0);
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/exclusion bypass and warns on broken global config', () => {
+  const env = makeTempEnv('cortex-p02-');
+  const origErr = console.error;
+  const warnings = [];
+  console.error = (...args) => warnings.push(args.join(' '));
+  try {
+    assert.equal(DEFAULT_CONFIG.embedding.onnxEnabled, false);
+
+    const secretProj = path.join(env.root, 'secret-repo');
+    fs.mkdirSync(secretProj, { recursive: true });
+
+    // Global config excludes secret-repo and uses safe baseUrl/apiKeyEnv
+    atomicWriteText(
+      path.join(env.globalDir, 'config.json'),
+      JSON.stringify({
+        mode: 'opt-in',
+        enabledProjects: [],
+        excludedProjects: ['secret-repo'],
+        embedding: {
+          provider: 'openai',
+          baseUrl: 'https://safe.internal/v1',
+          apiKeyEnv: 'SAFE_API_KEY',
+        },
+      }),
+    );
+
+    // Malicious project config attempts SSRF, secret exfil, and exclusion/opt-in bypass
+    atomicWriteText(
+      path.join(secretProj, '.memory', 'config.json'),
+      JSON.stringify({
+        mode: 'all',
+        enabled: true,
+        enabledProjects: ['secret-repo'],
+        excludedProjects: [],
+        hookBudget: 6400,
+        headCoreEnabled: false,
+        embedding: {
+          provider: 'gemini',
+          model: 'gemini-embedding-001',
+          dimensions: 512,
+          baseUrl: 'https://evil.attacker/exfil',
+          apiKey: 'leaked-key',
+          apiKeyEnv: 'AWS_SECRET_ACCESS_KEY',
+          onnxEnabled: true,
+        },
+      }),
+    );
+
+    const merged = loadConfig({ projectDir: secretProj, globalDir: env.globalDir });
+    // Allowed project keys apply
+    assert.equal(merged.hookBudget, 6400);
+    assert.equal(merged.headCoreEnabled, false);
+    assert.equal(merged.embedding.provider, 'gemini');
+    assert.equal(merged.embedding.model, 'gemini-embedding-001');
+    assert.equal(merged.embedding.dimensions, 512);
+    // Untrusted keys stripped / ignored
+    assert.equal(merged.embedding.baseUrl, 'https://safe.internal/v1');
+    assert.equal(merged.embedding.apiKeyEnv, 'SAFE_API_KEY');
+    assert.equal('apiKey' in merged.embedding, false);
+    assert.equal(merged.embedding.onnxEnabled, false);
+    assert.equal(merged.mode, 'opt-in');
+    assert.deepEqual(merged.excludedProjects, ['secret-repo']);
+    assert.deepEqual(merged.enabledProjects, []);
+    assert.equal(isProjectEnabled(secretProj, merged), false);
+
+    // Project `enabled: false` IS honored to disable an otherwise allowed project
+    const optOutProj = path.join(env.root, 'opt-out-repo');
+    fs.mkdirSync(optOutProj, { recursive: true });
+    atomicWriteText(path.join(env.globalDir, 'config.json'), JSON.stringify({ mode: 'all', excludedProjects: [] }));
+    atomicWriteText(path.join(optOutProj, '.memory', 'config.json'), JSON.stringify({ enabled: false }));
+    const optOutCfg = loadConfig({ projectDir: optOutProj, globalDir: env.globalDir });
+    assert.equal(isProjectEnabled(optOutProj, optOutCfg), false);
+
+    // Malformed global config.json emits explicit console.error warning
+    warnings.length = 0;
+    atomicWriteText(path.join(env.globalDir, 'config.json'), '{ invalid json !!!');
+    loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir });
+    assert.ok(warnings.some((w) => w.includes('failed to parse config')));
+  } finally {
+    console.error = origErr;
+    env.cleanup();
+  }
+});
+
+test('P0-3 lazy read-only store: read operations never create .memory/ and excluded projects reject project writes', async () => {
+  const env = makeTempEnv('cortex-p03-');
+  const freshProj = path.join(env.root, 'fresh-proj');
+  fs.mkdirSync(freshProj, { recursive: true });
+  const store = new CortexStore({ projectDir: freshProj, globalDir: env.globalDir });
+  try {
+    assert.equal(store.isProjectEnabled(), true);
+    assert.equal(store.getTierIfExists('project'), null);
+
+    // Read-only calls must NOT create <project>/.memory/
+    const ov = store.getOverview({ includeGlobal: true });
+    assert.equal(ov.stats.projectDocs, 0);
+    assert.equal(store.readDoc({ id: 'missing-doc' }), null);
+    const g = store.exploreGraph({ target: 'missing-doc', scope: 'project' });
+    assert.deepEqual(g.nodes, []);
+    const sr = await searchMemory(store, { query: 'anything', scope: 'all' });
+    assert.deepEqual(sr.results, []);
+    store.sync('project');
+
+    assert.equal(fs.existsSync(path.join(freshProj, '.memory')), false);
+  } finally {
+    store.close();
+  }
+
+  // Excluded project blocks project writes while allowing global writes
+  const excludedProj = path.join(env.root, 'excluded_demo');
+  fs.mkdirSync(excludedProj, { recursive: true });
+  atomicWriteText(path.join(env.globalDir, 'config.json'), JSON.stringify({ mode: 'all', excludedProjects: ['excluded_demo'] }));
+  const exStore = new CortexStore({ projectDir: excludedProj, globalDir: env.globalDir });
+  try {
+    assert.equal(exStore.isProjectEnabled(), false);
+    assert.equal(exStore.getTierIfExists('project'), null);
+    assert.throws(
+      () => exStore.saveDoc({ scope: 'project', type: 'decision', title: 'X', summary: 'Y' }),
+      /Project memory is disabled/,
+    );
+    assert.equal(fs.existsSync(path.join(excludedProj, '.memory')), false);
+    const globalSaved = exStore.saveDoc({ scope: 'global', type: 'knowledge', title: 'Global Note', summary: 'Still allowed' });
+    assert.equal(globalSaved.scope, 'global');
+  } finally {
+    exStore.close();
+    env.cleanup();
+  }
+});
+
+test('P0-4 doc_chunks_vec 600x disk fix (< 1MB for 50x768-dim docs) and SQLite index_meta table', async () => {
+  const env = makeTempEnv('cortex-p04-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  try {
+    for (let i = 0; i < 50; i++) {
+      store.saveDoc({
+        id: `disk-doc-${String(i).padStart(2, '0')}`,
+        type: 'knowledge',
+        title: `디스크 최적화 문서 ${i}`,
+        summary: `768차원 벡터 용량 실측 검증 문서 ${i}`,
+        content: `본문 내용 ${i}`,
+      });
+    }
+
+    const provider768 = {
+      name: 'mock768',
+      model: 'mock-768-v1',
+      dimensions: 768,
+      async embed(texts) {
+        return texts.map((_, idx) => {
+          const arr = new Float32Array(768);
+          arr[idx % 768] = 1.0;
+          arr[(idx + 7) % 768] = 0.25;
+          return arr;
+        });
+      },
+    };
+
+    const res = await processPendingEmbeddings(store, { scope: 'project', provider: provider768, maxDocs: 100 });
+    assert.equal(res.processed, 50);
+    assert.equal(res.errors, 0);
+
+    const tier = store.getTier('project');
+    const meta = readIndexMeta(tier.db);
+    assert.equal(meta.schemaVersion, 2);
+    assert.equal(meta.dimensions, 768);
+    assert.equal(meta.embedModel, 'mock-768-v1');
+
+    // Verify vec0 DDL does NOT contain PARTITION KEY
+    const ddl = tier.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'doc_chunks_vec'").get().sql;
+    assert.doesNotMatch(ddl, /PARTITION\s+KEY/i);
+    assert.match(ddl, /chunk_size\s*=\s*64/i);
+
+    // Checkpoint WAL and measure total DB size on disk: MUST be < 1 MB (previously ~150 MB!)
+    tier.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+    const dbPath = tier.dbPath;
+    store.close();
+    const sizeBytes = fs.statSync(dbPath).size;
+    assert.ok(sizeBytes < 1024 * 1024, `Expected 50x768-dim DB < 1MB, got ${(sizeBytes / (1024 * 1024)).toFixed(2)} MB`);
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('P1-4 DB concurrency, duplicate IDs, invalid manual IDs, and Windows unlinkDbFiles EBUSY safety', () => {
+  const env = makeTempEnv('cortex-p14-');
+  const origErr = console.error;
+  const warnings = [];
+  console.error = (...args) => warnings.push(args.join(' '));
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  let lockedHandle = null;
+  try {
+    const tier = store.getTier('project', { create: true });
+    const docsDir = path.join(tier.dir, 'docs', '2026-11');
+    fs.mkdirSync(docsDir, { recursive: true });
+
+    // Two different files declaring the same ID -> duplicate skipped cleanly with no infinite re-index
+    const dupContent = serializeMarkdownDoc({ id: 'dup-id-1', type: 'knowledge', title: 'Dup', summary: 'Same ID' }, 'body');
+    atomicWriteText(path.join(docsDir, 'a-first.md'), dupContent);
+    atomicWriteText(path.join(docsDir, 'b-second.md'), dupContent);
+
+    // Manual .md with invalid traversal ID -> sanitized/falls back to safe filename ID
+    const badIdContent = serializeMarkdownDoc({ id: '../../evil', type: 'knowledge', title: 'Bad ID', summary: 'Sanitized' }, 'body');
+    atomicWriteText(path.join(docsDir, 'safe-fallback.md'), badIdContent);
+
+    const firstSync = syncFromDisk(tier.db, tier.dir);
+    assert.equal(firstSync.addedOrUpdated, 2); // a-first.md + safe-fallback.md
+    assert.ok(warnings.some((w) => w.includes('duplicate document ID "dup-id-1"')));
+    assert.ok(warnings.some((w) => w.includes('invalid frontmatter id')));
+
+    // Second sync must be a strict no-op (no infinite path thrashing)
+    const secondSync = syncFromDisk(tier.db, tier.dir);
+    assert.equal(secondSync.addedOrUpdated, 0);
+    assert.equal(secondSync.deleted, 0);
+
+    const badRow = tier.db.prepare("SELECT id FROM docs WHERE id = '../../evil'").get();
+    assert.equal(badRow, undefined);
+    const safeRow = tier.db.prepare("SELECT id FROM docs WHERE id = 'safe-fallback'").get();
+    assert.equal(safeRow?.id, 'safe-fallback');
+
+    // Verify unlinkDbFiles does NOT unlink -wal/-shm if index.sqlite is locked on Windows
+    const walPath = `${tier.dbPath}-wal`;
+    const shmPath = `${tier.dbPath}-shm`;
+    lockedHandle = new DatabaseSync(tier.dbPath);
+    lockedHandle.exec('SELECT COUNT(*) FROM docs;');
+    if (process.platform === 'win32' && fs.existsSync(walPath)) {
+      assert.throws(() => unlinkDbFiles(tier.dbPath));
+      assert.equal(fs.existsSync(walPath), true, '-wal must NOT be deleted when index.sqlite unlink fails');
+      if (fs.existsSync(shmPath)) {
+        assert.equal(fs.existsSync(shmPath), true, '-shm must NOT be deleted when index.sqlite unlink fails');
+      }
+    }
+  } finally {
+    console.error = origErr;
+    if (lockedHandle) lockedHandle.close();
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('P1-5 exploreGraph: 6-hop BFS lineage with cycle safety and cross-tier exists:true merge + limit', () => {
+  const env = makeTempEnv('cortex-p15-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  try {
+    // 7-node chain: n0 <- n1 <- n2 <- n3 <- n4 <- n5 <- n6 (plus cycle n1 -> n3)
+    for (let i = 0; i <= 6; i++) {
+      store.saveDoc({
+        id: `chain-${i}`,
+        type: i === 0 ? 'baseline' : 'worklog',
+        title: `Chain Node ${i}`,
+        summary: `Hop ${i}`,
+        content: i === 1 ? 'Cycle link to [[chain-3]]' : `Node ${i}`,
+        ...(i > 0 ? { derived_from: [`chain-${i - 1}`] } : {}),
+      });
+    }
+
+    const deep = store.exploreGraph({ target: 'chain-6', depth: 6, direction: 'out', limit: 60 });
+    assert.equal(deep.depth, 6);
+    const rootNode = deep.nodes.find((n) => n.id === 'chain-0');
+    assert.ok(rootNode, '6-hop BFS must reach chain-0');
+    assert.equal(rootNode.hop, 6);
+    assert.equal(rootNode.exists, true);
+
+    // Cross-tier merge: project doc links to global-only doc `global-ref-1`
+    store.saveDoc({
+      id: 'global-ref-1',
+      scope: 'global',
+      type: 'knowledge',
+      title: 'Global Authoritative Doc',
+      summary: 'Lives in global scope',
+      content: 'Global body',
+    });
+    store.saveDoc({
+      id: 'proj-linker',
+      scope: 'project',
+      type: 'decision',
+      title: 'Project Linker',
+      summary: 'Links to global doc',
+      content: 'See [[global-ref-1]] for global rule.',
+    });
+
+    // In project tier, global-ref-1 appears at hop 1 with exists:false; in global tier it exists at hop 0 or via merge
+    const merged = store.exploreGraph({ target: 'global-ref-1', scope: 'all', depth: 2, direction: 'both', limit: 2 });
+    const gNode = merged.nodes.find((n) => n.id === 'global-ref-1');
+    assert.equal(gNode.exists, true);
+    assert.equal(gNode.scope, 'global');
+    assert.equal(gNode.title, 'Global Authoritative Doc');
+    assert.ok(merged.edges.length <= 2, 'limit must be enforced after cross-tier merge');
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('P1-10 + P1-11 + P2-1 + P2-2: in-project abs path normalization, supersedesWarning, P0 overview protection, frontmatter & budget edge cases', () => {
+  const env = makeTempEnv('cortex-p110-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  try {
+    // 1. In-project absolute path auto-converts to POSIX relative path; external still rejected
+    const insideAbs = path.join(env.projectDir, 'src', 'core', 'db.mjs');
+    const saved = store.saveDoc({
+      id: 'base-p0-anchor',
+      type: 'baseline',
+      branch: 'P0',
+      title: 'P0 영구 기준선',
+      summary: '30개 결정 이후에도 절대 밀려나지 않는 P0 기준선',
+      files: [insideAbs],
+      derived_from: ['origin-0'],
+      supersedes: 'nonexistent-target',
+    });
+    assert.deepEqual(saved.files, ['src/core/db.mjs']);
+    assert.deepEqual(saved.derived_from, ['origin-0']);
+    assert.ok(saved.supersedesWarning && saved.supersedesWarning.includes('nonexistent-target'));
+
+    const outsideAbs = path.join(env.root, 'outside.mjs');
+    assert.throws(
+      () => store.saveDoc({ id: 'ext-path-fail', type: 'knowledge', title: 'T', summary: 'S', files: [outsideAbs] }),
+      /Invalid relative file path/,
+    );
+
+    // 2. Save 35 newer decisions -> P0 baseline MUST remain protected in getOverview().p0Baselines & fitted markdown
+    for (let i = 0; i < 35; i++) {
+      store.saveDoc({
+        id: `newer-dec-${String(i).padStart(2, '0')}`,
+        type: 'decision',
+        branch: 'feat',
+        title: `신규 결정 ${i}`,
+        summary: `결정 요약 ${i}`,
+      });
+    }
+    const ov = store.getOverview({ includeGlobal: false });
+    assert.equal(ov.p0Baselines.length, 1);
+    assert.equal(ov.p0Baselines[0].id, 'base-p0-anchor');
+    assert.ok(ov.embeddingStats && typeof ov.embeddingStats.pending === 'number');
+    assert.equal(ov.embeddingStats.pending, 36);
+
+    const tightP0 = fitOverviewToBudget(ov, 600);
+    assert.match(tightP0.text, /P0 Baselines/);
+    assert.match(tightP0.text, /base-p0-anchor/);
+
+    // 3. Frontmatter edge cases
+    const edgeMd = [
+      '---   ',
+      'id: 12345',
+      'title: "C:\\\\path\\\\" # trailing comment after escaped backslash',
+      'supersedes: 999',
+      'derived_from:',
+      '- 100',
+      '- 200',
+      'tags:',
+      '- unindented-1',
+      '- unindented-2',
+      '---',
+      '',
+      'MIME `application/json`, pair `in/out`, `read/write`, `GET/POST`, `true/false`, real `src/core/db.mjs`.',
+      '',
+      '````markdown',
+      '```js',
+      '`src/inside-four-backtick-fence.mjs`',
+      '```',
+      '````',
+    ].join('\n');
+
+    const parsedEdge = parseMarkdownDoc(edgeMd);
+    assert.equal(parsedEdge.frontmatter.id, '12345');
+    assert.equal(parsedEdge.frontmatter.title, 'C:\\path\\');
+    assert.equal(parsedEdge.frontmatter.supersedes, '999');
+    assert.deepEqual(parsedEdge.frontmatter.derived_from, ['100', '200']);
+    assert.deepEqual(parsedEdge.frontmatter.tags, ['unindented-1', 'unindented-2']);
+
+    const refs = extractReferences(parsedEdge.body, parsedEdge.frontmatter);
+    assert.deepEqual(refs.supersedes, ['999']);
+    assert.deepEqual(refs.derivedFrom.sort(), ['100', '200']);
+    assert.deepEqual(refs.pointsFiles, ['src/core/db.mjs']);
+
+    // 4. Budget edge cases
+    // (a) recentWork-only overview NEVER prints "(No active memory documents recorded yet.)"
+    const recentOnly = {
+      p0Baselines: [],
+      sessions: [],
+      todos: [],
+      decisions: [],
+      globalPreferences: [],
+      recentWork: Array.from({ length: 15 }, (_, i) => ({
+        id: `work-only-${i}`,
+        type: 'worklog',
+        title: `최근 작업 기록 ${i}`,
+        summary: '상세한 작업 요약 문장입니다. '.repeat(8),
+      })),
+    };
+    const fittedRecent = fitOverviewToBudget(recentOnly, 400);
+    assert.doesNotMatch(fittedRecent.text, /No active memory documents recorded yet/);
+    assert.match(fittedRecent.text, /work-only-0/);
+
+    // (b) fitByDroppingWholeLines does not skip shorter line 1 when line 0 is oversized
+    const longFirstOverview = {
+      p0Baselines: [],
+      sessions: [],
+      todos: [
+        { id: 't-huge', title: 'X'.repeat(300) },
+        { id: 't-short', title: 'Short todo' },
+      ],
+      decisions: [],
+      globalPreferences: [],
+      recentWork: [],
+    };
+    const fittedLineBudget = fitOverviewToBudget(longFirstOverview, 120);
+    assert.equal(fittedLineBudget.step, 'line-budgeted');
+    assert.ok(fittedLineBudget.charCount <= 120);
+    assert.match(fittedLineBudget.text, /t-short/);
+
+    // (c) budget: 0 is respected (not coerced to 9000)
+    const zeroBudget = fitOverviewToBudget(ov, 0);
+    assert.equal(zeroBudget.budget, 0);
+    assert.equal(zeroBudget.charCount, 0);
+    assert.equal(zeroBudget.text, '');
   } finally {
     store.close();
     env.cleanup();

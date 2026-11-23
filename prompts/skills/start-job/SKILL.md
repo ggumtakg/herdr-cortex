@@ -19,7 +19,7 @@ description: 작업 진입 게이트. 문제·목표 합의, 기존 기억·코�
 
 1. `memory_overview`로 활성 세션·브랜치, 열린 `todo`, 최근 `decision`/`baseline`, 전역 선호도를 확인한다.
 2. `memory_search`로 관련 주제·파일·세션의 기존 결정을 1단계 요약으로 탐색한다.
-3. 핵심 문서만 `memory_read(id, include_neighbors: true)`로 전문을 읽고, 수정 대상 파일이 있다면 `memory_graph(target: "file:<상대경로>", direction: "in")`으로 영향받는 기존 결정·기준선을 확인한다.
+3. 핵심 문서만 `memory_read(id, include_neighbors: true)`로 전문을 읽고, 수정 대상 파일이 있다면 `memory_graph(target: "file:<프로젝트-상대경로>", direction: "in")`으로 영향받는 기존 결정·기준선을 확인한다.
 4. 관련 소스 코드를 직접 읽어 재사용 가능한 기존 구현과 유지해야 할 계약을 확인한다.
 
 ## 3단계: 실행 형태 라우팅
@@ -37,3 +37,5 @@ description: 작업 진입 게이트. 문제·목표 합의, 기존 기억·코�
 
 - 개발 작업으로 진입하면 `cortex_prompt(kind: "standard", name: "DEVELOPMENT_STANDARD")`를 참조 기준으로 삼는다.
 - 합의된 목표·제약이 이후 여러 턴이나 워커에 걸쳐 유지되어야 하면 HEAD가 `memory_save`로 `decision` 또는 `baseline` 문서를 저장한다.
+- `memory_save` / `memory_update`의 `files` 파라미터에는 **프로젝트 상대 경로**를 기록한다(프로젝트 루트 내부의 절대 경로는 저장 시 자동으로 상대 경로로 정규화되며, 프로젝트 외부 경로는 거부된다).
+- 대화 중 확인된 전역 사용자 선호도는 `memory_save(type: "knowledge", scope: "global", category: "preferences", ...)`로 저장해 모든 프로젝트에서 재사용한다.

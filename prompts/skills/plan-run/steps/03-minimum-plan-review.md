@@ -17,11 +17,11 @@
    - **목적 정합성**: `PLAN`의 각 항목이 `P0` 달성에 직접 기여하는가.
    - **과잉 설계 배제**: 현재 요구가 없는 추상화·옵션·중간 계층·신규 영속 상태·불필요한 테스트가 섞이지 않았는가.
    - **수단화 경계**: 도구·리팩토링·형식 채우기가 본래 문제 해결보다 앞서고 있지 않은가.
-4. 리뷰어는 `Verified Facts` / `Blockers` / `Minor Notes` / `Verdict`(`ACCEPT` 또는 `NEEDS_FIX`)를 반환한다. 불필요한 지적 없이 통과하면 `ACCEPT (Clean Evaluation)`을 정상 판정으로 본다.
+4. 리뷰어는 `Verified Facts (확인된 사실)` / `Open Facts (미결 사실)` / `Blockers (필수 수정)` / `Minor Notes (참고 사항)` / `Verdict (판정: ACCEPT | NEEDS_FIX)` 5개 구획으로 결과를 반환한다. 불필요한 지적 없이 통과하면 `ACCEPT (Clean Evaluation)`을 정상 판정으로 본다.
 
 ## Output (`memory_save` 기준선 계약)
 
-- 검수 결과는 별도 기준선을 남발하지 않고, HEAD가 `Verdict`와 핵심 `Blockers`만 요약해 다음 단계 전이 근거로 기록한다.
+- 검수 결과는 별도 기준선을 남발하지 않고, HEAD가 `Verdict`, 미결 `Open Facts`, 핵심 `Blockers`만 요약해 다음 단계 전이 근거로 기록한다.
 - 필요 시 `memory_update(id: PLAN_ID, append_content: "...")`로 `03` 최소성 검수 통과/보완 이력을 1~3줄 남긴다.
 
 ## Next Step (다음 단계)

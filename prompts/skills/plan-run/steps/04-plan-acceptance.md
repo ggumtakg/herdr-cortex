@@ -17,16 +17,16 @@
    - `SEED`의 목표와 확정 계약을 빠짐없이 충족하는가(누락 요구사항 여부).
    - 변경 경계, 파일 소유권, 실패/원자성 처리, 대표 실행 증명 기준이 모호함 없이 실행 가능한가.
    - 기존 코드·계약과의 숨은 충돌이 없는가.
-4. 리뷰어가 `Verified Facts` / `Blockers` / `Minor Notes` / `Verdict`(`ACCEPT` 또는 `NEEDS_FIX`)를 반환하면 HEAD가 최종 수용을 판정한다.
+4. 리뷰어가 `Verified Facts (확인된 사실)` / `Open Facts (미결 사실)` / `Blockers (필수 수정)` / `Minor Notes (참고 사항)` / `Verdict (판정: ACCEPT | NEEDS_FIX)` 5개 구획으로 결과를 반환하면 HEAD가 최종 수용을 판정한다.
 
 ## Output (`memory_save` 기준선 계약)
 
-HEAD가 수용을 확정하면 실행 기준선 `PN`을 저장한다.
+HEAD가 수용을 확정하면 실행 기준선 `C{k}-PN`을 저장한다.
 
 - `memory_save`:
-  - `type: "baseline"`, `session: "<세션명>"`, `branch: "PN"`
+  - `type: "baseline"`, `session: "<세션명>"`, `branch: "C{k}-PN"` (예: `C1-PN`, `C2-PN`)
   - `derived_from: ["<SEED_ID>", "<PLAN_ID>"]`
-  - `files`: 확정된 수정 대상 상대 경로 목록
+  - `files`: 확정된 수정 대상 프로젝트 상대 경로 목록
   - `title`, `summary`, `content`(최종 수용된 실행 규격, Entry Contract 경계, 대표 증명 기준)
 
 ## Next Step (다음 단계)

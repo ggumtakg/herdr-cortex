@@ -21,6 +21,7 @@ export const DEFAULT_CONFIG = Object.freeze({
     dimensions: 0,
     baseUrl: '',
     apiKeyEnv: '',
+    onnxEnabled: false,
     chunkMaxChars: 800,
     chunkOverlap: 100,
     timeoutMs: 15000,
@@ -89,15 +90,67 @@ export function ensureTierDirs(tierDir) {
   return paths;
 }
 
-function readJsonSafe(filePath) {
+function readJsonSafe(filePath, { warnOnError = false } = {}) {
   try {
     if (!fs.existsSync(filePath)) return null;
-    const raw = fs.readFileSync(filePath, 'utf8');
+    const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-  } catch {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (warnOnError) {
+        console.error(`[herdr-cortex] Warning: config at "${filePath}" must be a JSON object; ignoring.`);
+      }
+      return null;
+    }
+    return parsed;
+  } catch (err) {
+    if (warnOnError) {
+      console.error(`[herdr-cortex] Warning: failed to parse config at "${filePath}": ${err?.message || err}`);
+    }
     return null;
   }
+}
+
+const ALLOWED_PROJECT_EMBEDDING_KEYS = [
+  'provider',
+  'model',
+  'dimensions',
+  'chunkMaxChars',
+  'chunkOverlap',
+  'timeoutMs',
+];
+
+/**
+ * Whitelist only safe non-network, non-secret, non-global-scoping keys from project `.memory/config.json`.
+ * Strips `embedding.baseUrl`, `embedding.apiKey`, `embedding.apiKeyEnv`, `embedding.onnxEnabled`,
+ * `mode`, `enabledProjects`, `excludedProjects`, and `enabled: true` (only `enabled: false` is permitted).
+ */
+export function sanitizeProjectConfig(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const safe = {};
+
+  if (typeof raw.headCoreEnabled === 'boolean') {
+    safe.headCoreEnabled = raw.headCoreEnabled;
+  }
+  if (typeof raw.hookBudget === 'number' && Number.isFinite(raw.hookBudget)) {
+    safe.hookBudget = raw.hookBudget;
+  }
+  if (raw.enabled === false) {
+    safe.enabled = false;
+  }
+
+  if (raw.embedding && typeof raw.embedding === 'object' && !Array.isArray(raw.embedding)) {
+    const safeEmb = {};
+    for (const key of ALLOWED_PROJECT_EMBEDDING_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(raw.embedding, key) && raw.embedding[key] !== undefined) {
+        safeEmb[key] = raw.embedding[key];
+      }
+    }
+    if (Object.keys(safeEmb).length > 0) {
+      safe.embedding = safeEmb;
+    }
+  }
+
+  return safe;
 }
 
 function mergeConfig(base, override) {
@@ -113,15 +166,17 @@ function mergeConfig(base, override) {
 }
 
 /**
- * Load merged config from defaults -> global config.json -> project .memory/config.json.
+ * Load merged config from defaults -> global config.json -> whitelisted project .memory/config.json.
  */
 export function loadConfig({ projectDir, globalDir, overrides } = {}) {
   const gPaths = getTierPaths(getGlobalDir(globalDir));
-  let cfg = mergeConfig(DEFAULT_CONFIG, readJsonSafe(gPaths.configPath));
+  let cfg = mergeConfig(DEFAULT_CONFIG, readJsonSafe(gPaths.configPath, { warnOnError: true }));
 
   if (projectDir) {
     const pPaths = getTierPaths(getProjectMemoryDir(projectDir));
-    cfg = mergeConfig(cfg, readJsonSafe(pPaths.configPath));
+    const projectRaw = readJsonSafe(pPaths.configPath);
+    const projectSafe = sanitizeProjectConfig(projectRaw);
+    cfg = mergeConfig(cfg, projectSafe);
   }
 
   if (overrides) {
@@ -146,17 +201,17 @@ function matchesProjectRule(normPath, segments, rule) {
 }
 
 /**
- * Determine whether cortex hook context injection is enabled for `projectDir`.
+ * Determine whether cortex context/memory is enabled for `projectDir`.
  * Note: `revive` session-ID tracking still runs independently so reboot recovery stays intact.
  * Precedence:
- *   1) Explicit project config boolean `enabled: false | true`
- *   2) `excludedProjects` (exact/ancestor path OR folder name segment, case-insensitive)
- *   3) `mode === 'opt-in'` -> requires match in `enabledProjects`
+ *   1) Explicit opt-out `enabled: false`
+ *   2) `excludedProjects` (exact/ancestor path OR folder name segment, case-insensitive) — cannot be bypassed
+ *   3) `mode === 'opt-in'` -> requires match in `enabledProjects` — cannot be bypassed by project `enabled: true`
  *   4) Otherwise enabled (`mode === 'all'`)
  */
 export function isProjectEnabled(projectDir, config = DEFAULT_CONFIG) {
   if (!config || typeof config !== 'object') return true;
-  if (typeof config.enabled === 'boolean') return config.enabled;
+  if (config.enabled === false) return false;
 
   const normPath = normalizeMatchPath(projectDir || process.cwd());
   const segments = normPath.split('/').filter(Boolean);
@@ -309,16 +364,58 @@ export function normalizeRelPath(filePath) {
 
 /**
  * Strictly validate and normalize a relative file path.
- * Rejects NUL bytes, URLs, Windows drive letters, leading slashes, and traversal outside root.
+ * When `projectRoot` is provided, an absolute path strictly inside `projectRoot`
+ * is automatically converted into a project-relative POSIX path.
+ * Rejects NUL bytes, URLs, paths outside `projectRoot`, drive-relative paths, and traversal escapes.
  * Returns normalized POSIX relative path or null if invalid.
  */
-export function sanitizeRelFilePath(raw) {
+export function sanitizeRelFilePath(raw, projectRoot = null) {
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
   if (!trimmed || trimmed.includes('\0')) return null;
-  if (/^[a-zA-Z]:/.test(trimmed)) return null;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) return null;
-  if (trimmed.startsWith('/') || trimmed.startsWith('\\')) return null;
+
+  const isWinDrive = /^[a-zA-Z]:/.test(trimmed);
+  const isLeadingSlash = trimmed.startsWith('/') || trimmed.startsWith('\\');
+
+  if (isWinDrive || isLeadingSlash) {
+    if (!projectRoot) return null;
+    // Reject Windows drive-relative paths like "C:foo" (require "C:/" or "C:\")
+    if (isWinDrive && !/^[a-zA-Z]:[\\/]/.test(trimmed)) return null;
+    // Reject UNC paths like "\\server\share"
+    if (trimmed.startsWith('\\\\') || trimmed.startsWith('//')) return null;
+
+    const resolvedRoot = path.resolve(projectRoot);
+    const resolvedTarget = path.resolve(trimmed);
+    const rel = path.relative(resolvedRoot, resolvedTarget);
+    if (!rel || rel === '.' || rel === '..' || rel.startsWith(`..${path.sep}`) || rel.startsWith('../') || path.isAbsolute(rel)) {
+      return null;
+    }
+
+    try {
+      const realRoot = resolveRealPathWithFallback(resolvedRoot);
+      const realTarget = resolveRealPathWithFallback(resolvedTarget);
+      const realRel = path.relative(realRoot, realTarget);
+      if (!realRel || realRel === '.' || realRel === '..' || realRel.startsWith(`..${path.sep}`) || realRel.startsWith('../') || path.isAbsolute(realRel)) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+
+    const posixFromAbs = rel.replace(/\\/g, '/');
+    const normalizedAbs = path.posix.normalize(posixFromAbs);
+    if (
+      !normalizedAbs
+      || normalizedAbs === '.'
+      || normalizedAbs === '..'
+      || normalizedAbs.startsWith('../')
+      || normalizedAbs.startsWith('/')
+    ) {
+      return null;
+    }
+    return normalizedAbs;
+  }
 
   const posixRaw = trimmed.replace(/\\/g, '/');
   const normalized = path.posix.normalize(posixRaw);

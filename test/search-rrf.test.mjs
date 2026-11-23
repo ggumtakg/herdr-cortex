@@ -6,11 +6,14 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { CortexStore } from '../src/core/store.mjs';
-import { searchMemory } from '../src/core/search.mjs';
+import { searchMemory, tokenizeQuery } from '../src/core/search.mjs';
 import { readIndexMeta } from '../src/core/db.mjs';
-import { processPendingEmbeddings } from '../src/embeddings/index.mjs';
+import { buildDocChunks, createEmbeddingQueue, processPendingEmbeddings } from '../src/embeddings/index.mjs';
+import { createGeminiProvider } from '../src/embeddings/gemini.mjs';
+import { createOllamaProvider } from '../src/embeddings/ollama.mjs';
+import { runEmbedCli } from '../src/embeddings/cli.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
-import { REPO_ROOT } from '../src/core/config.mjs';
+import { REPO_ROOT, atomicWriteText } from '../src/core/config.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-rrf-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -607,6 +610,392 @@ test('regression: update & delete doc after doc_chunks_vec populated, plus disab
     assert.ok(searchRes.results.some((r) => r.id === 'novec-doc-3'));
   } finally {
     store.close();
+    env.cleanup();
+  }
+});
+
+test('P0-10 metadata-only update preserves doc_chunks_vec & embed_status=ready while updating vec0 status/type', async () => {
+  const env = makeTempEnv('cortex-p010-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  try {
+    store.saveDoc({
+      id: 'meta-preserve-1',
+      type: 'todo',
+      title: '메타데이터 보존 테스트',
+      summary: '본문 변경 없이 status와 tags만 바뀐다',
+      content: '릴레이 인박스 큐 검증 본문',
+      tags: ['v1'],
+    });
+
+    const provider = createMockProvider({ model: 'mock-embed-v1', dimensions: 4 });
+    const first = await processPendingEmbeddings(store, { scope: 'project', provider });
+    assert.equal(first.processed, 1);
+    assert.equal(provider.calls, 1);
+
+    // Update ONLY metadata (status, tags, due, type) — content_hash unchanged!
+    const upd = store.updateDoc({
+      id: 'meta-preserve-1',
+      scope: 'project',
+      status: 'done',
+      type: 'worklog',
+      tags: ['v1', 'completed'],
+      due: '2026-12-31',
+    });
+    assert.equal(upd.embed_status, 'ready');
+
+    const tier = store.getTier('project');
+    const vecRows = tier.db
+      .prepare("SELECT doc_id, status, type FROM doc_chunks_vec WHERE doc_id = 'meta-preserve-1'")
+      .all();
+    assert.ok(vecRows.length >= 1, 'Existing vector rows must be preserved');
+    assert.equal(vecRows[0].status, 'done');
+    assert.equal(vecRows[0].type, 'worklog');
+
+    // Re-running processPendingEmbeddings must NOT call provider again
+    const second = await processPendingEmbeddings(store, { scope: 'project', provider });
+    assert.equal(second.processed, 0);
+    assert.equal(provider.calls, 1);
+
+    // Now archive it -> vec0 status becomes 'archived', so default vector search excludes it
+    store.updateDoc({ id: 'meta-preserve-1', scope: 'project', status: 'archived' });
+    const archVec = tier.db
+      .prepare("SELECT status FROM doc_chunks_vec WHERE doc_id = 'meta-preserve-1'")
+      .get();
+    assert.equal(archVec.status, 'archived');
+
+    const searchExcluded = await searchMemory(store, {
+      query: '탭 인박스',
+      scope: 'project',
+      embeddingProvider: provider,
+    });
+    assert.ok(!searchExcluded.results.some((r) => r.id === 'meta-preserve-1'));
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('P0-8 + P0-9 embeddings reliability: 3-attempt cap, 401 circuit breaker, stale guard, queue drain, Gemini header/batch/retry, Ollama nomic prefix, buildDocChunks', async () => {
+  const env = makeTempEnv('cortex-p089-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  try {
+    store.saveDoc({
+      id: 'err-cap-doc',
+      type: 'knowledge',
+      title: '재시도 상한 테스트',
+      summary: '3회 실패 후 더 이상 호출하지 않아야 함',
+      content: '내용',
+    });
+    store.saveDoc({
+      id: 'superseded-skip',
+      type: 'knowledge',
+      status: 'superseded',
+      title: '대체된 문서',
+      summary: '임베딩 대상에서 제외되어야 함',
+      content: '내용',
+    });
+
+    // 1. Failing provider stops after 3 attempts
+    const failing = createMockProvider({ model: 'mock-fail', dimensions: 4, failOnEmbed: true });
+    for (let i = 1; i <= 3; i++) {
+      const r = await processPendingEmbeddings(store, { scope: 'project', provider: failing });
+      assert.equal(r.errors, 1);
+      assert.equal(failing.calls, i);
+    }
+    // 4th run MUST NOT call provider at all (embed_attempts >= 3)
+    const run4 = await processPendingEmbeddings(store, { scope: 'project', provider: failing });
+    assert.equal(run4.processed, 0);
+    assert.equal(run4.errors, 0);
+    assert.equal(failing.calls, 3);
+
+    const ov = store.getOverview({ includeGlobal: false });
+    assert.equal(ov.embeddingStats.error, 1);
+    assert.match(ov.embeddingStats.lastError, /Simulated offline network outage/);
+
+    // 2. HTTP 401 circuit breaker stops immediately after 1st doc
+    store.saveDoc({ id: 'cb-doc-1', type: 'knowledge', title: 'CB1', summary: 'S1', content: 'C1' });
+    store.saveDoc({ id: 'cb-doc-2', type: 'knowledge', title: 'CB2', summary: 'S2', content: 'C2' });
+    let cbCalls = 0;
+    const authFailProvider = {
+      name: 'gemini',
+      model: 'gemini-embedding-001',
+      dimensions: 4,
+      async embed() {
+        cbCalls++;
+        const err = new Error('Gemini embedding failed (401): API key not valid');
+        err.status = 401;
+        throw err;
+      },
+    };
+    const cbRes = await processPendingEmbeddings(store, { scope: 'project', provider: authFailProvider });
+    assert.equal(cbRes.circuitBroken, true);
+    assert.equal(cbCalls, 1, '401 must circuit-break before calling provider for 2nd doc');
+
+    // 3. Stale guard: doc modified mid-embed is NOT overwritten with stale vectors
+    store.saveDoc({ id: 'stale-doc', type: 'knowledge', title: 'Initial', summary: 'V1', content: 'Original body' });
+    const staleProvider = {
+      name: 'mock',
+      model: 'mock-stale-v1',
+      dimensions: 4,
+      async embed(texts) {
+        // Modify the doc while embed() is in flight!
+        store.updateDoc({ id: 'stale-doc', scope: 'project', content: 'Modified mid-flight body' });
+        return texts.map(() => new Float32Array([1, 0, 0, 0]));
+      },
+    };
+    await processPendingEmbeddings(store, { scope: 'project', provider: staleProvider });
+    const tier = store.getTier('project');
+    const staleRow = tier.db.prepare("SELECT embed_status FROM docs WHERE id = 'stale-doc'").get();
+    const staleVecCnt = tier.db.prepare("SELECT COUNT(*) AS cnt FROM doc_chunks_vec WHERE doc_id = 'stale-doc'").get().cnt;
+    assert.equal(staleRow.embed_status, 'pending');
+    assert.equal(staleVecCnt, 0);
+
+    // 4. Gemini provider: x-goog-api-key header (NO ?key= query), sub-batch <= 100, retry on 429
+    const geminiCalls = [];
+    let failFirst429 = true;
+    const gemini = createGeminiProvider({
+      apiKey: 'secret-test-key',
+      dimensions: 4,
+      retryBaseMs: 5,
+      fetchImpl: async (url, init) => {
+        geminiCalls.push({ url, headers: init.headers, body: JSON.parse(init.body) });
+        if (failFirst429) {
+          failFirst429 = false;
+          return { ok: false, status: 429, text: async () => 'Rate limited' };
+        }
+        const reqs = JSON.parse(init.body).requests;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ embeddings: reqs.map(() => ({ values: [1, 0, 0, 0] })) }),
+        };
+      },
+    });
+    const texts105 = Array.from({ length: 105 }, (_, i) => `chunk-${i}`);
+    const gVecs = await gemini.embed(texts105, { taskType: 'document' });
+    assert.equal(gVecs.length, 105);
+    assert.equal(geminiCalls.length, 3); // 1st batch (429) + retry (100) + 2nd batch (5)
+    for (const c of geminiCalls) {
+      assert.equal(c.url.includes('key='), false, 'API key must NEVER appear in URL query');
+      assert.equal(c.headers['x-goog-api-key'], 'secret-test-key');
+      assert.ok(c.body.requests.length <= 100);
+    }
+
+    // 5. Ollama nomic-embed prefixing
+    const ollamaInputs = [];
+    const ollama = createOllamaProvider({
+      model: 'nomic-embed-text',
+      retryBaseMs: 5,
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(init.body);
+        ollamaInputs.push(body.input);
+        return { ok: true, status: 200, json: async () => ({ embeddings: body.input.map(() => [0.5, 0.5, 0, 0]) }) };
+      },
+    });
+    await ollama.embed(['hello'], { taskType: 'document' });
+    await ollama.embed(['world'], { taskType: 'query' });
+    assert.deepEqual(ollamaInputs[0], ['search_document: hello']);
+    assert.deepEqual(ollamaInputs[1], ['search_query: world']);
+
+    // 6. buildDocChunks: chunk 0 stays <= maxChars and chunks 1..N preserve [title > heading] prefix
+    const chunks = buildDocChunks(
+      {
+        title: '아키텍처 가이드',
+        summary: '요약 문장입니다.',
+        content: `# 섹션1\n${'가나다라마바사 '.repeat(40)}\n\n## 섹션2\n${'아자차카타파하 '.repeat(40)}`,
+      },
+      { maxChars: 160, overlap: 0 },
+    );
+    assert.ok(chunks.length >= 4);
+    for (const ch of chunks) {
+      assert.ok(ch.text.length <= 160, `Chunk ${ch.chunkIndex} exceeded maxChars: ${ch.text.length}`);
+      assert.match(ch.text, /^\[아키텍처 가이드/);
+    }
+    assert.ok(chunks.some((c) => c.text.startsWith('[아키텍처 가이드 > 섹션2]\n')));
+
+    // 7. createEmbeddingQueue.drain() awaits in-flight flush cleanly
+    let flushFinished = false;
+    const slowProvider = {
+      name: 'slow',
+      model: 'slow-v1',
+      dimensions: 4,
+      async embed(texts) {
+        await new Promise((r) => setTimeout(r, 40));
+        flushFinished = true;
+        return texts.map(() => new Float32Array([1, 0, 0, 0]));
+      },
+    };
+    const queue = createEmbeddingQueue(store, { provider: slowProvider, debounceMs: 5 });
+    queue.schedule('project');
+    await new Promise((r) => setTimeout(r, 15)); // let flush start
+    await queue.drain(2000);
+    assert.equal(flushFinished, true, 'drain() must wait for in-flight flush to finish');
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('P1-1 + P1-2 search: lazy embed (0 calls when no vectors), SQL pushdown (no LIMIT starvation), Korean punctuation/particles, distance cutoff, and cross-tier RRF', async () => {
+  const env = makeTempEnv('cortex-p112-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  try {
+    // 1. Seed 120 superseded docs + 1 active doc with same keyword -> SQL pushdown MUST find the active doc!
+    for (let i = 0; i < 120; i++) {
+      store.saveDoc({
+        id: `sup-starve-${String(i).padStart(3, '0')}`,
+        type: 'decision',
+        status: 'superseded',
+        title: `스타베이션 테스트 구버전 ${i}`,
+        summary: '스타베이션 구버전 요약',
+        content: '스타베이션 본문',
+      });
+    }
+    store.saveDoc({
+      id: 'active-starve-winner',
+      type: 'decision',
+      status: 'active',
+      title: '스타베이션 활성 문서',
+      summary: '유일한 활성 문서가 SQL 푸시다운으로 반드시 검색되어야 한다',
+      content: '스타베이션 핵심 해결 문제 및 기억 데이터베이스 설명',
+    });
+
+    // Lazy query embedding: 0 indexed vectors -> provider.embed MUST NOT be called!
+    const spyProvider = createMockProvider({ model: 'mock-embed-v1', dimensions: 4 });
+    const starveRes = await searchMemory(store, {
+      query: '스타베이션',
+      scope: 'project',
+      embeddingProvider: spyProvider,
+    });
+    assert.equal(spyProvider.calls, 0, 'Must NOT call embeddingProvider.embed when no tier has vectors');
+    assert.equal(starveRes.results.length, 1);
+    assert.equal(starveRes.results[0].id, 'active-starve-winner');
+
+    // 2. Korean punctuation & particle stripping: "문제?", "기억을", "데이터베이스에서"
+    const toks = tokenizeQuery('문제? 기억을 데이터베이스에서');
+    assert.ok(toks.includes('문제'));
+    assert.ok(toks.includes('기억을'));
+    assert.ok(toks.includes('기억'));
+    assert.ok(toks.includes('데이터베이스'));
+
+    const rPunct = await searchMemory(store, { query: '문제?', scope: 'project' });
+    assert.ok(rPunct.results.some((r) => r.id === 'active-starve-winner'));
+
+    const rParticle = await searchMemory(store, { query: '기억을', scope: 'project' });
+    assert.ok(rParticle.results.some((r) => r.id === 'active-starve-winner'));
+
+    const rLongParticle = await searchMemory(store, { query: '데이터베이스에서', scope: 'project' });
+    assert.ok(rLongParticle.results.some((r) => r.id === 'active-starve-winner'));
+
+    // 3. Cross-tier RRF & cosine distance cutoff:
+    // Project doc has strong cosine match (dist ~0.01); Global doc has weak cosine match (dist ~0.40);
+    // Unrelated doc has distance ~0.95 (> 0.65 cutoff -> excluded!)
+    store.saveDoc({
+      id: 'proj-strong-vec',
+      scope: 'project',
+      type: 'knowledge',
+      title: 'Alpha Strong Project Doc',
+      summary: 'Project exact semantic hit',
+      content: 'strong-target-marker',
+    });
+    store.saveDoc({
+      id: 'proj-unrelated-vec',
+      scope: 'project',
+      type: 'knowledge',
+      title: 'Zeta Unrelated Doc',
+      summary: 'Completely orthogonal topic',
+      content: 'orthogonal-marker',
+    });
+    store.saveDoc({
+      id: 'global-weak-vec',
+      scope: 'global',
+      type: 'knowledge',
+      title: 'Beta Weak Global Doc',
+      summary: 'Global weaker semantic hit',
+      content: 'weak-global-marker',
+    });
+
+    const normalize = (arr) => {
+      const n = Math.sqrt(arr.reduce((acc, v) => acc + v * v, 0)) || 1;
+      return new Float32Array(arr.map((v) => v / n));
+    };
+    const crossTierProvider = {
+      name: 'mock-cross',
+      model: 'shared-model-v1',
+      dimensions: 4,
+      async embed(texts, { taskType } = {}) {
+        return texts.map((t) => {
+          if (taskType === 'query') return normalize([1, 0, 0, 0]);
+          if (t.includes('strong-target-marker')) return normalize([0.99, 0.14, 0, 0]); // cosine dist ~0.01
+          if (t.includes('weak-global-marker')) return normalize([0.65, 0.76, 0, 0]); // cosine dist ~0.35 <= 0.65
+          return normalize([0.05, 0, 0, 0.998]); // cosine dist ~0.95 > 0.65
+        });
+      },
+    };
+
+    await processPendingEmbeddings(store, { scope: 'all', provider: crossTierProvider, maxDocs: 200 });
+
+    const crossRes = await searchMemory(store, {
+      query: 'unmatched-keyword-xyz-query',
+      scope: 'all',
+      embeddingProvider: crossTierProvider,
+    });
+    assert.equal(crossRes.vectorUsed, true);
+    assert.equal(crossRes.results[0].id, 'proj-strong-vec', 'Strong project vector hit must outrank weak global hit');
+    assert.ok(crossRes.results.some((r) => r.id === 'global-weak-vec'));
+    assert.ok(!crossRes.results.some((r) => r.id === 'proj-unrelated-vec'), 'Distance > 0.65 must be filtered out');
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('P0-3 + P0-8 embeddings CLI: skips excluded projects, loops batches until 0 remaining, sets exitCode=1 on errors', async () => {
+  const env = makeTempEnv('cortex-cli-');
+  const prevExitCode = process.exitCode;
+  try {
+    // 1. Excluded project is skipped cleanly without creating .memory/
+    const exProj = path.join(env.root, 'excluded-cli-proj');
+    fs.mkdirSync(exProj, { recursive: true });
+    atomicWriteText(path.join(env.globalDir, 'config.json'), JSON.stringify({ mode: 'all', excludedProjects: ['excluded-cli-proj'] }));
+
+    const skippedRes = await runEmbedCli(['--project', exProj, '--global', env.globalDir, '--scope', 'project']);
+    assert.equal(skippedRes.skipped, true);
+    assert.equal(fs.existsSync(path.join(exProj, '.memory')), false);
+
+    // 2. Multi-batch loop with --max-docs 2 processes all 5 docs
+    const okProj = path.join(env.root, 'ok-cli-proj');
+    fs.mkdirSync(okProj, { recursive: true });
+    const store = new CortexStore({ projectDir: okProj, globalDir: env.globalDir });
+    for (let i = 0; i < 5; i++) {
+      store.saveDoc({ id: `cli-doc-${i}`, type: 'knowledge', title: `CLI ${i}`, summary: `S ${i}`, content: `C ${i}` });
+    }
+    store.close();
+
+    const okProvider = createMockProvider({ model: 'mock-cli-v1', dimensions: 4 });
+    process.exitCode = 0;
+    const multiRes = await runEmbedCli(
+      ['--project', okProj, '--global', env.globalDir, '--scope', 'project', '--max-docs', '2'],
+      { provider: okProvider },
+    );
+    assert.equal(multiRes.processed, 5);
+    assert.equal(multiRes.errors, 0);
+    assert.equal(process.exitCode, 0);
+
+    // 3. Error sets process.exitCode = 1
+    const errStore = new CortexStore({ projectDir: okProj, globalDir: env.globalDir });
+    errStore.saveDoc({ id: 'cli-err-doc', type: 'knowledge', title: 'Err', summary: 'S', content: 'C' });
+    errStore.close();
+
+    const errProvider = createMockProvider({ model: 'mock-cli-v1', dimensions: 4, failOnEmbed: true });
+    const errRes = await runEmbedCli(
+      ['--project', okProj, '--global', env.globalDir, '--scope', 'project'],
+      { provider: errProvider },
+    );
+    assert.equal(errRes.errors, 1);
+    assert.equal(process.exitCode, 1);
+  } finally {
+    process.exitCode = prevExitCode;
     env.cleanup();
   }
 });

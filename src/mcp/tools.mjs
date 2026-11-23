@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { REPO_ROOT, assertInsideDir } from '../core/config.mjs';
+import { REPO_ROOT, assertInsideDir, isProjectEnabled, loadConfig } from '../core/config.mjs';
+import { CortexStore } from '../core/store.mjs';
 import { searchMemory } from '../core/search.mjs';
 import { fitOverviewToBudget } from '../core/budget.mjs';
 
@@ -11,7 +12,14 @@ export function isSubagentCaller(args = {}, meta = {}) {
   if (meta && typeof meta === 'object') {
     const agentId = meta.agent_id || meta.agentId;
     if (agentId && String(agentId).trim() !== '') return true;
-    if (meta.is_subagent === true) return true;
+    if (meta.is_subagent === true || meta.isSubagent === true) return true;
+
+    const parentId =
+      meta.parentConversationId
+      || meta.parent_conversation_id
+      || meta.parentSessionId
+      || meta.parent_session_id;
+    if (parentId && String(parentId).trim() !== '') return true;
 
     const convId =
       meta['antigravity.google/conversation_id']
@@ -44,6 +52,68 @@ function makeSubagentDeniedError(toolName) {
       tool: toolName,
       message: 'Canonical memory writes are restricted to the main HEAD conversation; subagents have read-only memory access.',
     },
+  };
+}
+
+function makeProjectExcludedError(toolName, projectDir) {
+  return {
+    isError: true,
+    errorCode: 'PROJECT_EXCLUDED',
+    data: {
+      error: 'PROJECT_EXCLUDED',
+      tool: toolName,
+      project_dir: projectDir,
+      message: `Project "${projectDir}" is excluded by herdr-cortex configuration; project-tier operations are disabled (only scope="global" reads/writes are permitted).`,
+    },
+  };
+}
+
+function readGlobalOnlyOverview(targetStore, sessionFilter = '') {
+  const globalDocsDir = path.join(targetStore.globalDir, 'docs');
+  if (!fs.existsSync(globalDocsDir)) {
+    return {
+      sessionFilter: sessionFilter || null,
+      projectExcluded: true,
+      sessions: [],
+      todos: [],
+      decisions: [],
+      recentWork: [],
+      globalPreferences: [],
+    };
+  }
+  const globalTier = targetStore.getTier('global');
+  targetStore.sync('global');
+  const globalPrefs = globalTier.db
+    .prepare(`
+      SELECT id, path, type, title, summary, tags, updated_at
+      FROM docs
+      WHERE status = 'active'
+      ORDER BY CASE WHEN path LIKE 'docs/preferences/%' THEN 0 ELSE 1 END, updated_at DESC
+      LIMIT 25
+    `)
+    .all()
+    .map((r) => {
+      let tags = [];
+      try { tags = JSON.parse(r.tags || '[]'); } catch { tags = []; }
+      return {
+        id: r.id,
+        type: r.type,
+        category: r.path.startsWith('docs/preferences/') ? 'preferences' : 'knowledge',
+        title: r.title,
+        summary: r.summary,
+        tags,
+        updated_at: r.updated_at,
+      };
+    });
+
+  return {
+    sessionFilter: sessionFilter || null,
+    projectExcluded: true,
+    sessions: [],
+    todos: [],
+    decisions: [],
+    recentWork: [],
+    globalPreferences: globalPrefs,
   };
 }
 
@@ -97,10 +167,51 @@ export function createToolRegistry(
     promptsDir = path.join(REPO_ROOT, 'prompts'),
     getEmbeddingProvider = null,
     embeddingQueue = null,
+    projectEnabled = null,
     extraTools = [],
   } = {},
 ) {
   const tools = new Map();
+
+  const isDefaultProjectEnabled = () => {
+    if (typeof projectEnabled === 'boolean') return projectEnabled;
+    if (!store) return true;
+    const cfg = store.config || loadConfig({ projectDir: store.projectRoot, globalDir: store.globalDir });
+    return isProjectEnabled(store.projectRoot, cfg);
+  };
+
+  const withProjectStore = async (args, fn) => {
+    const requestedDir = typeof args?.project_dir === 'string' && args.project_dir.trim()
+      ? path.resolve(args.project_dir.trim())
+      : '';
+    const defaultRoot = store?.projectRoot ? path.resolve(store.projectRoot) : '';
+
+    if (!requestedDir || requestedDir.toLowerCase() === defaultRoot.toLowerCase()) {
+      return fn(store, {
+        projectDir: defaultRoot,
+        enabled: isDefaultProjectEnabled(),
+        isDefaultStore: true,
+      });
+    }
+
+    const cfg = loadConfig({ projectDir: requestedDir, globalDir: store.globalDir });
+    const enabled = isProjectEnabled(requestedDir, cfg);
+    const tempStore = new CortexStore({
+      projectDir: requestedDir,
+      globalDir: store.globalDir,
+      config: cfg,
+      disableVec: store.disableVec,
+    });
+    try {
+      return await fn(tempStore, {
+        projectDir: requestedDir,
+        enabled,
+        isDefaultStore: false,
+      });
+    } finally {
+      tempStore.close();
+    }
+  };
 
   const registerTool = (toolDef) => {
     if (!toolDef || !toolDef.name || typeof toolDef.handler !== 'function') {
@@ -129,20 +240,35 @@ export function createToolRegistry(
         file: { type: 'string', description: 'Filter docs linked to this relative file path' },
         include_superseded: { type: 'boolean', default: false },
         limit: { type: 'integer', minimum: 1, maximum: 100, default: 10 },
+        project_dir: { type: 'string', description: 'Optional project directory override' },
       },
     },
     async handler(args) {
-      const provider = typeof getEmbeddingProvider === 'function' ? await getEmbeddingProvider() : null;
-      return searchMemory(store, {
-        query: args.query || '',
-        scope: args.scope || 'all',
-        type: args.type || '',
-        session: args.session || '',
-        branch: args.branch || '',
-        file: args.file || '',
-        include_superseded: Boolean(args.include_superseded),
-        limit: args.limit ?? 10,
-        embeddingProvider: provider,
+      return withProjectStore(args, async (targetStore, { projectDir, enabled }) => {
+        const requestedScope = args.scope || 'all';
+        if (!enabled && requestedScope === 'project') {
+          return {
+            query: args.query || '',
+            scope: 'project',
+            projectExcluded: true,
+            projectDir,
+            vectorUsed: false,
+            results: [],
+          };
+        }
+        const effectiveScope = enabled ? requestedScope : 'global';
+        const provider = typeof getEmbeddingProvider === 'function' ? await getEmbeddingProvider() : null;
+        return searchMemory(targetStore, {
+          query: args.query || '',
+          scope: effectiveScope,
+          type: args.type || '',
+          session: args.session || '',
+          branch: args.branch || '',
+          file: args.file || '',
+          include_superseded: Boolean(args.include_superseded),
+          limit: args.limit ?? 10,
+          embeddingProvider: provider,
+        });
       });
     },
   });
@@ -157,21 +283,29 @@ export function createToolRegistry(
         id: { type: 'string' },
         scope: { type: 'string', enum: ['project', 'global', 'all'], default: 'all' },
         include_neighbors: { type: 'boolean', default: false },
+        project_dir: { type: 'string', description: 'Optional project directory override' },
       },
     },
     async handler(args) {
-      const doc = store.readDoc({
-        id: args.id,
-        scope: args.scope || 'all',
-        include_neighbors: Boolean(args.include_neighbors),
+      return withProjectStore(args, async (targetStore, { projectDir, enabled }) => {
+        const requestedScope = args.scope || 'all';
+        if (!enabled && requestedScope === 'project') {
+          return makeProjectExcludedError('memory_read', projectDir);
+        }
+        const effectiveScope = enabled ? requestedScope : 'global';
+        const doc = targetStore.readDoc({
+          id: args.id,
+          scope: effectiveScope,
+          include_neighbors: Boolean(args.include_neighbors),
+        });
+        if (!doc) {
+          return {
+            isError: true,
+            data: { error: 'NOT_FOUND', message: `Document "${args.id}" not found` },
+          };
+        }
+        return doc;
       });
-      if (!doc) {
-        return {
-          isError: true,
-          data: { error: 'NOT_FOUND', message: `Document "${args.id}" not found` },
-        };
-      }
-      return doc;
     },
   });
 
@@ -195,19 +329,24 @@ export function createToolRegistry(
         tags: { type: 'array', items: { type: 'string' } },
         files: { type: 'array', items: { type: 'string' } },
         supersedes: { type: 'string' },
-        derived_from: {
-          oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-        },
+        derived_from: { type: 'array', items: { type: 'string' } },
         due: { type: 'string' },
         category: { type: 'string', enum: ['preferences', 'knowledge'] },
+        project_dir: { type: 'string', description: 'Optional project directory override' },
       },
     },
     async handler(args) {
-      const saved = store.saveDoc(args);
-      if (embeddingQueue && typeof embeddingQueue.schedule === 'function') {
-        embeddingQueue.schedule(saved.scope);
-      }
-      return saved;
+      return withProjectStore(args, async (targetStore, { projectDir, enabled, isDefaultStore }) => {
+        const requestedScope = args.scope || 'project';
+        if (!enabled && requestedScope !== 'global') {
+          return makeProjectExcludedError('memory_save', projectDir);
+        }
+        const saved = targetStore.saveDoc(args);
+        if (isDefaultStore && embeddingQueue && typeof embeddingQueue.schedule === 'function') {
+          embeddingQueue.schedule(saved.scope);
+        }
+        return saved;
+      });
     },
   });
 
@@ -231,42 +370,62 @@ export function createToolRegistry(
         branch: { type: 'string' },
         tags: { type: 'array', items: { type: 'string' } },
         files: { type: 'array', items: { type: 'string' } },
-        derived_from: {
-          oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-        },
+        derived_from: { type: 'array', items: { type: 'string' } },
         due: { type: 'string' },
+        project_dir: { type: 'string', description: 'Optional project directory override' },
       },
     },
     async handler(args) {
-      const updated = store.updateDoc(args);
-      if (embeddingQueue && typeof embeddingQueue.schedule === 'function') {
-        embeddingQueue.schedule(updated.scope);
-      }
-      return updated;
+      return withProjectStore(args, async (targetStore, { projectDir, enabled, isDefaultStore }) => {
+        const requestedScope = args.scope || 'all';
+        if (!enabled && requestedScope !== 'global') {
+          return makeProjectExcludedError('memory_update', projectDir);
+        }
+        const updated = targetStore.updateDoc(args);
+        if (isDefaultStore && embeddingQueue && typeof embeddingQueue.schedule === 'function') {
+          embeddingQueue.schedule(updated.scope);
+        }
+        return updated;
+      });
     },
   });
 
   registerTool({
     name: 'memory_graph',
-    description: 'Explore 1-2 hop graph relationships around a document ID or file:<relPath> target for impact analysis and baseline lineage.',
+    description: 'Explore 1-10 hop graph relationships around a document ID or file:<relPath> target for impact analysis and baseline lineage.',
     inputSchema: {
       type: 'object',
       required: ['target'],
       properties: {
         target: { type: 'string', description: 'Document ID or file:<relative/path>' },
         scope: { type: 'string', enum: ['project', 'global', 'all'], default: 'project' },
-        depth: { type: 'integer', minimum: 1, maximum: 3, default: 2 },
+        depth: { type: 'integer', minimum: 1, maximum: 10, default: 2 },
         direction: { type: 'string', enum: ['in', 'out', 'both'], default: 'both' },
         limit: { type: 'integer', minimum: 1, maximum: 500, default: 60 },
+        project_dir: { type: 'string', description: 'Optional project directory override' },
       },
     },
     async handler(args) {
-      return store.exploreGraph({
-        target: args.target,
-        scope: args.scope || 'project',
-        depth: args.depth ?? 2,
-        direction: args.direction || 'both',
-        limit: args.limit ?? 60,
+      return withProjectStore(args, async (targetStore, { projectDir, enabled }) => {
+        const requestedScope = args.scope || 'project';
+        if (!enabled && requestedScope === 'project') {
+          return {
+            target: args.target,
+            scope: 'project',
+            projectExcluded: true,
+            projectDir,
+            nodes: [],
+            edges: [],
+          };
+        }
+        const effectiveScope = enabled ? requestedScope : 'global';
+        return targetStore.exploreGraph({
+          target: args.target,
+          scope: effectiveScope,
+          depth: args.depth ?? 2,
+          direction: args.direction || 'both',
+          limit: args.limit ?? 60,
+        });
       });
     },
   });
@@ -281,25 +440,40 @@ export function createToolRegistry(
         include_global: { type: 'boolean', default: true },
         budget: { type: 'integer', minimum: 256, maximum: 50000, default: 9000 },
         format: { type: 'string', enum: ['both', 'json', 'markdown'], default: 'both' },
+        project_dir: { type: 'string', description: 'Optional project directory override' },
       },
     },
     async handler(args) {
-      const overview = store.getOverview({
-        session: args.session || '',
-        includeGlobal: args.include_global !== false,
+      return withProjectStore(args, async (targetStore, { enabled }) => {
+        const overview = enabled
+          ? targetStore.getOverview({
+              session: args.session || '',
+              includeGlobal: args.include_global !== false,
+            })
+          : (args.include_global !== false
+              ? readGlobalOnlyOverview(targetStore, args.session || '')
+              : {
+                  sessionFilter: args.session || null,
+                  projectExcluded: true,
+                  sessions: [],
+                  todos: [],
+                  decisions: [],
+                  recentWork: [],
+                  globalPreferences: [],
+                });
+        const fitted = fitOverviewToBudget(overview, args.budget ?? targetStore.config?.hookBudget ?? 9000);
+        if (args.format === 'markdown') {
+          return { markdown: fitted.text, step: fitted.step, charCount: fitted.charCount };
+        }
+        if (args.format === 'json') {
+          return overview;
+        }
+        return {
+          ...overview,
+          formatted: fitted.text,
+          fitStep: fitted.step,
+        };
       });
-      const fitted = fitOverviewToBudget(overview, args.budget ?? store.config?.hookBudget ?? 9000);
-      if (args.format === 'markdown') {
-        return { markdown: fitted.text, step: fitted.step, charCount: fitted.charCount };
-      }
-      if (args.format === 'json') {
-        return overview;
-      }
-      return {
-        ...overview,
-        formatted: fitted.text,
-        fitStep: fitted.step,
-      };
     },
   });
 

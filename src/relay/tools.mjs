@@ -1,15 +1,17 @@
 import path from 'node:path';
+import { isProjectEnabled, loadConfig } from '../core/config.mjs';
 import { createHcClient, sanitizeSingleLineTrigger } from './hc.mjs';
 import { ackMessage, drainInbox, enqueueMessage, peekInbox } from './inbox.mjs';
 import { isValidTerminalId, listSavedSessions, readSavedSession, validateTerminalId } from '../revive/tracker.mjs';
+import { isSubagentCaller } from '../mcp/tools.mjs';
 
 function normalizePathKey(p) {
   if (typeof p !== 'string' || !p.trim()) return '';
   return path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
 }
 
-function resolveProjectSessions(store) {
-  if (!store || typeof store.getOverview !== 'function') return [];
+function resolveProjectSessions(store, projectEnabled) {
+  if (!projectEnabled || !store || typeof store.getOverview !== 'function') return [];
   try {
     const ov = store.getOverview({ includeGlobal: false });
     return Array.isArray(ov?.sessions) ? ov.sessions : [];
@@ -24,7 +26,7 @@ function buildWakeTrigger({ messageId, fromTerminalId, contextDocs }) {
     ? ` (${contextDocs.length} doc${contextDocs.length === 1 ? '' : 's'})`
     : '';
   return sanitizeSingleLineTrigger(
-    `[relay] New message ${messageId} from ${from}${docsHint} — run relay_inbox(action="peek")`,
+    `[relay] Message ${messageId} from ${from}${docsHint} — check hook context or run relay_inbox(action="peek") if not shown`,
   );
 }
 
@@ -37,11 +39,18 @@ export function createRelayTools({
   legacyHome,
   hcClient = null,
   store = null,
+  projectEnabled = null,
   getCurrentTerminalId = () => (process.env.HC_TERMINAL_ID || '').trim(),
 } = {}) {
   const hc = hcClient || createHcClient();
   const resolvedProjectDir = path.resolve(projectDir);
   const projectPathKey = normalizePathKey(resolvedProjectDir);
+
+  const isCurrentProjectEnabled = () => {
+    if (typeof projectEnabled === 'boolean') return projectEnabled;
+    const cfg = store?.config || loadConfig({ projectDir: resolvedProjectDir, globalDir });
+    return isProjectEnabled(resolvedProjectDir, cfg);
+  };
 
   const relayTabsTool = {
     name: 'relay_tabs',
@@ -56,7 +65,7 @@ export function createRelayTools({
       const currentTerminalId = getCurrentTerminalId();
       const savedList = listSavedSessions({ globalDir, legacyHome });
       const savedById = new Map(savedList.map((s) => [s.terminalId, s]));
-      const projectSessions = resolveProjectSessions(store);
+      const projectSessions = resolveProjectSessions(store, isCurrentProjectEnabled());
 
       const lsRes = hc.listTerminals();
       const tabs = [];
@@ -129,6 +138,7 @@ export function createRelayTools({
   const relaySendTool = {
     name: 'relay_send',
     description: 'Send a message (with optional context_docs IDs) to another Herdr terminal via atomic file inbox, optionally sending a short single-line wake trigger via hc send.',
+    writeProtected: true,
     inputSchema: {
       type: 'object',
       required: ['to_terminal_id', 'message'],
@@ -150,6 +160,18 @@ export function createRelayTools({
       },
     },
     async handler(args) {
+      if (!isCurrentProjectEnabled()) {
+        return {
+          isError: true,
+          errorCode: 'PROJECT_EXCLUDED',
+          data: {
+            error: 'PROJECT_EXCLUDED',
+            project_dir: resolvedProjectDir,
+            message: `Project "${resolvedProjectDir}" is excluded by herdr-cortex configuration; relay_send is disabled.`,
+          },
+        };
+      }
+
       const toTerminalId = validateTerminalId(args.to_terminal_id);
       const message = typeof args.message === 'string' ? args.message : '';
       if (!message.trim()) {
@@ -168,7 +190,7 @@ export function createRelayTools({
       }
 
       const fromTerminalId = typeof args.from_terminal_id === 'string' && args.from_terminal_id.trim()
-        ? args.from_terminal_id.trim()
+        ? validateTerminalId(args.from_terminal_id)
         : getCurrentTerminalId();
 
       const contextDocs = Array.isArray(args.context_docs)
@@ -183,6 +205,21 @@ export function createRelayTools({
         || (savedTarget?.cwd ? savedTarget.cwd : '')
         || resolvedProjectDir;
       const targetProjectDir = path.resolve(rawTargetDir);
+
+      // Never write inbox files or create .memory/ inside an excluded target project
+      const targetConfig = loadConfig({ projectDir: targetProjectDir, globalDir });
+      if (!isProjectEnabled(targetProjectDir, targetConfig)) {
+        return {
+          isError: true,
+          errorCode: 'TARGET_PROJECT_EXCLUDED',
+          data: {
+            error: 'TARGET_PROJECT_EXCLUDED',
+            to_terminal_id: toTerminalId,
+            target_project_dir: targetProjectDir,
+            message: `Target project "${targetProjectDir}" is excluded by herdr-cortex configuration.`,
+          },
+        };
+      }
 
       const enqueued = enqueueMessage(targetProjectDir, toTerminalId, {
         from_terminal_id: fromTerminalId,
@@ -217,10 +254,16 @@ export function createRelayTools({
           wakeError = getRes.error;
         } else if (!getRes.status.live) {
           wakeReason = 'target_not_live';
+        } else if (getRes.status.isBareShell === true) {
+          wakeReason = 'target_is_bare_shell';
+        } else if (getRes.status.blocked) {
+          wakeReason = 'target_blocked';
+        } else if (getRes.status.error) {
+          wakeReason = 'target_error';
         } else if (getRes.status.busy || !getRes.status.idle) {
           wakeReason = 'target_busy';
         } else {
-          const sendRes = hc.sendTrigger(toTerminalId, trigger);
+          const sendRes = hc.sendTrigger(toTerminalId, trigger, { ifIdle: true });
           if (sendRes.ok) {
             woke = true;
             wakeReason = 'sent_auto_idle';
@@ -259,8 +302,19 @@ export function createRelayTools({
         terminal_id: { type: 'string', description: 'Optional terminal ID override (defaults to HC_TERMINAL_ID)' },
       },
     },
-    async handler(args) {
+    async handler(args, meta = {}) {
       const action = args.action || 'peek';
+      if (action === 'ack' && isSubagentCaller(args, meta)) {
+        return {
+          isError: true,
+          errorCode: 'SUBAGENT_WRITE_DENIED',
+          data: {
+            error: 'SUBAGENT_WRITE_DENIED',
+            tool: 'relay_inbox',
+            message: 'Subagents cannot acknowledge/delete relay inbox messages; use action="peek" only.',
+          },
+        };
+      }
       const rawTerminalId = typeof args.terminal_id === 'string' && args.terminal_id.trim()
         ? args.terminal_id.trim()
         : getCurrentTerminalId();

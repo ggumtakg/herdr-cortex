@@ -54,6 +54,7 @@ if (-not $TestHome -and -not [string]::IsNullOrWhiteSpace($PROFILE)) {
     $profileTargets += $PROFILE
 }
 $profileTargets = $profileTargets | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+$newlineEvaluator = [System.Text.RegularExpressions.MatchEvaluator]{ param($m) "`r`n" }
 
 foreach ($profPath in $profileTargets) {
     if (-not (Test-Path $profPath)) { continue }
@@ -65,7 +66,7 @@ foreach ($profPath in $profileTargets) {
     foreach ($m in $markers) {
         if ($updated -match [regex]::Escape($m.Start)) {
             $pattern = "(?s)\r?\n?" + [regex]::Escape($m.Start) + ".*?" + [regex]::Escape($m.End) + "\r?\n?"
-            $updated = [regex]::Replace($updated, $pattern, "`r`n")
+            $updated = [regex]::Replace($updated, $pattern, $newlineEvaluator)
             $changed = $true
         }
     }
@@ -73,7 +74,8 @@ foreach ($profPath in $profileTargets) {
     if ($changed) {
         $updated = $updated.Trim()
         if ($updated.Length -gt 0) { $updated += "`r`n" }
-        [System.IO.File]::WriteAllText($profPath, $updated, (New-Object System.Text.UTF8Encoding($false)))
+        # Write UTF-8 with BOM so Windows PowerShell 5.1 reads Korean characters cleanly
+        [System.IO.File]::WriteAllText($profPath, $updated, (New-Object System.Text.UTF8Encoding($true)))
         Write-Host "[OK] Cleaned PowerShell profile: $profPath" -ForegroundColor Green
     }
 }

@@ -24,8 +24,8 @@ HEAD가 아래 기준선 문서를 저장한다(1사이클에서 `P0`가 없으�
 - (최초 1회) `memory_save`:
   - `type: "baseline"`, `session: "<세션명>"`, `branch: "P0"`
   - `title`, `summary`, `content`(최초 목적·확정 제약·범위 외·최종 성공 기준)
-- (매 사이클) `memory_save`:
-  - `type: "baseline"`, `session: "<세션명>"`, `branch: "IDEATION"`
+- (매 사이클 `k`) `memory_save`:
+  - `type: "baseline"`, `session: "<세션명>"`, `branch: "C{k}-IDEATION"` (예: `C1-IDEATION`, `C2-IDEATION`)
   - `derived_from: ["<SEED_ID>"]` (1사이클에서는 `["<P0_ID>"]`)
   - `title`, `summary`, `content`(단기 목표, 완료 신호, 범위 외 항목)
 

@@ -20,13 +20,13 @@
 
 ## Output (`memory_save` 기준선 계약)
 
-HEAD가 `PLAN` 기준선을 저장한다.
+HEAD가 `C{k}-PLAN` 기준선을 저장한다.
 
 - `memory_save`:
-  - `type: "baseline"`, `session: "<세션명>"`, `branch: "PLAN"`
+  - `type: "baseline"`, `session: "<세션명>"`, `branch: "C{k}-PLAN"` (예: `C1-PLAN`, `C2-PLAN`)
   - `derived_from: ["<IDEATION_ID>"]`
   - `supersedes: "<이전_PLAN_ID>"` (보완 재작성 시에만 지정)
-  - `files`: 수정 예정 상대 경로 목록
+  - `files`: 수정 예정 프로젝트 상대 경로 목록
   - `title`, `summary`, `content`(실행 규격, 변경 경계, 대표 검증 명령)
 
 ## Next Step (다음 단계)

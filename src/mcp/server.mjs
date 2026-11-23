@@ -2,7 +2,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { CortexStore } from '../core/store.mjs';
-import { REPO_ROOT, loadConfig } from '../core/config.mjs';
+import { REPO_ROOT, isProjectEnabled, loadConfig } from '../core/config.mjs';
 import { createEmbeddingQueue, resolveEmbeddingProvider } from '../embeddings/index.mjs';
 import { createRelayTools } from '../relay/tools.mjs';
 import { createToolRegistry } from './tools.mjs';
@@ -13,6 +13,15 @@ export const SERVER_INFO = Object.freeze({
 });
 
 export const DEFAULT_PROTOCOL_VERSION = '2024-11-05';
+
+export const SERVER_INSTRUCTIONS = `herdr-cortex MCP 도구 안내:
+- 기억 조회: memory_overview(활성 세션·결정·할 일), memory_search(하이브리드 1단계 요약), memory_read(전문), memory_graph(1~10홉 계보·파일 영향).
+- 기억 저장(메인 HEAD 전용, 서브에이전트 읽기 전용): memory_save(type: decision|worklog|knowledge|todo|baseline, supersedes, derived_from, files, scope: project|global, global 선호는 category: "preferences") 및 memory_update(status: active|done|superseded|archived).
+- 멀티 워크스페이스: 필요 시 memory_* 도구에 project_dir 지정 가능.
+- Herdr 탭 협업: relay_tabs(탭 조회), relay_send(context_docs 첨부, HEAD 전용), relay_inbox(action: peek|ack).
+- 프롬프트 로드: cortex_prompt로 start-job, product-planning, delegate, independent-review, plan-run(kind: "skill"), DEVELOPMENT_STANDARD(kind: "standard"), coder/developer/reviewer(kind: "agent") 로드.`;
+
+export const EXCLUDED_SERVER_INSTRUCTIONS = `herdr-cortex MCP 안내: 현재 프로젝트는 herdr-cortex 설정(excludedProjects/opt-in)에 의해 제외되어 있습니다. 프로젝트 기억 쓰기·relay_send 및 .memory/ 생성이 차단되며, scope: "global" 조회와 cortex_prompt만 사용할 수 있습니다.`;
 
 function makeJsonRpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
@@ -33,17 +42,28 @@ export function createMcpServer({
   getEmbeddingProvider = null,
   embeddingQueue = null,
   hcClient = null,
+  projectEnabled = null,
   includeRelayTools = true,
   extraTools = [],
   input = process.stdin,
   output = process.stdout,
 } = {}) {
+  const effectiveProjectEnabled = typeof projectEnabled === 'boolean'
+    ? projectEnabled
+    : (store
+        ? isProjectEnabled(
+            store.projectRoot,
+            store.config || loadConfig({ projectDir: store.projectRoot, globalDir: store.globalDir }),
+          )
+        : true);
+
   const defaultRelayTools = includeRelayTools && store
     ? createRelayTools({
         projectDir: store.projectRoot,
         globalDir: store.globalDir,
         hcClient,
         store,
+        projectEnabled: effectiveProjectEnabled,
       })
     : [];
 
@@ -51,6 +71,7 @@ export function createMcpServer({
     promptsDir,
     getEmbeddingProvider,
     embeddingQueue,
+    projectEnabled: effectiveProjectEnabled,
     extraTools: [...defaultRelayTools, ...extraTools],
   });
 
@@ -76,10 +97,15 @@ export function createMcpServer({
           tools: {},
         },
         serverInfo: SERVER_INFO,
+        instructions: effectiveProjectEnabled ? SERVER_INSTRUCTIONS : EXCLUDED_SERVER_INSTRUCTIONS,
       });
     }
 
-    if (method === 'notifications/initialized' || method === 'initialized') {
+    if (
+      method === 'notifications/initialized'
+      || method === 'initialized'
+      || method === 'notifications/roots/list_changed'
+    ) {
       return null;
     }
 
@@ -148,11 +174,18 @@ export function createMcpServer({
             writeResponse(makeJsonRpcError(null, -32700, `Parse error: ${err.message}`));
             return;
           }
-          const resp = await handleMessage(parsed);
-          writeResponse(resp);
+          try {
+            const resp = await handleMessage(parsed);
+            writeResponse(resp);
+          } catch (err) {
+            process.stderr.write(`[cortex-mcp] internal error: ${err?.stack || err}\n`);
+            if (parsed && typeof parsed === 'object' && parsed.id !== undefined) {
+              writeResponse(makeJsonRpcError(parsed.id, -32603, err?.message || 'Internal error'));
+            }
+          }
         })
         .catch((err) => {
-          process.stderr.write(`[cortex-mcp] internal error: ${err?.stack || err}\n`);
+          process.stderr.write(`[cortex-mcp] fatal chain error: ${err?.stack || err}\n`);
         });
     });
 
@@ -203,6 +236,7 @@ function parseCliOptions(argv) {
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const opts = parseCliOptions(process.argv.slice(2));
   const config = loadConfig({ projectDir: opts.projectDir, globalDir: opts.globalDir });
+  const projectEnabled = isProjectEnabled(opts.projectDir, config);
   const store = new CortexStore({
     projectDir: opts.projectDir,
     globalDir: opts.globalDir,
@@ -212,7 +246,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   let cachedProviderPromise = null;
   const getEmbeddingProvider = () => {
     if (!cachedProviderPromise) {
-      cachedProviderPromise = resolveEmbeddingProvider(config).catch(() => null);
+      cachedProviderPromise = resolveEmbeddingProvider(config).catch(() => {
+        cachedProviderPromise = null;
+        return null;
+      });
     }
     return cachedProviderPromise;
   };
@@ -227,31 +264,42 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     promptsDir: opts.promptsDir,
     getEmbeddingProvider,
     embeddingQueue,
+    projectEnabled,
   });
 
   const handle = server.start();
 
   let closed = false;
-  const shutdown = () => {
+  const shutdown = async () => {
     if (closed) return;
     closed = true;
-    embeddingQueue.cancel();
     handle.close();
+    if (typeof embeddingQueue?.drain === 'function') {
+      try {
+        await embeddingQueue.drain(3000);
+      } catch {
+        // ignore drain errors on shutdown
+      }
+    } else if (typeof embeddingQueue?.cancel === 'function') {
+      embeddingQueue.cancel();
+    }
     store.close();
   };
 
-  handle.done.finally(shutdown);
+  handle.done.finally(() => {
+    shutdown().catch(() => {});
+  });
   process.on('SIGINT', () => {
     handle.close();
-    handle.done.finally(() => {
-      shutdown();
+    handle.done.finally(async () => {
+      await shutdown();
       process.exit(0);
     });
   });
   process.on('SIGTERM', () => {
     handle.close();
-    handle.done.finally(() => {
-      shutdown();
+    handle.done.finally(async () => {
+      await shutdown();
       process.exit(0);
     });
   });

@@ -3,11 +3,12 @@ import path from 'node:path';
 
 export const DEFAULT_MAX_TURNS = 5;
 export const DEFAULT_RECENT_TURNS_BUDGET = 4500;
+export const DEFAULT_MAX_TAIL_BYTES = 2 * 1024 * 1024; // 2MB tail read for fast 100MB+ transcripts
 
 const NOISE_PATTERNS = [
-  /<command-name>/i,
-  /<local-command/i,
-  /\[Request interrupted/i,
+  /^\s*<command-name>/i,
+  /^\s*<local-command/i,
+  /^\s*\[Request interrupted/i,
 ];
 
 function isNoiseText(text) {
@@ -17,15 +18,47 @@ function isNoiseText(text) {
   return NOISE_PATTERNS.some((re) => re.test(trimmed));
 }
 
-function readJsonlLines(filePath) {
+function readJsonlLines(filePath, { maxTailBytes = DEFAULT_MAX_TAIL_BYTES } = {}) {
   if (!filePath || typeof filePath !== 'string') return [];
-  if (!fs.existsSync(filePath)) return [];
-  let raw;
+  let stat;
   try {
-    raw = fs.readFileSync(filePath, 'utf8');
+    stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size === 0) return [];
   } catch {
     return [];
   }
+
+  let raw;
+  let slicedFromTail = false;
+  try {
+    if (maxTailBytes > 0 && stat.size > maxTailBytes) {
+      const readSize = maxTailBytes;
+      const offset = stat.size - readSize;
+      const buf = Buffer.allocUnsafe(readSize);
+      const fd = fs.openSync(filePath, 'r');
+      try {
+        const bytesRead = fs.readSync(fd, buf, 0, readSize, offset);
+        raw = buf.subarray(0, bytesRead).toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      slicedFromTail = true;
+    } else {
+      raw = fs.readFileSync(filePath, 'utf8');
+    }
+  } catch {
+    return [];
+  }
+
+  if (slicedFromTail) {
+    // Drop the leading partial line cut mid-record when starting at an arbitrary byte offset
+    const firstNewline = raw.indexOf('\n');
+    if (firstNewline === -1) return [];
+    raw = raw.slice(firstNewline + 1);
+  } else {
+    raw = raw.replace(/^\uFEFF/, '');
+  }
+
   const entries = [];
   const lines = raw.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
@@ -117,7 +150,7 @@ function extractClaudeEntryMessage(entry) {
         if (!isNoiseText(block.text)) keptParts.push(block.text.trim());
       } else if (bType === 'tool_result') {
         const resText = extractTextFromBlockContent(block.content);
-        if (resText && /The user answered/i.test(resText) && !isNoiseText(resText)) {
+        if (resText && /(?:The\s+)?user\s+(?:has\s+)?answered/i.test(resText) && !isNoiseText(resText)) {
           keptParts.push(resText);
         }
       }
@@ -202,13 +235,30 @@ export function formatRecentTurns(
       keptReversed.push({ turn, block });
       usedChars += needed;
     } else if (keptReversed.length === 0) {
-      // Even the single newest turn alone exceeds maxChars -> trim only this newest turn cleanly at line/word boundary
+      // Even the single newest turn alone exceeds maxChars -> preserve both turn header/user head
+      // AND assistant conclusion (tail) within avail budget.
       const avail = maxChars - heading.length - 2;
       if (avail >= 40) {
-        const suffix = '\n[...trimmed]';
-        const sliceLimit = Math.max(20, avail - suffix.length);
-        const clipped = block.slice(0, sliceLimit).replace(/\s+\S*$/, '').trimEnd() || block.slice(0, sliceLimit);
-        keptReversed.push({ turn, block: `${clipped}${suffix}` });
+        const marker = '\n[...middle trimmed...]\n';
+        if (avail > marker.length + 30) {
+          const remaining = avail - marker.length;
+          const headLimit = Math.max(15, Math.floor(remaining * 0.4));
+          const tailLimit = Math.max(15, remaining - headLimit);
+          const headRaw = block.slice(0, headLimit);
+          const headClean = headRaw.replace(/\s+\S*$/, '').trimEnd() || headRaw.trimEnd();
+          const tailRaw = block.slice(block.length - tailLimit);
+          const tailClean = tailRaw.replace(/^\S*\s+/, '').trimStart() || tailRaw.trimStart();
+          const combined = `${headClean}${marker}${tailClean}`;
+          keptReversed.push({
+            turn,
+            block: combined.length <= avail ? combined : combined.slice(0, avail).trimEnd(),
+          });
+        } else {
+          const suffix = '\n[...trimmed]';
+          const sliceLimit = Math.max(20, avail - suffix.length);
+          const clipped = block.slice(0, sliceLimit).replace(/\s+\S*$/, '').trimEnd() || block.slice(0, sliceLimit);
+          keptReversed.push({ turn, block: `${clipped}${suffix}` });
+        }
       }
       break;
     } else {
@@ -245,9 +295,10 @@ export function extractClaudeRecentTurns(
   {
     maxTurns = DEFAULT_MAX_TURNS,
     maxChars = DEFAULT_RECENT_TURNS_BUDGET,
+    maxTailBytes = DEFAULT_MAX_TAIL_BYTES,
   } = {},
 ) {
-  const rows = readJsonlLines(transcriptPath);
+  const rows = readJsonlLines(transcriptPath, { maxTailBytes });
   if (rows.length === 0) {
     return { turns: [], text: '', charCount: 0, droppedCount: 0, boundaryType: null };
   }
@@ -282,10 +333,19 @@ export function extractClaudeRecentTurns(
     boundaryType = lastBoundary.kind;
     segmentTurns = extractRange(lastBoundary.index + 1, rows.length);
 
-    // Immediately after /compact or /clear writes a trailing boundary, restore the turns right before it
-    if (segmentTurns.length === 0 && (lastBoundary.kind === 'compact' || lastBoundary.kind === 'clear')) {
-      const prevBoundaryIdx = boundaries.length >= 2 ? boundaries[boundaries.length - 2].index + 1 : 0;
-      segmentTurns = extractRange(prevBoundaryIdx, lastBoundary.index);
+    // Immediately after one or more consecutive empty /compact or /clear boundaries,
+    // walk backwards across empty boundary segments to restore the last non-empty segment.
+    if (segmentTurns.length === 0) {
+      for (let k = boundaries.length - 1; k >= 0; k--) {
+        const b = boundaries[k];
+        if (b.kind !== 'compact' && b.kind !== 'clear') break;
+        const prevStart = k > 0 ? boundaries[k - 1].index + 1 : 0;
+        const candidate = extractRange(prevStart, b.index);
+        if (candidate.length > 0) {
+          segmentTurns = candidate;
+          break;
+        }
+      }
     }
   }
 
@@ -298,7 +358,7 @@ export function extractClaudeRecentTurns(
   };
 }
 
-function resolveAntigravityTranscriptPath(transcriptPath) {
+export function resolveAntigravityTranscriptPath(transcriptPath) {
   if (!transcriptPath || typeof transcriptPath !== 'string') return '';
   const resolved = path.resolve(transcriptPath);
   if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
@@ -443,10 +503,11 @@ export function extractAntigravityState(
   {
     maxTurns = DEFAULT_MAX_TURNS,
     maxChars = DEFAULT_RECENT_TURNS_BUDGET,
+    maxTailBytes = DEFAULT_MAX_TAIL_BYTES,
   } = {},
 ) {
   const actualPath = resolveAntigravityTranscriptPath(transcriptPath);
-  const rows = readJsonlLines(actualPath);
+  const rows = readJsonlLines(actualPath, { maxTailBytes });
   if (rows.length === 0) {
     return {
       transcriptPath: actualPath || null,

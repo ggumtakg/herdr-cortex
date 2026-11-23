@@ -19,7 +19,7 @@ import {
   recordSession,
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
-import { drainInbox, formatInboxForHook } from '../relay/inbox.mjs';
+import { drainInbox, formatInboxForHookDetailed } from '../relay/inbox.mjs';
 import { extractClaudeRecentTurns } from './recent-turns.mjs';
 
 export const CLAUDE_HOOK_MAX_CHARS = 9000;
@@ -39,6 +39,27 @@ const CORTEX_DIRECT_TOOLS = new Set([
   'relay_inbox',
   'cortex_prompt',
 ]);
+
+const WRITE_PROTECTED_CORTEX_TOOLS = new Set([
+  'memory_save',
+  'memory_update',
+  'relay_send',
+]);
+
+function extractBaseCortexToolName(toolName) {
+  if (typeof toolName !== 'string') return '';
+  return toolName.trim().replace(/^(?:mcp__)?cortex__/i, '').toLowerCase();
+}
+
+function isWriteProtectedCortexCall(toolName, rawInput = {}) {
+  const base = extractBaseCortexToolName(toolName);
+  if (WRITE_PROTECTED_CORTEX_TOOLS.has(base)) return true;
+  if (base === 'relay_inbox') {
+    const action = String(rawInput?.action || 'peek').trim().toLowerCase();
+    return action === 'ack';
+  }
+  return false;
+}
 
 export function isCortexToolName(toolName) {
   if (typeof toolName !== 'string') return false;
@@ -63,7 +84,8 @@ function readHeadCore(promptsDir, config) {
 function hasAnyOverviewItems(ov) {
   if (!ov) return false;
   return (
-    (ov.sessions?.length || 0) > 0
+    (ov.p0Baselines?.length || 0) > 0
+    || (ov.sessions?.length || 0) > 0
     || (ov.todos?.length || 0) > 0
     || (ov.decisions?.length || 0) > 0
     || (ov.recentWork?.length || 0) > 0
@@ -169,16 +191,19 @@ export function handleClaudeSessionStart(
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   const maxChars = Math.max(256, Math.min(Number(config.hookBudget) || CLAUDE_HOOK_MAX_CHARS, CLAUDE_HOOK_MAX_CHARS));
+  const source = String(payload.source || '').trim().toLowerCase();
 
-  // Record revive session on 'all' or 'core' (and on 'context' returns existing record with previousSessionId)
-  const sessionRec = recordSession({
-    terminalId,
-    agent: 'claude',
-    payload,
-    cwd: projectDir,
-    globalDir: effectiveGlobalDir,
-    legacyHome,
-  });
+  // Record revive session once (skip on legacy split part="core" to avoid parallel race)
+  const sessionRec = part !== 'core'
+    ? recordSession({
+        terminalId,
+        agent: 'claude',
+        payload,
+        cwd: projectDir,
+        globalDir: effectiveGlobalDir,
+        legacyHome,
+      })
+    : null;
 
   if (!isProjectEnabled(projectDir, config)) {
     return {};
@@ -194,8 +219,9 @@ export function handleClaudeSessionStart(
     used += sep + text.trim().length;
   };
 
-  // 1. HEAD_CORE.md (in 'all' or 'core')
-  if (part === 'all' || part === 'core') {
+  // 1. HEAD_CORE.md (in 'all' or 'core'); skip duplicate on resume/fork where conversation already has it
+  const skipDuplicateHeadCore = source === 'resume' || source === 'fork';
+  if ((part === 'all' || part === 'core') && !skipDuplicateHeadCore) {
     const headCore = readHeadCore(promptsDir, config);
     if (headCore) {
       pushSection(trimLinesToBudget(headCore, maxChars));
@@ -209,34 +235,35 @@ export function handleClaudeSessionStart(
         },
       };
     }
+  } else if (part === 'core') {
+    return {};
   }
 
-  // 2. Drain relay inbox (urgent peer messages)
-  let drainedInbox = null;
-  if (isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
-    try {
-      drainedInbox = drainInbox(projectDir, terminalId);
-    } catch {
-      drainedInbox = null;
-    }
-  }
-
-  const source = String(payload.source || '').trim().toLowerCase();
   const wantsRecentTurns = (source === 'compact' || source === 'clear') && Boolean(payload.transcript_path || payload.transcriptPath);
   const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
 
   const sepCost = (n) => (sections.length + n > 0 ? 2 : 0);
 
-  if (drainedInbox && drainedInbox.messages.length > 0) {
+  // 2. Budget-first relay inbox drain + partial ACK (only ack fully delivered non-truncated messages)
+  if (isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
     const remaining = maxChars - used - sepCost(0);
     if (remaining >= 120) {
-      const inboxBudget = (overview || wantsRecentTurns)
-        ? Math.min(2000, Math.max(300, Math.floor(remaining * 0.35)))
-        : remaining;
-      const inboxText = formatInboxForHook(drainedInbox.messages, { maxChars: Math.min(inboxBudget, remaining) });
-      if (inboxText) {
-        pushSection(inboxText);
-        drainedInbox.ack();
+      try {
+        const drainedInbox = drainInbox(projectDir, terminalId);
+        if (drainedInbox && drainedInbox.messages.length > 0) {
+          const inboxBudget = (overview || wantsRecentTurns)
+            ? Math.min(2000, Math.max(300, Math.floor(remaining * 0.35)))
+            : remaining;
+          const detailed = formatInboxForHookDetailed(drainedInbox.messages, {
+            maxChars: Math.min(inboxBudget, remaining),
+          });
+          if (detailed.text) {
+            pushSection(detailed.text);
+          }
+          drainedInbox.ack(detailed.includedIds);
+        }
+      } catch {
+        // ignore inbox errors in hook
       }
     }
   }
@@ -260,12 +287,14 @@ export function handleClaudeSessionStart(
       });
 
       // On /clear, Claude Code often opens a brand-new empty <newSessionId>.jsonl;
-      // fall back safely to sibling <previousSessionId>.jsonl when 0 turns exist.
+      // fall back safely to sibling <previousSessionId>.jsonl, or (for non-Herdr terminals
+      // without HC_TERMINAL_ID) the most recently modified sibling *.jsonl in the same directory.
       if (source === 'clear' && extracted.turns.length === 0) {
+        const resolvedCurrent = path.resolve(transcriptPath);
+        const transcriptDir = path.dirname(resolvedCurrent);
         const prevSessionId = sessionRec?.record?.previousSessionId;
         if (prevSessionId && isValidId(prevSessionId)) {
           try {
-            const transcriptDir = path.dirname(path.resolve(transcriptPath));
             const siblingPath = assertInsideDir(transcriptDir, `${prevSessionId}.jsonl`);
             if (fs.existsSync(siblingPath)) {
               const prevExtracted = extractClaudeRecentTurns(siblingPath, {
@@ -279,6 +308,40 @@ export function handleClaudeSessionStart(
             }
           } catch {
             // ignore invalid or escaped sibling path
+          }
+        }
+
+        if (extracted.turns.length === 0 && fs.existsSync(transcriptDir)) {
+          try {
+            const candidates = fs.readdirSync(transcriptDir, { withFileTypes: true })
+              .filter((ent) => ent.isFile() && ent.name.endsWith('.jsonl') && !ent.name.startsWith('agent-'))
+              .map((ent) => {
+                try {
+                  const abs = assertInsideDir(transcriptDir, ent.name);
+                  if (abs.toLowerCase() === resolvedCurrent.toLowerCase()) return null;
+                  const st = fs.statSync(abs);
+                  if (st.size === 0) return null;
+                  return { abs, mtimeMs: st.mtimeMs };
+                } catch {
+                  return null;
+                }
+              })
+              .filter(Boolean)
+              .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+            for (const cand of candidates.slice(0, 5)) {
+              const candExtracted = extractClaudeRecentTurns(cand.abs, {
+                maxTurns: 5,
+                maxChars: maxRecentChars,
+              });
+              if (candExtracted.turns.length > 0) {
+                extracted = candExtracted;
+                resolvedTurnsTranscript = cand.abs;
+                break;
+              }
+            }
+          } catch {
+            // ignore directory scan errors
           }
         }
       }
@@ -333,6 +396,9 @@ export function handleClaudeSessionStart(
  * Note: Claude Code rejects `hookSpecificOutput` on PreCompact; emit top-level `continue` + `systemMessage`.
  */
 export function handleClaudePreCompact(payload = {}, { globalDir } = {}) {
+  if (isSubagentPayload(payload)) {
+    return {};
+  }
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: resolveCortexGlobalDir(globalDir) });
   if (!isProjectEnabled(projectDir, config)) {
@@ -377,23 +443,25 @@ export function handleClaudeUserPrompt(
     return {};
   }
 
-  const text = formatInboxForHook(drained.messages, { maxChars });
-  drained.ack();
+  const detailed = formatInboxForHookDetailed(drained.messages, { maxChars });
+  drained.ack(detailed.includedIds);
 
-  if (!text) return {};
+  if (!detailed.text) return {};
   return {
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
-      additionalContext: text,
+      additionalContext: detailed.text,
     },
   };
 }
 
 /**
  * Claude Code PreToolUse handler:
- * For cortex MCP tools, ALWAYS strip any LLM-supplied `_caller_agent_id` and
- * inject the real host `agent_id` (if caller is a subagent) via `updatedInput`
- * so Canon Protection cannot be spoofed.
+ * - For subagents calling write-protected cortex tools (memory_save, memory_update,
+ *   relay_send, relay_inbox(action="ack")), directly return permissionDecision: 'deny'.
+ * - For subagents calling read-only cortex tools, inject real host agent_id via updatedInput
+ *   and NEVER return permissionDecision: 'allow'.
+ * - For HEAD, strip any LLM-spoofed `_caller_agent_id`.
  */
 export function handleClaudePreToolUse(payload = {}) {
   const toolName = payload.tool_name || payload.toolName || '';
@@ -407,6 +475,17 @@ export function handleClaudePreToolUse(payload = {}) {
 
   const hadSpoofedKey = Object.prototype.hasOwnProperty.call(rawInput, '_caller_agent_id');
   const hostAgentId = String(payload.agent_id || payload.agentId || '').trim();
+  const callerIsSubagent = Boolean(hostAgentId) || isSubagentPayload(payload);
+
+  if (callerIsSubagent && isWriteProtectedCortexCall(toolName, rawInput)) {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'Canonical memory and relay write operations are restricted to the main HEAD conversation; subagents have read-only access.',
+      },
+    };
+  }
 
   if (!hadSpoofedKey && !hostAgentId) {
     return {};
@@ -422,7 +501,6 @@ export function handleClaudePreToolUse(payload = {}) {
   return {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
-      ...(hostAgentId ? { permissionDecision: 'allow' } : {}),
       updatedInput,
     },
   };
@@ -465,7 +543,7 @@ function parseCliArgs(argv) {
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   try {
     const { event, part } = parseCliArgs(process.argv.slice(2));
-    const raw = fs.readFileSync(0, 'utf8');
+    const raw = fs.readFileSync(0, 'utf8').replace(/^\uFEFF/, '');
     let payload = {};
     if (raw && raw.trim()) {
       payload = JSON.parse(raw);

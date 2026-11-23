@@ -90,28 +90,28 @@ flowchart TB
 
 | 테이블 | 유형 | 역할 |
 | :--- | :---: | :--- |
-| **`docs`** | 정형(SQL) | 메타데이터(`type`, `status`, `session`, `branch`, `tags`, `due`), 원문 `content`, 증분 동기화용 `(mtime_ms, size, hash)`, 임베딩 상태 |
-| **`docs_fts`** | 키워드(FTS5) | `tokenize='trigram'` 전문 검색(BM25). **한국어 1~2자 토큰(`압축`, `락`, `훅`)의 trigram 누락 엣지케이스는 자동 `LIKE` 폴백으로 보완** |
-| **`doc_chunks_vec`** | 벡터(`sqlite-vec`) | `vec0` 코사인 유사도 검색 (`PARTITION KEY`로 문서 단위 원자 삭제, `+heading`/`+snippet` 내장). 미설정·오프라인 시 무장애 자동 생략 |
-| **`edges`** | 그래프 | `links_to`(`[[doc-id]]`), `points_file`, `file_link`, `supersedes`, `derived_from`, `session_next` 통합 엣지 (`WITH RECURSIVE` 1~3홉 탐색) |
+| **`docs`** | 정형(SQL) | 메타데이터(`type`, `status`, `session`, `branch`, `tags`, `due`), 원문 `content`, 증분 동기화용 `(mtime_ms, size, hash, content_hash)`, 임베딩 상태·재시도 정보 |
+| **`docs_fts`** | 키워드(FTS5) | `tokenize='trigram'` 전문 검색(BM25) + SQL `JOIN docs` 메타데이터 푸시다운. **한국어 1~2자 토큰(`압축`, `락`, `훅`) 및 보수적 조사 어간 매칭은 자동 `LIKE` 폴백과 보조 토큰으로 보완** |
+| **`doc_chunks_vec`** | 벡터(`sqlite-vec`) | `vec0` 코사인 유사도 검색 (`chunk_size=64` 콤팩트 블록, `doc_id`/`status`/`type` 메타데이터 푸시다운, `+heading`/`+snippet` 내장). 본문(`content_hash`)이 그대로인 메타데이터 변경 시 기존 벡터를 보존하며 미설정·오프라인 시 무장애 자동 생략 |
+| **`edges`** | 그래프 | `links_to`(`[[doc-id]]`), `points_file`, `file_link`, `supersedes`, `derived_from`, `session_next` 통합 엣지 (BFS **1~10홉** 탐색으로 다사이클 계보·파일 영향도 추적) |
 
 * **4박자 RRF 2단계 조회 (토큰 절약)**:
-  1. **1단계 (`memory_search`)**: 정형 필터(`superseded`/`archived` 기본 제외) + 한국어 키워드 + 벡터 KNN을 **RRF(Reciprocal Rank Fusion)** + 최신성 가중치로 융합하고 1홉 연관 엣지를 붙여 **`id`, `title`, `summary`, `relations` 목록만** 반환합니다.
+  1. **1단계 (`memory_search`)**: 정형 필터(`superseded`/`archived` 기본 제외, `vec0` `status` 메타데이터 푸시다운) + 한국어 키워드 + 지연 쿼리 임베딩 기반 벡터 KNN(코사인 거리 컷오프)을 **RRF(Reciprocal Rank Fusion)** + 최신성 가중치로 융합하고 1홉 연관 엣지를 붙여 **`id`, `title`, `summary`, `relations` 목록만** 반환합니다.
   2. **2단계 (`memory_read`)**: LLM이 목록에서 정말 필요한 문서 1~3개만 지정해 전문을 로드합니다.
 
 ### ③ 플러거블 비동기 임베딩 (`src/embeddings/`)
-* **지원 프로바이더**: `gemini` (`gemini-embedding-001`, 768차원) · `openai` (`text-embedding-3-small`) · `ollama` (`bge-m3`) · 로컬 `onnx` (`@huggingface/transformers` 지연 로드) · `auto` · `none`
-* **저장 지연 0ms**: `memory_save` 시 정형·FTS5·그래프만 10~30ms 안에 즉시 커밋하고, 벡터 임베딩은 비동기 백그라운드 큐(또는 `npm run embed`)가 처리합니다.
-* **모델 교체 자동 대응**: 프로바이더/차원이 바뀌면 `index-meta.json`으로 감지해 `doc_chunks_vec`만 마크다운 정본에서 자동 재구축합니다.
+* **지원 프로바이더**: `gemini` (`gemini-embedding-001`, 768차원, `x-goog-api-key` 헤더 + 100건 sub-batching) · `openai` (`text-embedding-3-small`) · `ollama` (`bge-m3`) · 로컬 `onnx` (`@huggingface/transformers` 지연 로드) · `auto` · `none`
+* **저장 지연 0ms**: `memory_save` 시 정형·FTS5·그래프만 10~30ms 안에 즉시 커밋하고, 벡터 임베딩은 비동기 백그라운드 큐(또는 `npm run embed`)가 처리합니다. `superseded`/`archived` 문서는 임베딩에서 제외하고 실패 시 최대 재시도 + 백오프를 적용합니다.
+* **모델 교체 자동 대응**: 프로바이더/차원이 바뀌면 SQLite 내부 `index_meta` 테이블로 원자 감지해 `doc_chunks_vec`만 마크다운 정본에서 자동 재구축합니다.
 
 ### ④ 공식 훅 자동 복구 · `revive` · Herdr `relay`
 * **공식 훅만 사용 (비공개 소켓/로그 해킹 배제)**:
-  * **Claude Code**: `SessionStart`(9,000자 상한 대응 `core`/`context` 분할, `/clear`·`compact` 시 직전 5턴 원문 및 `previousSessionId.jsonl` 복원), `PreCompact`(1줄 포인터), `UserPromptSubmit`(인박스 드레인), `PreToolUse`(서브에이전트 스푸핑 방어)
-  * **Antigravity CLI**: `SessionStart`, `PreInvocation`(`/compact` 1줄 포인터, `transcript_full.jsonl`의 `CHECKPOINT` 완료 감지 시 1회 자동 복원, 인박스 드레인)
-  * **`FIT_STEPS` 무절단 축약**: 훅 예산(기본 9,000자) 초과 시 문장 중간을 자르지 않고 단계별로 축약하며 열린 세션·할 일·핵심 결정을 끝까지 보존합니다.
-* **프로젝트별 스코핑 (`mode` / `excludedProjects` / `enabledProjects`)**: 특정 프로젝트만 제외(`excludedProjects`)하거나 지정 프로젝트에만 켜는(`opt-in`) 안전 모드를 지원합니다. 제외된 프로젝트에서는 `HEAD_CORE`/맥락 주입과 `.memory/` 생성을 완전 차단하면서 기존 `revive` 세션 추적만 조용히 유지합니다.
+  * **Claude Code**: `SessionStart`(9,000자 상한 대응 통합 예산, `/clear`·`compact` 시 직전 5턴 원문 및 `previousSessionId.jsonl` 복원), `PreCompact`(서브에이전트 가드 적용), `UserPromptSubmit`(예산 확인 후 부분 `ack` 인박스 드레인), `PreToolUse`(서브에이전트 쓰기 도구 차단)
+  * **Antigravity CLI**: `SessionStart`, `PreInvocation`(`/compact` 1줄 포인터, `transcript_full.jsonl` tail 역탐색 기반 `CHECKPOINT` 완료 감지 시 1회 자동 복원, 통합 예산 내 부분 `ack` 인박스 드레인)
+  * **`FIT_STEPS` 무절단 축약 & `P0` 기준선 보호**: 훅 예산(기본 9,000자) 초과 시 문장 중간을 자르지 않고 단계별로 축약하며, **열린 세션·할 일·활성 `P0` 기준선·핵심 결정**을 끝까지 보호합니다.
+* **전 구간 프로젝트 스코핑 (`mode` / `excludedProjects` / `enabledProjects`) & 설정 샌드박스**: 특정 프로젝트만 제외(`excludedProjects`)하거나 지정 프로젝트에만 켜는(`opt-in`) 안전 모드를 **훅 · MCP 서버 · `relay` · `embed` CLI 전 구간**에 일관 적용합니다. 제외된 프로젝트에서는 `HEAD_CORE`/맥락 주입과 `.memory/` 자동 생성을 완전 차단하고, 읽기 전용 도구도 미초기화 프로젝트에 `.memory/`를 만들지 않으며, 프로젝트 `.memory/config.json`의 네트워크/인증/전역 스코핑 키 덮어쓰기를 차단합니다.
 * **`revive` (재부팅 세션 복구)**: Herdr 탭(`HC_TERMINAL_ID`)별 `agy`/`claude` 대화 ID를 기록하되, **서브에이전트 가드**로 하위 에이전트가 부모 탭의 세션 ID를 덮어쓰지 못하게 막고 `/clear` 이전 `previousSessionId` 체인을 보관합니다.
-* **`relay` (Herdr 크로스 탭 메시징)**: `hc ls --json` / `hc get`으로 살아 있는 탭을 조회하고, 메시지 원문은 대상 탭 프로젝트의 `.memory/state/inbox/<terminalId>/`에 원자 저장(`.taking-<pid>` claim/ack + 크래시 복구 + `.broken/` 격리)한 뒤, 대상 탭이 유휴 상태일 때만 `hc send`로 짧은 1줄 깨우기 트리거를 보냅니다.
+* **`relay` (Herdr 크로스 탭 메시징)**: `hc ls --json` / `hc get`으로 살아 있는 탭을 조회하고, 메시지 원문은 대상 탭 프로젝트의 `.memory/state/inbox/<terminalId>/`에 원자 저장(`.taking-<pid>` claim/부분 ack + 크래시 복구 + `.broken/` 격리)한 뒤, 빈 셸을 제외한 유휴 탭에만 `hc send --if idle`로 짧은 1줄 깨우기 트리거를 보냅니다.
 
 ---
 
@@ -124,8 +124,8 @@ flowchart TB
 | **`start-job`** | `prompts/skills/start-job/SKILL.md` | 진입 게이트: 목표 합의 → 기억 우선 탐색 → 직접 / 포크 / `delegate` / `plan-run` 라우팅 |
 | **`product-planning`** | `prompts/skills/product-planning/SKILL.md` | 문제 정의 → 사용자 가치 → 유저플로우(자동화 vs 사용자 통제 경계) 3단계 기획 |
 | **`delegate`** | `prompts/skills/delegate/SKILL.md` | 1회성 경계 위임 (작업 종류 혼합 금지 + Entry Contract 5요소 + 워커 로딩 + 재통합) |
-| **`independent-review`** | `prompts/skills/independent-review/SKILL.md` | 제작 편향 없는 새 컨텍스트 독립 검수 (`ACCEPT` / `NEEDS_FIX`) |
-| **`plan-run` (8단계)** | `prompts/skills/plan-run/` (`steps/01~08.md`) | **호스트 중립 다단계 자율 파이프라인**: `P0`(최초 목적) → `01` Ideation → `02` 실행 계획 → `03` `P0` 최소성 독립 점검 → `04` 독립 계획 수용(`PN`) → `05` 실행(`Rn`) → `06` `PN` 독립 결과 검수 → `07` `P0` 전체 방향 점검 → `08` HEAD 최종 판정. 각 기준선을 `.memory/docs/` `type: baseline` + `derived_from` 그래프로 영속화해 Claude·Antigravity 양쪽에서 동일 동작 |
+| **`independent-review`** | `prompts/skills/independent-review/SKILL.md` | 제작 편향 없는 새 컨텍스트 독립 검수 (`Verified Facts` / `Open Facts` / `Blockers` / `Minor Notes` / `Verdict` 5구획 통일) |
+| **`plan-run` (8단계)** | `prompts/skills/plan-run/` (`steps/01~08.md`) | **호스트 중립 다사이클 자율 파이프라인**: `P0`(최초 목적, `memory_overview` 보호) → 사이클별 브랜치(`C{k}-IDEATION`, `C{k}-PLAN`, `C{k}-PN`, `C{k}-R{k}`, `C{k}-SEED`)와 `derived_from` 그래프로 1~10홉 계보 영속화. `LOCAL_CORRECTION` 시 `attempt: N/2` 추적, `DONE` 시 중간 기준선 `archived`/`done` 자동 마감으로 `memory_overview` 청결 유지 |
 | **워커 3종** | `prompts/agents/{coder,developer,reviewer}.md` | `coder`(확정 명세 번역, `contract_conflict` 거절) · `developer`(경계 내 E2E 구현+증명) · `reviewer`(수정 권한 0 독립 비평가) |
 
 ---
@@ -138,8 +138,8 @@ flowchart TB
 | `memory_read` | 메모리 | 읽기 | 2단계 문서 전문 + 1홉 이웃 그래프 로드 |
 | `memory_save` | 메모리 | **HEAD 전용** | 마크다운 정본 생성, `supersedes` 전이, 즉시 색인 + 비동기 임베딩 |
 | `memory_update` | 메모리 | **HEAD 전용** | 기존 문서 상태/본문/태그/파일 갱신 |
-| `memory_graph` | 메모리 | 읽기 | 1~3홉 그래프 탐색, `file:<경로>` 영향도(`impact`), `plan-run` 계보 추적 |
-| `memory_overview` | 메모리 | 읽기 | 활성 세션/브랜치, 열린 할 일, 최근 결정/기준선, 전역 선호도 요약 |
+| `memory_graph` | 메모리 | 읽기 | 1~10홉 그래프 탐색, `file:<경로>` 영향도(`impact`), `plan-run` 다사이클 계보 추적 |
+| `memory_overview` | 메모리 | 읽기 | 활성 세션/브랜치, 열린 할 일, 보호된 `P0` 기준선 및 최근 결정/기준선, 전역 선호도 요약 |
 | `relay_tabs` | 릴레이 | 읽기 | `hc ls` + 저장 세션 + 인박스 대기 수 통합 탭 목록 |
 | `relay_send` | 릴레이 | 쓰기 | 타깃 프로젝트 인박스 원자 저장 + 유휴 시 `hc send` 단선 트리거 |
 | `relay_inbox` | 릴레이 | 읽기/확인 | 현재 탭 수신 메시지 조회(`peek`) / 확인(`ack`) |
@@ -208,7 +208,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 revive-agents          # 빈 셸 상태인 모든 Antigravity / Claude 탭 일괄 복구
 revive-agents -DryRun  # 복구 대상과 명령어 미리 보기
 revive-status          # 열린 Herdr 터미널 및 저장된 세션 ID 확인
-cortex-status          # 전역/프로젝트 herdr-cortex 상태 확인
+cortex-status          # 현재 디렉터리 isProjectEnabled, sqlite-vec 로드, 임베딩 상태 분포(ready/pending/error + 최근 에러), DB/WAL 크기, 인박스/.broken/.tmp 진단
 
 # 테스트 실행 (행동 · 회귀 · purity 테스트)
 npm test

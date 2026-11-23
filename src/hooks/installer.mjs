@@ -202,12 +202,7 @@ function updateClaudeSettings(homeDir, repoRoot, isInstall) {
     hooks: [
       {
         type: 'command',
-        command: `node --no-warnings "${claudeScript}" session-start core --id ${CLAUDE_HOOK_MARKER}`,
-        timeout: 10,
-      },
-      {
-        type: 'command',
-        command: `node --no-warnings "${claudeScript}" session-start context --id ${CLAUDE_HOOK_MARKER}`,
+        command: `node --no-warnings "${claudeScript}" session-start --id ${CLAUDE_HOOK_MARKER}`,
         timeout: 10,
       },
     ],
@@ -305,6 +300,21 @@ function syncClaudeSkills(homeDir, repoRoot, isInstall) {
     }
 
     fs.cpSync(srcDir, destDir, { recursive: true });
+    // Sync SKILL.md frontmatter `name:` to match the installed cortex-<skill> directory name
+    const skillMdPath = path.join(destDir, 'SKILL.md');
+    if (fs.existsSync(skillMdPath)) {
+      const rawSkill = fs.readFileSync(skillMdPath, 'utf8').replace(/^\uFEFF/, '');
+      const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---/.exec(rawSkill);
+      if (fmMatch) {
+        const fmBody = fmMatch[1];
+        const eol = rawSkill.includes('\r\n') ? '\r\n' : '\n';
+        const updatedFmBody = /^name\s*:\s*.*$/m.test(fmBody)
+          ? fmBody.replace(/^name\s*:\s*.*$/m, `name: ${destName}`)
+          : `name: ${destName}${eol}${fmBody}`;
+        const updatedSkill = `---${eol}${updatedFmBody}${eol}---${rawSkill.slice(fmMatch[0].length)}`;
+        atomicWriteText(skillMdPath, updatedSkill);
+      }
+    }
     atomicWriteText(path.join(destDir, SKILL_MANAGED_MARKER), `managed-by=herdr-cortex\nsource=${srcDir}\n`);
     installed.push(destName);
   }

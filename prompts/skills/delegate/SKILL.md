@@ -29,7 +29,7 @@ description: 경계가 확정된 단일 작업을 워커(coder/developer/reviewe
 
 1. **소비자 (Consumer)**: 이 결과물을 누가, 다음 어떤 판단·단계에서 사용하는가.
 2. **관측 산출물 (Observable Deliverable)**: 생성·수정할 파일, 반환할 구조화 요약, 확인 가능한 출력 형식.
-3. **권위 입력 (Authoritative Inputs)**: 기준선 문서 ID(`memory_read` 대상), 확정 결정, 직접 읽어야 할 파일 경로. HEAD의 장황한 해석 대신 1차 근거를 제공한다.
+3. **권위 입력 (Authoritative Inputs)**: 기준선 문서 ID(`memory_read` 대상), 확정 결정, 직접 읽어야 할 파일 경로(프로젝트 상대 경로 권장). HEAD의 장황한 해석 대신 1차 근거를 제공한다.
 4. **변경 경계 (Mutation Boundary)**: 수정 허용 파일/디렉터리, 건드리지 말아야 할 소유 영역, 유지해야 할 외부 계약.
 5. **대표 증명 (Representative Proof)**: 완료 전 실제 환경에서 실행해야 할 대표 명령과 통과 기준(실제 입력 → 실제 출력).
 
@@ -46,3 +46,5 @@ description: 경계가 확정된 단일 작업을 워커(coder/developer/reviewe
 1. 대표 실행 증명이 실제로 통과했는지 관측 출력으로 확인한다.
 2. 산출물 영향이 크거나 계약·로직 변경이 포함되면 `independent-review`를 새 컨텍스트로 실행해 편향 없이 검증한다.
 3. 수용이 확정되면 HEAD가 `memory_save` 또는 `memory_update`로 작업 기록·결정·기준선 변경(변경 시 `supersedes`)을 정본에 반영한다.
+   - `files` 파라미터에는 **프로젝트 상대 경로**를 전달한다(프로젝트 루트 내부의 절대 경로는 자동 상대화되며, 프로젝트 외부 경로는 차단된다).
+   - 작업 과정에서 프로젝트 전반에 적용할 사용자 선호를 새로 확인했다면 `memory_save(type: "knowledge", scope: "global", category: "preferences", ...)`로 별도 보존한다.

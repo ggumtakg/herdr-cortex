@@ -33,28 +33,32 @@ function hydrateNodes(db, nodeIds) {
   }
 
   if (docIds.length > 0) {
-    const placeholders = docIds.map(() => '?').join(', ');
-    const rows = db
-      .prepare(`
-        SELECT id, type, status, title, summary, session, branch, updated_at
-        FROM docs
-        WHERE id IN (${placeholders})
-      `)
-      .all(...docIds);
+    const BATCH = 200;
+    for (let i = 0; i < docIds.length; i += BATCH) {
+      const batch = docIds.slice(i, i + BATCH);
+      const placeholders = batch.map(() => '?').join(', ');
+      const rows = db
+        .prepare(`
+          SELECT id, type, status, title, summary, session, branch, updated_at
+          FROM docs
+          WHERE id IN (${placeholders})
+        `)
+        .all(...batch);
 
-    for (const row of rows) {
-      nodeMap.set(row.id, {
-        id: row.id,
-        nodeType: 'doc',
-        exists: true,
-        type: row.type,
-        status: row.status,
-        title: row.title,
-        summary: row.summary,
-        session: row.session,
-        branch: row.branch,
-        updated_at: row.updated_at,
-      });
+      for (const row of rows) {
+        nodeMap.set(row.id, {
+          id: row.id,
+          nodeType: 'doc',
+          exists: true,
+          type: row.type,
+          status: row.status,
+          title: row.title,
+          summary: row.summary,
+          session: row.session,
+          branch: row.branch,
+          updated_at: row.updated_at,
+        });
+      }
     }
   }
 
@@ -148,8 +152,64 @@ export function getNeighbors(db, targetId, { direction = 'both', limit = 20 } = 
   });
 }
 
+function queryFrontierEdges(db, frontier, dir) {
+  const BATCH = 200;
+  const collected = [];
+
+  for (let i = 0; i < frontier.length; i += BATCH) {
+    const batch = frontier.slice(i, i + BATCH);
+    const placeholders = batch.map(() => '?').join(', ');
+
+    if (dir === 'out' || dir === 'both') {
+      const outRows = db
+        .prepare(`
+          SELECT src, dst, kind, weight
+          FROM edges
+          WHERE src IN (${placeholders})
+          ORDER BY weight DESC, kind ASC, dst ASC
+        `)
+        .all(...batch);
+      for (const r of outRows) {
+        collected.push({
+          src: r.src,
+          dst: r.dst,
+          kind: r.kind,
+          weight: Number(r.weight) || 0,
+          stepDir: 'out',
+          peer: r.dst,
+        });
+      }
+    }
+
+    if (dir === 'in' || dir === 'both') {
+      const inRows = db
+        .prepare(`
+          SELECT src, dst, kind, weight
+          FROM edges
+          WHERE dst IN (${placeholders})
+          ORDER BY weight DESC, kind ASC, src ASC
+        `)
+        .all(...batch);
+      for (const r of inRows) {
+        collected.push({
+          src: r.src,
+          dst: r.dst,
+          kind: r.kind,
+          weight: Number(r.weight) || 0,
+          stepDir: 'in',
+          peer: r.src,
+        });
+      }
+    }
+  }
+
+  collected.sort((a, b) => b.weight - a.weight || a.kind.localeCompare(b.kind) || a.peer.localeCompare(b.peer));
+  return collected;
+}
+
 /**
- * Explore 1..2 hop neighborhood around a doc ID or `file:<relPath>` using WITH RECURSIVE.
+ * Explore 1..10 hop neighborhood around a doc ID or `file:<relPath>` using batched BFS
+ * with a global visited-nodes Set (eliminating recursive path explosion & duplicate LIMIT exhaustion).
  */
 export function exploreGraph(db, { target, depth = 2, direction = 'both', limit = 60 } = {}) {
   const normalizedTarget = normalizeGraphTarget(target);
@@ -157,100 +217,46 @@ export function exploreGraph(db, { target, depth = 2, direction = 'both', limit 
     throw new Error('exploreGraph requires a non-empty target');
   }
 
-  const maxDepth = Math.max(1, Math.min(3, Number(depth) || 2));
+  const maxDepth = Math.max(1, Math.min(10, Number(depth) || 2));
   const dir = direction === 'in' || direction === 'out' ? direction : 'both';
-  const maxRows = Math.max(1, Math.min(500, Number(limit) || 60));
+  const maxEdges = Math.max(1, Math.min(500, Number(limit) || 60));
 
-  // SQLite WITH RECURSIVE joins directly against edges.
-  let recursiveStepSql;
-  if (dir === 'out') {
-    recursiveStepSql = `
-      SELECT
-        e.dst AS node,
-        t.hop + 1 AS hop,
-        t.visited || e.dst || '|' AS visited,
-        e.src AS edge_src,
-        e.dst AS edge_dst,
-        e.kind AS edge_kind,
-        e.weight AS edge_weight,
-        'out' AS step_dir
-      FROM traversal t
-      JOIN edges e ON e.src = t.node
-      WHERE t.hop < ?
-        AND instr(t.visited, '|' || e.dst || '|') = 0
-    `;
-  } else if (dir === 'in') {
-    recursiveStepSql = `
-      SELECT
-        e.src AS node,
-        t.hop + 1 AS hop,
-        t.visited || e.src || '|' AS visited,
-        e.src AS edge_src,
-        e.dst AS edge_dst,
-        e.kind AS edge_kind,
-        e.weight AS edge_weight,
-        'in' AS step_dir
-      FROM traversal t
-      JOIN edges e ON e.dst = t.node
-      WHERE t.hop < ?
-        AND instr(t.visited, '|' || e.src || '|') = 0
-    `;
-  } else {
-    recursiveStepSql = `
-      SELECT
-        CASE WHEN e.src = t.node THEN e.dst ELSE e.src END AS node,
-        t.hop + 1 AS hop,
-        t.visited || (CASE WHEN e.src = t.node THEN e.dst ELSE e.src END) || '|' AS visited,
-        e.src AS edge_src,
-        e.dst AS edge_dst,
-        e.kind AS edge_kind,
-        e.weight AS edge_weight,
-        CASE WHEN e.src = t.node THEN 'out' ELSE 'in' END AS step_dir
-      FROM traversal t
-      JOIN edges e ON (e.src = t.node OR e.dst = t.node)
-      WHERE t.hop < ?
-        AND instr(t.visited, '|' || (CASE WHEN e.src = t.node THEN e.dst ELSE e.src END) || '|') = 0
-    `;
-  }
-  const sql = `
-    WITH RECURSIVE traversal(node, hop, visited, edge_src, edge_dst, edge_kind, edge_weight, step_dir) AS (
-      SELECT ?, 0, '|' || ? || '|', NULL, NULL, NULL, NULL, NULL
-      UNION ALL
-      ${recursiveStepSql}
-    )
-    SELECT node, hop, edge_src, edge_dst, edge_kind, edge_weight, step_dir
-    FROM traversal
-    WHERE hop > 0
-    ORDER BY hop ASC, edge_weight DESC, edge_kind ASC
-    LIMIT ?
-  `;
+  const visitedNodes = new Map(); // nodeId -> minimum hop
+  visitedNodes.set(normalizedTarget, 0);
 
-  const rows = db.prepare(sql).all(normalizedTarget, normalizedTarget, maxDepth, maxRows);
+  const edgeMap = new Map(); // `${src}\0${dst}\0${kind}` -> edge
+  let frontier = [normalizedTarget];
 
-  const nodeHops = new Map();
-  nodeHops.set(normalizedTarget, 0);
+  for (let hop = 1; hop <= maxDepth && frontier.length > 0 && edgeMap.size < maxEdges; hop++) {
+    const hopEdges = queryFrontierEdges(db, frontier, dir);
+    const nextFrontierSet = new Set();
 
-  const edgeMap = new Map();
-  for (const row of rows) {
-    const prevHop = nodeHops.get(row.node);
-    if (prevHop === undefined || row.hop < prevHop) {
-      nodeHops.set(row.node, row.hop);
+    for (const e of hopEdges) {
+      if (edgeMap.size >= maxEdges) break;
+
+      const edgeKey = `${e.src}\0${e.dst}\0${e.kind}`;
+      if (!edgeMap.has(edgeKey)) {
+        edgeMap.set(edgeKey, {
+          src: e.src,
+          dst: e.dst,
+          kind: e.kind,
+          weight: e.weight,
+          hop,
+          direction: e.stepDir,
+        });
+      }
+
+      if (!visitedNodes.has(e.peer)) {
+        visitedNodes.set(e.peer, hop);
+        nextFrontierSet.add(e.peer);
+      }
     }
-    const edgeKey = `${row.edge_src}|${row.edge_dst}|${row.edge_kind}`;
-    if (!edgeMap.has(edgeKey)) {
-      edgeMap.set(edgeKey, {
-        src: row.edge_src,
-        dst: row.edge_dst,
-        kind: row.edge_kind,
-        weight: row.edge_weight,
-        hop: row.hop,
-        direction: row.step_dir,
-      });
-    }
+
+    frontier = [...nextFrontierSet];
   }
 
-  const hydrated = hydrateNodes(db, [...nodeHops.keys()]);
-  const nodes = [...nodeHops.entries()]
+  const hydrated = hydrateNodes(db, [...visitedNodes.keys()]);
+  const nodes = [...visitedNodes.entries()]
     .map(([id, hop]) => ({
       ...(hydrated.get(id) || { id }),
       hop,

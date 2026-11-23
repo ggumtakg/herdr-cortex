@@ -10,8 +10,16 @@ const BUSY_STATES = new Set([
   'busy', 'running', 'working', 'thinking', 'active', 'streaming', 'executing',
 ]);
 
+const BLOCKED_STATES = new Set([
+  'blocked', 'waiting_permission', 'permission', 'stuck', 'approval',
+]);
+
+const ERROR_STATES = new Set([
+  'error', 'errored', 'failed', 'crashed',
+]);
+
 const IDLE_STATES = new Set([
-  'idle', 'waiting', 'ready', 'input', 'prompt', 'paused',
+  'idle', 'waiting', 'ready', 'input', 'prompt', 'paused', 'done',
 ]);
 
 export const MAX_WAKE_TRIGGER_CHARS = 240;
@@ -43,6 +51,8 @@ export function detectTerminalActivity(terminal) {
       state: 'unknown',
       live: false,
       busy: false,
+      blocked: false,
+      error: false,
       idle: false,
       agentName: '',
       isBareShell: false,
@@ -62,7 +72,7 @@ export function detectTerminalActivity(terminal) {
   ).trim();
   const isBareShell = agentName ? BARE_SHELLS.has(agentName.toLowerCase()) : false;
 
-  const cwd = String(terminal.cwd || terminal.foreground?.cwd || '').trim();
+  const cwd = String(terminal.foreground?.cwd || terminal.cwd || '').trim();
   const where = String(terminal.labels?.where || terminal.where || '').trim();
 
   const candidateStatuses = [
@@ -77,27 +87,40 @@ export function detectTerminalActivity(terminal) {
     .map((v) => v.trim().toLowerCase());
 
   let busy = false;
+  let blocked = false;
+  let error = false;
   let explicitIdle = false;
+
+  if (terminal.error === true || terminal.foreground?.error === true || candidateStatuses.some((s) => ERROR_STATES.has(s))) {
+    error = true;
+  }
+  if (terminal.blocked === true || terminal.foreground?.blocked === true || candidateStatuses.some((s) => BLOCKED_STATES.has(s))) {
+    blocked = true;
+  }
 
   if (terminal.busy === true || terminal.foreground?.busy === true) {
     busy = true;
-  } else if (terminal.idle === true || terminal.foreground?.idle === true) {
-    explicitIdle = true;
   } else if (terminal.idle === false || terminal.foreground?.idle === false) {
     busy = true;
   } else if (candidateStatuses.some((s) => BUSY_STATES.has(s))) {
     busy = true;
-  } else if (candidateStatuses.some((s) => IDLE_STATES.has(s))) {
+  } else if (
+    terminal.idle === true
+    || terminal.foreground?.idle === true
+    || candidateStatuses.some((s) => IDLE_STATES.has(s))
+  ) {
     explicitIdle = true;
   }
 
-  const idle = live && !busy && (explicitIdle || !busy);
+  const idle = live && !busy && !blocked && !error && !isBareShell && explicitIdle;
 
   return {
     terminalId,
     state: stateRaw || (live ? 'live' : 'unknown'),
     live,
     busy: live && busy,
+    blocked: live && blocked,
+    error: live && error,
     idle,
     agentName,
     isBareShell,
@@ -160,6 +183,13 @@ export function createHcClient({
     if (!res.ok) return res;
     try {
       const parsed = JSON.parse(res.stdout.trim() || '{}');
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.error) {
+        return {
+          ok: false,
+          code: 'HC_API_ERROR',
+          error: typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error),
+        };
+      }
       const rawList = Array.isArray(parsed)
         ? parsed
         : Array.isArray(parsed?.terminals)
@@ -185,6 +215,13 @@ export function createHcClient({
     if (!res.ok) return res;
     try {
       const parsed = JSON.parse(res.stdout.trim() || '{}');
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.error) {
+        return {
+          ok: false,
+          code: 'HC_API_ERROR',
+          error: typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error),
+        };
+      }
       const terminal = parsed?.terminal && typeof parsed.terminal === 'object'
         ? parsed.terminal
         : parsed;
@@ -202,7 +239,7 @@ export function createHcClient({
     }
   }
 
-  function sendTrigger(terminalId, text) {
+  function sendTrigger(terminalId, text, { ifIdle = false } = {}) {
     const cleanId = validateTerminalId(terminalId);
     const singleLine = sanitizeSingleLineTrigger(text);
     if (!singleLine) {
@@ -212,7 +249,15 @@ export function createHcClient({
         error: 'Wake trigger text must be non-empty after single-line sanitization.',
       };
     }
-    const res = runHc(['send', cleanId, singleLine]);
+    let res;
+    if (ifIdle) {
+      res = runHc(['send', '--if', 'idle', cleanId, singleLine]);
+      if (!res.ok && /unknown flag|unrecognized|invalid option|unexpected argument/i.test(String(res.error || ''))) {
+        res = runHc(['send', cleanId, singleLine]);
+      }
+    } else {
+      res = runHc(['send', cleanId, singleLine]);
+    }
     if (!res.ok) return res;
     return {
       ok: true,

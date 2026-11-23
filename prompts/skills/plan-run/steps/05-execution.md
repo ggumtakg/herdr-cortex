@@ -20,13 +20,13 @@
 
 ## Output (`memory_save` 기준선 계약)
 
-HEAD가 실행 결과 기준선 `RESULT`를 저장한다.
+HEAD가 실행 결과 기준선 `C{k}-R{k}`를 저장한다.
 
 - `memory_save`:
-  - `type: "baseline"`, `session: "<세션명>"`, `branch: "Rn"`
+  - `type: "baseline"`, `session: "<세션명>"`, `branch: "C{k}-R{k}"` (예: `C1-R1`, `C2-R2`)
   - `derived_from: ["<PN_ID>"]`
-  - `supersedes: "<이전_RESULT_ID>"` (`LOCAL_CORRECTION` 재실행 시 지정)
-  - `files`: 실제 생성·수정된 상대 경로 목록
+  - `supersedes: "<이전_RESULT_ID>"` (`LOCAL_CORRECTION` 재실행 시 지정하고 요약에 `attempt: N/2` 명시)
+  - `files`: 실제 생성·수정된 프로젝트 상대 경로 목록
   - `title`, `summary`, `content`(변경 요약, 실제 실행 명령 및 관측 결과, 잔여 제약·예외)
 
 ## Next Step (다음 단계)

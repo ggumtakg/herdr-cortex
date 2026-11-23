@@ -18,7 +18,7 @@ function finish() {
 }
 
 try {
-  const raw = fs.readFileSync(0, 'utf8');
+  const raw = fs.readFileSync(0, 'utf8').replace(/^\uFEFF/, '');
   let payload = {};
   if (raw && raw.trim().length > 0) {
     payload = JSON.parse(raw);

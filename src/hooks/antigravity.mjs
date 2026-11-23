@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import {
   REPO_ROOT,
   assertInsideDir,
-  atomicWriteText,
+  atomicWriteJson,
   getProjectMemoryDir,
   getTierPaths,
   isProjectEnabled,
@@ -21,22 +21,26 @@ import {
   recordSession,
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
-import { drainInbox, formatInboxForHook } from '../relay/inbox.mjs';
-import { extractAntigravityState } from './recent-turns.mjs';
+import { drainInbox, formatInboxForHookDetailed } from '../relay/inbox.mjs';
+import { extractAntigravityState, resolveAntigravityTranscriptPath } from './recent-turns.mjs';
 import { COMPACT_POINTER_INSTRUCTION } from './claude.mjs';
 
 const SAFE_CONV_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+const ROLE_PROBE_BYTES = 16 * 1024;
+const SUBAGENT_MSG_RE = /\[Message\]\s+timestamp=[^\n]+\ssender=[0-9a-zA-Z_-]{8,}/i;
+const USER_STEP_FALLBACK_RE = /"(?:type|stepType|step_type|kind)"\s*:\s*"(?:[A-Z_]*_)?(?:USER_INPUT|USER_EXPLICIT)"/i;
 
-function wrapAntigravityInject(text) {
-  if (!text || !text.trim()) return {};
+function wrapAntigravityInjectSteps(sections) {
+  const clean = (Array.isArray(sections) ? sections : [])
+    .map((s) => (typeof s === 'string' ? s.trim() : ''))
+    .filter(Boolean);
+  if (clean.length === 0) return {};
   return {
-    injectSteps: [
-      {
-        systemMessage: {
-          systemMessage: text.trim(),
-        },
+    injectSteps: clean.map((text) => ({
+      systemMessage: {
+        systemMessage: text,
       },
-    ],
+    })),
   };
 }
 
@@ -51,10 +55,26 @@ function readHeadCore(promptsDir, config) {
   }
 }
 
+function trimLinesToBudget(text, budget) {
+  if (!text || budget <= 0) return '';
+  if (text.length <= budget) return text;
+  const lines = text.split('\n');
+  const out = [];
+  let len = 0;
+  for (const line of lines) {
+    const add = out.length === 0 ? line.length : 1 + line.length;
+    if (len + add > budget) break;
+    out.push(line);
+    len += add;
+  }
+  return out.join('\n').trimEnd();
+}
+
 function hasAnyOverviewItems(ov) {
   if (!ov) return false;
   return (
-    (ov.sessions?.length || 0) > 0
+    (ov.p0Baselines?.length || 0) > 0
+    || (ov.sessions?.length || 0) > 0
     || (ov.todos?.length || 0) > 0
     || (ov.decisions?.length || 0) > 0
     || (ov.recentWork?.length || 0) > 0
@@ -123,20 +143,122 @@ function loadOverviewSafely({ projectDir, globalDir, config }) {
   }
 }
 
-function resolveCheckpointFile(projectDir, convId) {
-  const cleanConv = String(convId || '').trim();
-  if (!SAFE_CONV_ID_RE.test(cleanConv) || cleanConv.includes('..')) return null;
-  const { checkpointsDir } = getTierPaths(getProjectMemoryDir(projectDir));
-  return assertInsideDir(checkpointsDir, `${cleanConv}.txt`);
+/**
+ * Inspect only the first 16KB of an Antigravity transcript to classify the conversation role:
+ * - 'root'     : contains a USER_INPUT / USER_EXPLICIT step
+ * - 'subagent' : contains `[Message] timestamp=... sender=<id>` and NO USER_INPUT/USER_EXPLICIT step
+ * - 'unknown'  : missing, empty, or not yet populated (e.g. brand-new SessionStart)
+ */
+export function detectAntigravityTranscriptRole(transcriptPath) {
+  if (!transcriptPath || typeof transcriptPath !== 'string') return 'unknown';
+  const resolved = resolveAntigravityTranscriptPath(transcriptPath)
+    || (fs.existsSync(transcriptPath) ? path.resolve(transcriptPath) : '');
+  if (!resolved) return 'unknown';
+
+  let stat;
+  try {
+    stat = fs.statSync(resolved);
+    if (!stat.isFile() || stat.size === 0) return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+
+  const readLen = Math.min(stat.size, ROLE_PROBE_BYTES);
+  let chunk = '';
+  let fd;
+  try {
+    fd = fs.openSync(resolved, 'r');
+    const buf = Buffer.allocUnsafe(readLen);
+    const bytesRead = fs.readSync(fd, buf, 0, readLen, 0);
+    chunk = buf.subarray(0, bytesRead).toString('utf8');
+  } catch {
+    return 'unknown';
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+
+  if (!chunk.trim()) return 'unknown';
+
+  let hasUserStep = false;
+  const lines = chunk.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object') {
+        const stepType = String(
+          parsed.type || parsed.stepType || parsed.step_type || parsed.kind || '',
+        ).toUpperCase();
+        if (
+          stepType === 'USER_INPUT'
+          || stepType === 'USER_EXPLICIT'
+          || stepType.endsWith('_USER_INPUT')
+          || stepType.endsWith('_USER_EXPLICIT')
+          || Boolean(parsed.userInput || parsed.user_input)
+        ) {
+          hasUserStep = true;
+          break;
+        }
+      }
+    } catch {
+      if (USER_STEP_FALLBACK_RE.test(trimmed)) {
+        hasUserStep = true;
+        break;
+      }
+    }
+  }
+
+  if (hasUserStep) return 'root';
+  if (SUBAGENT_MSG_RE.test(chunk)) return 'subagent';
+  return 'unknown';
 }
 
-function readCheckpointKey(filePath) {
+/**
+ * Resolve per-conversation state file path.
+ * Uses <project>/.memory/state/checkpoints/<convId>.json when <project>/.memory exists,
+ * otherwise stores under <globalDir>/state/checkpoints/<convId>.json so uninitialized
+ * projects NEVER get a .memory/ folder created automatically.
+ */
+function resolveCheckpointFile(projectDir, globalDir, convId) {
+  const cleanConv = String(convId || '').trim();
+  if (!SAFE_CONV_ID_RE.test(cleanConv) || cleanConv.includes('..')) return null;
+
+  const projectMemDir = getProjectMemoryDir(projectDir);
+  const tierRoot = fs.existsSync(projectMemDir) ? projectMemDir : globalDir;
+  const { checkpointsDir } = getTierPaths(tierRoot);
+  return {
+    jsonPath: assertInsideDir(checkpointsDir, `${cleanConv}.json`),
+    legacyTxtPath: assertInsideDir(checkpointsDir, `${cleanConv}.txt`),
+  };
+}
+
+function readCheckpointState(cpPaths) {
+  if (!cpPaths) return { started: false, checkpoint: '' };
   try {
-    if (!filePath || !fs.existsSync(filePath)) return '';
-    return fs.readFileSync(filePath, 'utf8').trim();
+    if (fs.existsSync(cpPaths.jsonPath)) {
+      const raw = fs.readFileSync(cpPaths.jsonPath, 'utf8').replace(/^\uFEFF/, '');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return {
+          started: Boolean(parsed.started),
+          checkpoint: typeof parsed.checkpoint === 'string' ? parsed.checkpoint : '',
+          transcriptPath: typeof parsed.transcriptPath === 'string' ? parsed.transcriptPath : '',
+          transcriptMtimeMs: typeof parsed.transcriptMtimeMs === 'number' ? parsed.transcriptMtimeMs : 0,
+          transcriptSize: typeof parsed.transcriptSize === 'number' ? parsed.transcriptSize : 0,
+        };
+      }
+    }
+    if (fs.existsSync(cpPaths.legacyTxtPath)) {
+      const legacyKey = fs.readFileSync(cpPaths.legacyTxtPath, 'utf8').trim();
+      return { started: true, checkpoint: legacyKey };
+    }
   } catch {
-    return '';
+    // ignore corrupt checkpoint state
   }
+  return { started: false, checkpoint: '' };
 }
 
 function extractTranscriptPath(payload) {
@@ -153,8 +275,17 @@ function extractTranscriptPath(payload) {
   return '';
 }
 
+function isExplicitRootPayload(payload, convId) {
+  if (!convId || !payload || typeof payload !== 'object') return false;
+  const rootId = payload.rootConversationId || payload.root_conversation_id;
+  return typeof rootId === 'string' && rootId.trim() !== '' && rootId.trim() === convId;
+}
+
 /**
  * Antigravity SessionStart handler.
+ * Defers startup injection and session recording to PreInvocation when transcript role
+ * is 'unknown' and rootConversationId is not explicitly equal to conversationId (real
+ * Antigravity CLI behavior where root vs subagent cannot yet be distinguished at SessionStart).
  */
 export function handleAntigravitySessionStart(
   payload = {},
@@ -169,6 +300,19 @@ export function handleAntigravitySessionStart(
     return {};
   }
 
+  const transcriptPath = extractTranscriptPath(payload);
+  const role = detectAntigravityTranscriptRole(transcriptPath);
+  if (role === 'subagent') {
+    return {};
+  }
+
+  const convId = extractSessionId(payload);
+  const explicitRoot = isExplicitRootPayload(payload, convId);
+  if (role === 'unknown' && !explicitRoot) {
+    // Defer to PreInvocation once step 0 reveals root vs subagent
+    return {};
+  }
+
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
@@ -187,51 +331,78 @@ export function handleAntigravitySessionStart(
     return {};
   }
 
-  const parts = [];
+  const sections = [];
   let used = 0;
+
+  const pushSection = (text) => {
+    const clean = typeof text === 'string' ? text.trim() : '';
+    if (!clean) return;
+    if (used + clean.length <= budget) {
+      sections.push(clean);
+      used += clean.length;
+    }
+  };
 
   const headCore = readHeadCore(promptsDir, config);
   if (headCore) {
-    parts.push(headCore);
-    used += headCore.length;
+    pushSection(trimLinesToBudget(headCore, budget - used));
   }
 
   const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
   if (overview) {
-    const overviewBudget = Math.max(256, budget - used - (parts.length > 0 ? 2 : 0));
-    const fitted = fitOverviewToBudget(overview, overviewBudget);
-    if (fitted.text) {
-      parts.push(fitted.text);
-      used += (parts.length > 1 ? 2 : 0) + fitted.text.length;
-    }
-  }
-
-  if (isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
-    try {
-      const drained = drainInbox(projectDir, terminalId);
-      if (drained.messages.length > 0) {
-        const inboxText = formatInboxForHook(drained.messages, { maxChars: 2500 });
-        if (inboxText) {
-          parts.push(inboxText);
-          drained.ack();
-        }
+    const remaining = budget - used;
+    if (remaining >= 120) {
+      const fitted = fitOverviewToBudget(overview, remaining);
+      if (fitted.text) {
+        pushSection(fitted.text);
       }
-    } catch {
-      // ignore inbox errors in hook
     }
   }
 
-  return wrapAntigravityInject(parts.join('\n\n'));
+  // Budget-first inbox drain + partial ACK
+  if (isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
+    const remaining = budget - used;
+    if (remaining >= 120) {
+      try {
+        const drained = drainInbox(projectDir, terminalId);
+        if (drained.messages.length > 0) {
+          const detailed = formatInboxForHookDetailed(drained.messages, {
+            maxChars: Math.min(2500, remaining),
+          });
+          if (detailed.text) {
+            pushSection(detailed.text);
+          }
+          drained.ack(detailed.includedIds);
+        }
+      } catch {
+        // ignore inbox errors in hook
+      }
+    }
+  }
+
+  if (convId && sections.length > 0) {
+    const cpPaths = resolveCheckpointFile(projectDir, effectiveGlobalDir, convId);
+    if (cpPaths) {
+      const existing = readCheckpointState(cpPaths);
+      atomicWriteJson(cpPaths.jsonPath, {
+        ...existing,
+        started: true,
+      });
+    }
+  }
+
+  return wrapAntigravityInjectSteps(sections);
 }
 
 /**
  * Antigravity PreInvocation handler:
- *  1) Updates revive session if root conversation.
- *  2) If lastUserInput === '/compact', injects 1-line compact pointer.
- *  3) Detects new CHECKPOINT (DONE) in transcript_full.jsonl compared to
- *     .memory/state/checkpoints/<convId>.txt; on change, re-injects
- *     HEAD_CORE.md + fitted overview + last 5 turns once and persists new key.
- *  4) Drains relay inbox for HC_TERMINAL_ID.
+ *  1) Rejects subagents via payload fields OR 16KB transcript role probe (NEVER overwrites parent session!).
+ *  2) Records revive session ONLY when confirmed root conversation.
+ *  3) On first root PreInvocation (!state.started), injects HEAD_CORE + overview once.
+ *  4) If lastUserInput starts with '/compact', injects 1-line compact pointer.
+ *  5) Fast (mtime, size) check before reading transcript; on new CHECKPOINT (DONE),
+ *     re-injects HEAD_CORE + overview + last 5 turns once within combined hookBudget.
+ *  6) Budget-first relay inbox drain with partial ACK.
  */
 export function handleAntigravityPreInvocation(
   payload = {},
@@ -246,96 +417,194 @@ export function handleAntigravityPreInvocation(
     return {};
   }
 
+  const transcriptPath = extractTranscriptPath(payload);
+  const role = detectAntigravityTranscriptRole(transcriptPath);
+  if (role === 'subagent') {
+    return {};
+  }
+
+  const lastInput = String(payload.lastUserInput ?? payload.userInput ?? '').trim();
+  if (SUBAGENT_MSG_RE.test(lastInput)) {
+    return {};
+  }
+
+  const convId = extractSessionId(payload);
+  const explicitRoot = isExplicitRootPayload(payload, convId);
+  const isConfirmedRoot =
+    role === 'root'
+    || explicitRoot
+    || (role === 'unknown' && lastInput.length > 0 && !SUBAGENT_MSG_RE.test(lastInput));
+
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   const budget = Math.max(256, Number(config.hookBudget) || 9000);
 
-  recordSession({
-    terminalId,
-    agent: 'antigravity',
-    payload,
-    cwd: projectDir,
-    globalDir: effectiveGlobalDir,
-    legacyHome,
-  });
+  if (isConfirmedRoot) {
+    recordSession({
+      terminalId,
+      agent: 'antigravity',
+      payload,
+      cwd: projectDir,
+      globalDir: effectiveGlobalDir,
+      legacyHome,
+    });
+  }
 
   if (!isProjectEnabled(projectDir, config)) {
     return {};
   }
 
-  const parts = [];
-
-  // 1. Detect /compact command (with or without trailing arguments)
-  const lastInput = String(payload.lastUserInput ?? payload.userInput ?? '').trim();
-  if (/^\/compact(?:\s|$)/i.test(lastInput)) {
-    parts.push(COMPACT_POINTER_INSTRUCTION);
+  if (!isConfirmedRoot) {
+    return {};
   }
 
-  // 2. Detect new CHECKPOINT (DONE) in transcript_full.jsonl
-  const transcriptPath = extractTranscriptPath(payload);
-  const convId = extractSessionId(payload);
-  if (transcriptPath && convId) {
-    const state = extractAntigravityState(transcriptPath, {
-      maxTurns: 5,
-      maxChars: Math.min(4500, Math.max(500, Math.floor(budget * 0.5))),
-    });
+  const cpPaths = convId ? resolveCheckpointFile(projectDir, effectiveGlobalDir, convId) : null;
+  const cpState = readCheckpointState(cpPaths);
+  let stateDirty = false;
 
-    if (state.latestCheckpoint?.key) {
-      const cpFile = resolveCheckpointFile(projectDir, convId);
-      const prevKey = readCheckpointKey(cpFile);
-      if (cpFile && prevKey !== state.latestCheckpoint.key) {
-        const restoreParts = [];
-        let restoreUsed = 0;
+  const sections = [];
+  let used = 0;
 
-        const headCore = readHeadCore(promptsDir, config);
-        if (headCore) {
-          restoreParts.push(headCore);
-          restoreUsed += headCore.length;
+  const pushSection = (text) => {
+    const clean = typeof text === 'string' ? text.trim() : '';
+    if (!clean) return false;
+    if (used + clean.length <= budget) {
+      sections.push(clean);
+      used += clean.length;
+      return true;
+    }
+    return false;
+  };
+
+  // 1. Detect /compact command (with or without trailing arguments)
+  if (/^\/compact(?:\s|$)/i.test(lastInput)) {
+    pushSection(COMPACT_POINTER_INSTRUCTION);
+  }
+
+  // 2. First root PreInvocation startup injection (deferred from SessionStart)
+  let injectedStartupThisTurn = false;
+  if (!cpState.started) {
+    const headCore = readHeadCore(promptsDir, config);
+    if (headCore) {
+      pushSection(trimLinesToBudget(headCore, budget - used));
+    }
+    const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
+    if (overview) {
+      const remaining = budget - used;
+      if (remaining >= 120) {
+        const fitted = fitOverviewToBudget(overview, remaining);
+        if (fitted.text) {
+          pushSection(fitted.text);
         }
+      }
+    }
+    cpState.started = true;
+    stateDirty = true;
+    injectedStartupThisTurn = true;
+  }
 
-        const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
-        if (overview) {
-          const turnsReserve = state.text ? state.text.length + 2 : 0;
-          const ovBudget = Math.max(256, budget - restoreUsed - turnsReserve - 4);
-          const fitted = fitOverviewToBudget(overview, ovBudget);
-          if (fitted.text) {
-            restoreParts.push(fitted.text);
+  // 3. Fast (mtime, size) transcript check + CHECKPOINT (DONE) restore
+  if (transcriptPath && convId) {
+    const actualTranscript = resolveAntigravityTranscriptPath(transcriptPath);
+    let stat = null;
+    if (actualTranscript) {
+      try {
+        stat = fs.statSync(actualTranscript);
+      } catch {
+        stat = null;
+      }
+    }
+
+    const transcriptChanged = Boolean(
+      stat
+      && stat.isFile()
+      && stat.size > 0
+      && (
+        cpState.transcriptPath !== actualTranscript
+        || cpState.transcriptMtimeMs !== stat.mtimeMs
+        || cpState.transcriptSize !== stat.size
+      ),
+    );
+
+    if (transcriptChanged) {
+      const state = extractAntigravityState(actualTranscript, {
+        maxTurns: 5,
+        maxChars: Math.min(4500, Math.max(300, Math.floor(budget * 0.5))),
+      });
+
+      cpState.transcriptPath = actualTranscript;
+      cpState.transcriptMtimeMs = stat.mtimeMs;
+      cpState.transcriptSize = stat.size;
+      stateDirty = true;
+
+      if (state.latestCheckpoint?.key && state.latestCheckpoint.key !== cpState.checkpoint) {
+        if (!injectedStartupThisTurn) {
+          const headCore = readHeadCore(promptsDir, config);
+          if (headCore) {
+            pushSection(trimLinesToBudget(headCore, budget - used));
+          }
+
+          const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
+          if (overview) {
+            const turnsReserve = state.text ? Math.min(state.text.length, Math.floor((budget - used) * 0.5)) : 0;
+            const ovBudget = budget - used - turnsReserve;
+            if (ovBudget >= 120) {
+              const fitted = fitOverviewToBudget(overview, ovBudget);
+              if (fitted.text) {
+                pushSection(fitted.text);
+              }
+            }
           }
         }
 
         if (state.text) {
-          restoreParts.push(state.text);
+          const remaining = budget - used;
+          if (state.text.length <= remaining) {
+            pushSection(state.text);
+          } else if (remaining >= 160) {
+            const refit = extractAntigravityState(actualTranscript, {
+              maxTurns: 5,
+              maxChars: remaining,
+            });
+            if (refit.text) {
+              pushSection(refit.text);
+            }
+          }
         }
 
-        if (restoreParts.length > 0) {
-          parts.push(restoreParts.join('\n\n'));
-        }
-
-        if (state.latestCheckpoint.key) {
-          atomicWriteText(cpFile, `${state.latestCheckpoint.key}\n`);
-        }
+        cpState.checkpoint = state.latestCheckpoint.key;
+        stateDirty = true;
       }
     }
   }
 
-  // 3. Drain relay inbox
+  if (cpPaths && stateDirty) {
+    atomicWriteJson(cpPaths.jsonPath, cpState);
+  }
+
+  // 4. Budget-first relay inbox drain + partial ACK
   if (isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
-    try {
-      const drained = drainInbox(projectDir, terminalId);
-      if (drained.messages.length > 0) {
-        const inboxText = formatInboxForHook(drained.messages, { maxChars: 2500 });
-        if (inboxText) {
-          parts.push(inboxText);
-          drained.ack();
+    const remaining = budget - used;
+    if (remaining >= 120) {
+      try {
+        const drained = drainInbox(projectDir, terminalId);
+        if (drained.messages.length > 0) {
+          const detailed = formatInboxForHookDetailed(drained.messages, {
+            maxChars: Math.min(2500, remaining),
+          });
+          if (detailed.text) {
+            pushSection(detailed.text);
+          }
+          drained.ack(detailed.includedIds);
         }
+      } catch {
+        // ignore inbox errors in hook
       }
-    } catch {
-      // ignore inbox errors in hook
     }
   }
 
-  return wrapAntigravityInject(parts.join('\n\n'));
+  return wrapAntigravityInjectSteps(sections);
 }
 
 export function runAntigravityHook(eventName, payload = {}, options = {}) {
@@ -369,7 +638,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   let output = {};
   try {
     const { event } = parseCliArgs(process.argv.slice(2));
-    const raw = fs.readFileSync(0, 'utf8');
+    const raw = fs.readFileSync(0, 'utf8').replace(/^\uFEFF/, '');
     let payload = {};
     if (raw && raw.trim()) {
       payload = JSON.parse(raw);

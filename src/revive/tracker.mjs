@@ -9,13 +9,28 @@ import {
 } from '../core/config.mjs';
 
 const TERMINAL_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+const SESSION_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
 const RESERVED_WIN_NAMES = new Set([
   'con', 'prn', 'aux', 'nul',
   'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
   'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9',
 ]);
 
+const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(ms) {
+  Atomics.wait(SLEEP_BUF, 0, 0, ms);
+}
+
 export const MAX_SESSION_HISTORY = 5;
+
+export function isValidSessionId(id) {
+  if (typeof id !== 'string') return false;
+  const trimmed = id.trim();
+  if (!SESSION_ID_RE.test(trimmed)) return false;
+  if (trimmed.includes('..')) return false;
+  return true;
+}
 
 export function isValidTerminalId(id) {
   if (typeof id !== 'string') return false;
@@ -68,6 +83,13 @@ export function isSubagentPayload(payload) {
   if (agentId && String(agentId).trim() !== '') return true;
   if (payload.is_subagent === true || payload.isSubagent === true) return true;
 
+  const parentId =
+    payload.parentConversationId
+    || payload.parent_conversation_id
+    || payload.parentSessionId
+    || payload.parent_session_id;
+  if (parentId && String(parentId).trim() !== '') return true;
+
   const convId = payload.conversationId || payload.conversation_id;
   const rootConvId = payload.rootConversationId || payload.root_conversation_id;
   if (convId && rootConvId && String(convId).trim() !== String(rootConvId).trim()) {
@@ -85,7 +107,9 @@ export function extractSessionId(payload) {
     || payload.session_id
     || payload.sessionId
     || '';
-  return typeof candidate === 'string' ? candidate.trim() : '';
+  if (typeof candidate !== 'string') return '';
+  const trimmed = candidate.trim();
+  return isValidSessionId(trimmed) ? trimmed : '';
 }
 
 export function extractCwd(payload, fallbackCwd = process.cwd()) {
@@ -104,14 +128,23 @@ export function extractCwd(payload, fallbackCwd = process.cwd()) {
 }
 
 function readJsonFileSafe(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return null;
-    const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
+  const maxRetries = 6;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (!fs.existsSync(filePath)) return null;
+      const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch (err) {
+      const retryable = err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES');
+      if (retryable && attempt < maxRetries) {
+        sleepSync(15 * (attempt + 1));
+        continue;
+      }
+      return null;
+    }
   }
+  return null;
 }
 
 /**
@@ -227,13 +260,21 @@ export function recordSession({
     return { recorded: false, reason: 'invalid_terminal_id' };
   }
 
-  const sessionId = typeof explicitSessionId === 'string' && explicitSessionId.trim()
+  const rawSessionId = typeof explicitSessionId === 'string' && explicitSessionId.trim()
     ? explicitSessionId.trim()
-    : extractSessionId(payload);
+    : (
+        typeof (payload.conversationId || payload.conversation_id || payload.session_id || payload.sessionId) === 'string'
+          ? String(payload.conversationId || payload.conversation_id || payload.session_id || payload.sessionId).trim()
+          : ''
+      );
 
-  if (!sessionId) {
+  if (!rawSessionId) {
     return { recorded: false, reason: 'missing_session_id' };
   }
+  if (!isValidSessionId(rawSessionId)) {
+    return { recorded: false, reason: 'invalid_session_id' };
+  }
+  const sessionId = rawSessionId;
 
   const normalizedAgent = String(agent || '').trim().toLowerCase() === 'antigravity'
     ? 'antigravity'
