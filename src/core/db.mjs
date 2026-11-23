@@ -22,6 +22,11 @@ try {
 
 const vecEnabledDbs = new WeakSet();
 
+// A connection without the vector extension (hook processes) cannot touch doc_chunks_vec. When it removes a
+// document it leaves this marker in index_meta, and the next vector-enabled connection deletes the leftovers.
+const VEC_CLEANUP_KEY = 'vecCleanupPending';
+const orphanSweptDbPaths = new Set(); // index files this process has already swept once
+
 export const SCHEMA_VERSION = 2;
 
 const CORE_SCHEMA_SQL = `
@@ -856,7 +861,12 @@ export function indexSingleFile(db, tierDir, absFilePath) {
   if (prevByPath && prevByPath.id !== record.doc.id) {
     stmts.deleteDocById.run(prevByPath.id);
     stmts.deleteFtsById.run(prevByPath.id);
-    if (stmts.deleteVecById) stmts.deleteVecById.run(prevByPath.id);
+    if (stmts.deleteVecById) {
+      stmts.deleteVecById.run(prevByPath.id);
+    } else if (hasVectorTable(db)) {
+      // No vector extension on this connection: leave the cleanup to one that has it.
+      db.prepare('INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)').run(VEC_CLEANUP_KEY, '1');
+    }
     stmts.deleteAllDocEdges.run(prevByPath.id, prevByPath.id);
   }
 
@@ -906,9 +916,51 @@ export function getDuplicateDocIds(tierDir) {
 }
 
 /**
+ * Delete vector rows whose document no longer exists. Returns the number of rows removed.
+ * Must run on a vector-enabled connection, inside the caller's transaction.
+ */
+function deleteOrphanVectors(db) {
+  try {
+    const res = db.prepare('DELETE FROM doc_chunks_vec WHERE doc_id NOT IN (SELECT id FROM docs)').run();
+    return Number(res.changes) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Orphan-vector upkeep for one sync (see VEC_CLEANUP_KEY). `removedDocs` says whether this sync deleted
+ * document rows whose vectors it could not delete itself.
+ */
+function reconcileOrphanVectors(db, { removedDocs, dbPath }) {
+  if (!hasVectorTable(db)) return 0;
+
+  if (!vecEnabledDbs.has(db)) {
+    if (removedDocs) {
+      db.prepare('INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)').run(VEC_CLEANUP_KEY, '1');
+    }
+    return 0;
+  }
+
+  // The scan reads the whole vector table, so it runs only when another connection asked for it,
+  // and once per process and index file to catch leftovers from before the marker existed.
+  const flagged = db.prepare('SELECT value FROM index_meta WHERE key = ?').get(VEC_CLEANUP_KEY)?.value === '1';
+  if (!flagged && orphanSweptDbPaths.has(dbPath)) return 0;
+
+  const removed = deleteOrphanVectors(db);
+  orphanSweptDbPaths.add(dbPath);
+  if (flagged) {
+    db.prepare('DELETE FROM index_meta WHERE key = ?').run(VEC_CLEANUP_KEY);
+  }
+  return removed;
+}
+
+/**
  * Incrementally sync all Markdown files in <tierDir>/docs/ into SQLite.
  * Reads existing state INSIDE a `BEGIN IMMEDIATE` transaction to prevent TOCTOU races.
  * Checks (mtime_ms, size) first, then SHA-256 hash; detects duplicate IDs; removes deleted files.
+ * On a vector-enabled connection it also removes vector rows left behind by connections that could not;
+ * the result then carries `orphanVectorsRemoved` (the key is absent when nothing was removed).
  */
 export function syncFromDisk(db, tierDir) {
   const paths = ensureTierDirs(tierDir);
@@ -917,6 +969,7 @@ export function syncFromDisk(db, tierDir) {
   let addedOrUpdated = 0;
   let statUpdated = 0;
   let deleted = 0;
+  let orphanVectorsRemoved = 0;
   const duplicates = [];
 
   withTransaction(db, () => {
@@ -1016,10 +1069,12 @@ export function syncFromDisk(db, tierDir) {
     }
 
     if (toUpsert.length === 0 && toStatOnly.length === 0 && toDelete.length === 0) {
+      orphanVectorsRemoved = reconcileOrphanVectors(db, { removedDocs: false, dbPath: paths.dbPath });
       return;
     }
 
     const stmts = upsertDocStatements(db);
+    let removedDocs = false;
 
     for (const item of toStatOnly) {
       stmts.updateStatOnly.run(item.mtime_ms, item.size, item.id);
@@ -1029,14 +1084,16 @@ export function syncFromDisk(db, tierDir) {
       // If the same doc ID moved to a new path in `toUpsert`, delete old row cleanly without losing vector check via prevById
       stmts.deleteDocById.run(row.id);
       stmts.deleteFtsById.run(row.id);
-      if (!seenIds.has(row.id) && stmts.deleteVecById) {
-        stmts.deleteVecById.run(row.id);
+      if (!seenIds.has(row.id)) {
+        removedDocs = true;
+        if (stmts.deleteVecById) stmts.deleteVecById.run(row.id);
       }
       stmts.deleteAllDocEdges.run(row.id, row.id);
     }
 
     for (const { record, prevByPath, prevById } of toUpsert) {
       if (prevByPath && prevByPath.id !== record.doc.id) {
+        removedDocs = true;
         stmts.deleteDocById.run(prevByPath.id);
         stmts.deleteFtsById.run(prevByPath.id);
         if (stmts.deleteVecById) stmts.deleteVecById.run(prevByPath.id);
@@ -1051,6 +1108,8 @@ export function syncFromDisk(db, tierDir) {
 
     rebuildSessionNextEdges(db, affectedSessions);
 
+    orphanVectorsRemoved = reconcileOrphanVectors(db, { removedDocs, dbPath: paths.dbPath });
+
     addedOrUpdated = toUpsert.length;
     statUpdated = toStatOnly.length;
     deleted = toDelete.filter((r) => !seenIds.has(r.id)).length;
@@ -1062,5 +1121,6 @@ export function syncFromDisk(db, tierDir) {
     addedOrUpdated,
     statUpdated,
     deleted,
+    ...(orphanVectorsRemoved > 0 ? { orphanVectorsRemoved } : {}),
   };
 }

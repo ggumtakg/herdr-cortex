@@ -16,17 +16,32 @@ export const DEFAULT_CONFIG = Object.freeze({
   headCoreEnabled: true,
   hookBudget: 9000,
   embedding: {
-    provider: 'auto', // auto | gemini | openai | ollama | onnx | none
-    model: '',
-    dimensions: 0,
-    baseUrl: '',
-    apiKeyEnv: '',
-    onnxEnabled: false,
+    // none | auto | gemini | openai | ollama | onnx. Nothing is embedded (and nothing leaves this machine)
+    // until the user picks a provider; "auto" is an explicit choice, not the default.
+    provider: 'none',
     chunkMaxChars: 800,
     chunkOverlap: 100,
-    timeoutMs: 15000,
+    timeoutMs: 15000, // per request while embedding documents
+    queryTimeoutMs: 3000, // per search query embedding (single attempt, no retries)
+    circuitBreakMs: 300000, // pause after a service-side failure before embeddings are attempted again
+    // Each provider reads only its own block plus the shared keys above.
+    gemini: { model: '', dimensions: 0, apiKeyEnv: '', apiKey: '', baseUrl: '' },
+    openai: { model: '', dimensions: 0, apiKeyEnv: '', apiKey: '', baseUrl: '' },
+    ollama: { baseUrl: '', model: '', dimensions: 0 },
+    onnx: { enabled: false, model: '' },
   },
+  // Per-project settings owned by the user, keyed by absolute project path:
+  //   { "C:\\work\\proj-a": { "embedding": { "provider": "ollama", "ollama": { "model": "bge-m3" } } } }
+  projects: {},
 });
+
+export const EMBEDDING_PROVIDER_NAMES = Object.freeze(['gemini', 'openai', 'ollama', 'onnx']);
+
+/**
+ * Flat `embedding.*` keys of the previous config format. They are ignored wherever they appear;
+ * the settings now live in the per-provider blocks (`embedding.<provider>.*`).
+ */
+export const LEGACY_EMBEDDING_KEYS = Object.freeze(['baseUrl', 'model', 'dimensions', 'apiKey', 'apiKeyEnv', 'onnxEnabled']);
 
 const DOC_ID_RE = /^[a-zA-Z0-9가-힣._-]+$/;
 const RESERVED_WIN_NAMES = new Set([
@@ -137,22 +152,19 @@ function readJsonSafe(filePath, { warnOnError = false } = {}) {
   }
 }
 
-const ALLOWED_PROJECT_EMBEDDING_KEYS = [
-  'provider',
-  'model',
-  'dimensions',
-  'chunkMaxChars',
-  'chunkOverlap',
-  'timeoutMs',
-];
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
 
 /**
- * Whitelist only safe non-network, non-secret, non-global-scoping keys from project `.memory/config.json`.
- * Strips `embedding.baseUrl`, `embedding.apiKey`, `embedding.apiKeyEnv`, `embedding.onnxEnabled`,
- * `mode`, `enabledProjects`, `excludedProjects`, and `enabled: true` (only `enabled: false` is permitted).
+ * Keep only the keys a project's own `.memory/config.json` may set: `headCoreEnabled`, `hookBudget`,
+ * and `enabled: false`. That file lives inside the repository, so whoever authored the repository controls it;
+ * it must not be able to choose where documents are sent (`embedding`), which projects are enabled
+ * (`mode`, `enabledProjects`, `excludedProjects`, `projects`), or switch a project on (`enabled: true`).
+ * Per-project embedding settings belong in the user's global config under `projects["<project path>"]`.
  */
 export function sanitizeProjectConfig(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (!isPlainObject(raw)) return null;
   const safe = {};
 
   if (typeof raw.headCoreEnabled === 'boolean') {
@@ -165,51 +177,171 @@ export function sanitizeProjectConfig(raw) {
     safe.enabled = false;
   }
 
-  if (raw.embedding && typeof raw.embedding === 'object' && !Array.isArray(raw.embedding)) {
-    const safeEmb = {};
-    for (const key of ALLOWED_PROJECT_EMBEDDING_KEYS) {
-      if (Object.prototype.hasOwnProperty.call(raw.embedding, key) && raw.embedding[key] !== undefined) {
-        safeEmb[key] = raw.embedding[key];
-      }
-    }
-    if (Object.keys(safeEmb).length > 0) {
-      safe.embedding = safeEmb;
-    }
-  }
-
   return safe;
 }
 
+function mergeEmbedding(base, override) {
+  const from = isPlainObject(base) ? base : {};
+  const over = isPlainObject(override) ? override : {};
+  const out = { ...from, ...over };
+  // Provider blocks merge key by key, so an override of `ollama.model` keeps the inherited `ollama.baseUrl`.
+  for (const name of EMBEDDING_PROVIDER_NAMES) {
+    out[name] = {
+      ...(isPlainObject(from[name]) ? from[name] : {}),
+      ...(isPlainObject(over[name]) ? over[name] : {}),
+    };
+  }
+  return out;
+}
+
 function mergeConfig(base, override) {
-  if (!override || typeof override !== 'object') return base;
+  const over = isPlainObject(override) ? override : {};
   return {
     ...base,
-    ...override,
-    embedding: {
-      ...base.embedding,
-      ...(override.embedding && typeof override.embedding === 'object' ? override.embedding : {}),
-    },
+    ...over,
+    embedding: mergeEmbedding(base.embedding, over.embedding),
   };
 }
 
+const configProblems = new WeakMap(); // merged config object -> problems found while loading it
+const warnedConfigProblems = new Set();
+
+function warnConfigOnce(key, message) {
+  if (warnedConfigProblems.has(key)) return;
+  warnedConfigProblems.add(key);
+  console.error(`[herdr-cortex] Warning: ${message}`);
+}
+
 /**
- * Load merged config from defaults -> global config.json -> whitelisted project .memory/config.json.
+ * Configuration problems recorded by `loadConfig` for the config object it returned:
+ * [{ code, message, source, ... }] with code `legacy_embedding_keys` or `project_embedding_ignored`.
+ * Empty for objects that did not come from `loadConfig`.
+ */
+export function getConfigProblems(config) {
+  const found = config && typeof config === 'object' ? configProblems.get(config) : null;
+  return found ? found.map((item) => ({ ...item })) : [];
+}
+
+/**
+ * Names of old-format flat keys present in an `embedding` object (see `LEGACY_EMBEDDING_KEYS`).
+ */
+export function findLegacyEmbeddingKeys(embedding) {
+  if (!isPlainObject(embedding)) return [];
+  return LEGACY_EMBEDDING_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(embedding, key));
+}
+
+export function describeLegacyEmbeddingKeys(keys, location = 'embedding') {
+  const named = keys.map((key) => `${location}.${key}`).join(', ');
+  return `${named} ${keys.length === 1 ? 'is' : 'are'} from the old config format and ignored. `
+    + `Move provider settings into ${location}.<provider> `
+    + `(for example ${location}.ollama.baseUrl, ${location}.gemini.model, ${location}.openai.apiKeyEnv, ${location}.onnx.enabled).`;
+}
+
+// Returns a copy of `embedding` without the old flat keys and records a problem when any were present.
+function dropLegacyEmbeddingKeys(embedding, { source, location, problems }) {
+  if (!isPlainObject(embedding)) return undefined;
+  const legacyKeys = findLegacyEmbeddingKeys(embedding);
+  if (legacyKeys.length === 0) return embedding;
+
+  const clean = { ...embedding };
+  for (const key of legacyKeys) delete clean[key];
+
+  const message = `${describeLegacyEmbeddingKeys(legacyKeys, location)} (in "${source}")`;
+  problems.push({ code: 'legacy_embedding_keys', keys: legacyKeys, location, source, message });
+  warnConfigOnce(`legacy\0${source}\0${location}\0${legacyKeys.join(',')}`, message);
+  return clean;
+}
+
+function withCleanEmbedding(raw, context) {
+  if (!isPlainObject(raw) || raw.embedding === undefined) return raw;
+  const { embedding, ...rest } = raw;
+  const clean = dropLegacyEmbeddingKeys(embedding, context);
+  return clean === undefined ? rest : { ...rest, embedding: clean };
+}
+
+/**
+ * Canonical form of a project path for exact-match comparison: absolute, junctions/symlinks resolved,
+ * lower-cased on Windows. A path that does not exist yet is resolved through its deepest existing ancestor.
+ */
+export function projectPathKey(projectPath) {
+  const resolved = path.resolve(String(projectPath));
+  let real = resolved;
+  try {
+    real = fs.realpathSync.native(resolved);
+  } catch {
+    try {
+      real = resolveRealPathWithFallback(resolved);
+    } catch {
+      real = resolved;
+    }
+  }
+  return process.platform === 'win32' ? real.toLowerCase() : real;
+}
+
+function resolveProjectRoot(projectDir) {
+  const resolved = path.resolve(projectDir);
+  return path.basename(resolved) === '.memory' ? path.dirname(resolved) : resolved;
+}
+
+// Entries of the global `projects` map whose key is exactly this project root (never a parent or a folder name).
+function findProjectEntries(projects, projectRoot) {
+  if (!isPlainObject(projects)) return [];
+  const wanted = projectPathKey(projectRoot);
+  const matches = [];
+  for (const [key, entry] of Object.entries(projects)) {
+    if (typeof key !== 'string' || !path.isAbsolute(key.trim()) || !isPlainObject(entry)) continue;
+    if (projectPathKey(key.trim()) === wanted) matches.push({ key, entry });
+  }
+  return matches;
+}
+
+/**
+ * Load the merged config. Later sources override earlier ones:
+ *   1. `DEFAULT_CONFIG`
+ *   2. global `config.json`
+ *   3. `projects["<this project's path>"].embedding` of the global `config.json` (exact project root, real path)
+ *   4. the project's own `.memory/config.json`, reduced by `sanitizeProjectConfig`
+ *   5. `overrides` (programmatic, e.g. CLI flags)
+ * Old-format flat `embedding.*` keys and an `embedding` block in the project file are ignored; each is reported
+ * once per process on stderr and through `getConfigProblems(config)`.
  */
 export function loadConfig({ projectDir, globalDir, overrides } = {}) {
+  const problems = [];
   const gPaths = getTierPaths(getGlobalDir(globalDir));
-  let cfg = mergeConfig(DEFAULT_CONFIG, readJsonSafe(gPaths.configPath, { warnOnError: true }));
+  const globalRaw = readJsonSafe(gPaths.configPath, { warnOnError: true });
+  let cfg = mergeConfig(
+    DEFAULT_CONFIG,
+    withCleanEmbedding(globalRaw, { source: gPaths.configPath, location: 'embedding', problems }),
+  );
 
   if (projectDir) {
+    const projectRoot = resolveProjectRoot(projectDir);
+    for (const { key, entry } of findProjectEntries(globalRaw?.projects, projectRoot)) {
+      const embedding = dropLegacyEmbeddingKeys(entry.embedding, {
+        source: gPaths.configPath,
+        location: `projects[${JSON.stringify(key)}].embedding`,
+        problems,
+      });
+      if (embedding) cfg = mergeConfig(cfg, { embedding });
+    }
+
     const pPaths = getTierPaths(getProjectMemoryDir(projectDir));
     const projectRaw = readJsonSafe(pPaths.configPath);
-    const projectSafe = sanitizeProjectConfig(projectRaw);
-    cfg = mergeConfig(cfg, projectSafe);
+    if (isPlainObject(projectRaw) && projectRaw.embedding !== undefined) {
+      const message = `"embedding" in the project file "${pPaths.configPath}" is ignored: a repository cannot choose `
+        + 'where documents are sent. Put per-project embedding settings in the global config.json under '
+        + `projects[${JSON.stringify(projectRoot)}].embedding.`;
+      problems.push({ code: 'project_embedding_ignored', source: pPaths.configPath, message });
+      warnConfigOnce(`project-embedding\0${pPaths.configPath}`, message);
+    }
+    cfg = mergeConfig(cfg, sanitizeProjectConfig(projectRaw));
   }
 
   if (overrides) {
-    cfg = mergeConfig(cfg, overrides);
+    cfg = mergeConfig(cfg, withCleanEmbedding(overrides, { source: 'overrides', location: 'embedding', problems }));
   }
 
+  configProblems.set(cfg, problems);
   return cfg;
 }
 

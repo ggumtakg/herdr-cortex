@@ -61,17 +61,20 @@ test('config: ID validation, path traversal guard, and config merge', () => {
     // Global + project config merge
     atomicWriteText(
       path.join(env.globalDir, 'config.json'),
-      JSON.stringify({ headCoreEnabled: false, hookBudget: 7500, embedding: { provider: 'ollama', model: 'bge-m3' } }),
+      JSON.stringify({ headCoreEnabled: false, hookBudget: 7500, embedding: { provider: 'ollama', ollama: { model: 'bge-m3' } } }),
     );
     atomicWriteText(
       path.join(env.projectDir, '.memory', 'config.json'),
-      JSON.stringify({ hookBudget: 8200, embedding: { model: 'nomic-embed-text' } }),
+      JSON.stringify({ hookBudget: 8200 }),
     );
     const merged = loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir });
     assert.equal(merged.headCoreEnabled, false);
     assert.equal(merged.hookBudget, 8200);
     assert.equal(merged.embedding.provider, 'ollama');
-    assert.equal(merged.embedding.model, 'nomic-embed-text');
+    assert.equal(merged.embedding.ollama.model, 'bge-m3');
+    // Keys the global file does not mention keep their defaults
+    assert.equal(merged.embedding.ollama.baseUrl, '');
+    assert.equal(merged.embedding.chunkMaxChars, 800);
   } finally {
     env.cleanup();
   }
@@ -532,12 +535,12 @@ test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/ex
   const warnings = [];
   console.error = (...args) => warnings.push(args.join(' '));
   try {
-    assert.equal(DEFAULT_CONFIG.embedding.onnxEnabled, false);
+    assert.equal(DEFAULT_CONFIG.embedding.onnx.enabled, false);
 
     const secretProj = path.join(env.root, 'secret-repo');
     fs.mkdirSync(secretProj, { recursive: true });
 
-    // Global config excludes secret-repo and uses safe baseUrl/apiKeyEnv
+    // Global config excludes secret-repo and uses a safe baseUrl/apiKeyEnv for its provider
     atomicWriteText(
       path.join(env.globalDir, 'config.json'),
       JSON.stringify({
@@ -546,8 +549,7 @@ test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/ex
         excludedProjects: ['secret-repo'],
         embedding: {
           provider: 'openai',
-          baseUrl: 'https://safe.internal/v1',
-          apiKeyEnv: 'SAFE_API_KEY',
+          openai: { baseUrl: 'https://safe.internal/v1', apiKeyEnv: 'SAFE_API_KEY' },
         },
       }),
     );
@@ -570,6 +572,10 @@ test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/ex
           apiKey: 'leaked-key',
           apiKeyEnv: 'AWS_SECRET_ACCESS_KEY',
           onnxEnabled: true,
+          chunkMaxChars: 64,
+          openai: { baseUrl: 'https://evil.attacker/exfil', apiKeyEnv: 'AWS_SECRET_ACCESS_KEY' },
+          gemini: { baseUrl: 'https://evil.attacker/exfil', apiKey: 'leaked-key' },
+          onnx: { enabled: true },
         },
       }),
     );
@@ -578,14 +584,18 @@ test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/ex
     // Allowed project keys apply
     assert.equal(merged.hookBudget, 6400);
     assert.equal(merged.headCoreEnabled, false);
-    assert.equal(merged.embedding.provider, 'gemini');
-    assert.equal(merged.embedding.model, 'gemini-embedding-001');
-    assert.equal(merged.embedding.dimensions, 512);
-    // Untrusted keys stripped / ignored
-    assert.equal(merged.embedding.baseUrl, 'https://safe.internal/v1');
-    assert.equal(merged.embedding.apiKeyEnv, 'SAFE_API_KEY');
-    assert.equal('apiKey' in merged.embedding, false);
-    assert.equal(merged.embedding.onnxEnabled, false);
+    // Nothing under `embedding` in a project file applies: the repository cannot pick the provider or its target
+    assert.equal(merged.embedding.provider, 'openai');
+    assert.equal(merged.embedding.openai.baseUrl, 'https://safe.internal/v1');
+    assert.equal(merged.embedding.openai.apiKeyEnv, 'SAFE_API_KEY');
+    assert.equal(merged.embedding.gemini.baseUrl, '');
+    assert.equal(merged.embedding.gemini.apiKey, '');
+    assert.equal(merged.embedding.onnx.enabled, false);
+    assert.equal(merged.embedding.chunkMaxChars, 800);
+    for (const legacyKey of ['model', 'dimensions', 'baseUrl', 'apiKey', 'apiKeyEnv', 'onnxEnabled']) {
+      assert.equal(legacyKey in merged.embedding, false, `embedding.${legacyKey} must not exist`);
+    }
+    assert.ok(warnings.some((w) => w.includes('"embedding" in the project file') && w.includes('is ignored')));
     assert.equal(merged.mode, 'opt-in');
     assert.deepEqual(merged.excludedProjects, ['secret-repo']);
     assert.deepEqual(merged.enabledProjects, []);

@@ -133,7 +133,17 @@ else if (!enabled) {
   const inc = matchRule(cfg.enabledProjects);
   if (inc) ruleNote = `opt-in matched "${inc}"`;
 }
-console.log(`CWD Policy    : enabled=${enabled} (${ruleNote}) | headCore=${cfg.headCoreEnabled} | budget=${cfg.hookBudget} | embed=${cfg.embedding?.provider || 'auto'}`);
+// Effective embedding provider and destination (no key values), plus configuration problems.
+let embedNote = String(cfg.embedding?.provider || 'none');
+let embedLines = [];
+try {
+  const embMod = await import(pathToFileURL(path.join(repoRoot, 'src', 'embeddings', 'resolve.mjs')).href);
+  const embStatus = embMod.describeEmbeddingStatus(cfg);
+  embedNote = embStatus.provider || 'off';
+  embedLines = embMod.formatEmbeddingStatus(embStatus);
+} catch {}
+console.log(`CWD Policy    : enabled=${enabled} (${ruleNote}) | headCore=${cfg.headCoreEnabled} | budget=${cfg.hookBudget} | embed=${embedNote}`);
+for (const line of embedLines) console.log(`Embedding     : ${line.replace(/^embedding:?\s+/, '')}`);
 
 const fmtBytes = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(2)}MB` : `${(n / 1024).toFixed(1)}KB`);
 const fileSize = (p) => { try { return fs.existsSync(p) ? fs.statSync(p).size : 0; } catch { return 0; } };

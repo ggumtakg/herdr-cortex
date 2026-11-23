@@ -1,9 +1,70 @@
 import { normalizeRelPath } from './config.mjs';
 import { hasVectorTable, readIndexMeta, syncFromDisk } from './db.mjs';
 import { getNeighbors } from './graph.mjs';
+import { classifyEmbeddingError, isEmbeddingTimeoutError } from '../embeddings/breaker.mjs';
 
 const RRF_K = 60;
 const DEFAULT_MAX_VEC_DISTANCE = 0.65;
+const DEFAULT_QUERY_TIMEOUT_MS = 3000;
+
+/**
+ * Embed the search query with a hard deadline and a single attempt, so an unreachable embedding service
+ * costs a search at most `timeoutMs` before it continues with keyword and graph results.
+ * Returns { vector, skipped } where `skipped` is '' or the reason vectors are not used:
+ *   'circuit_open'      - the service failed recently; not asked at all
+ *   'embedding_timeout' - no answer within `timeoutMs`
+ *   'embedding_error'   - the provider failed or returned no usable vector
+ */
+async function embedQueryWithDeadline(provider, query, { timeoutMs, breaker }) {
+  if (breaker && breaker.isOpen()) {
+    return { vector: null, skipped: 'circuit_open' };
+  }
+
+  const isUsable = (vecs) => Array.isArray(vecs) && Boolean(vecs[0]) && vecs[0].length > 0;
+  let deadline = null;
+  let gaveUp = false;
+  try {
+    const call = Promise.resolve(
+      provider.embed([query], { taskType: 'query', timeoutMs, maxRetries: 0 }),
+    );
+    // The provider may not honor the per-call limits (a local model that is still loading, for example);
+    // the search moves on regardless. If the answer does arrive later, the service evidently works,
+    // so the breaker opened by this timeout is closed again.
+    call.then(
+      (vecs) => {
+        if (gaveUp && breaker && isUsable(vecs)) breaker.recordSuccess();
+      },
+      () => {},
+    );
+    const vecs = await Promise.race([
+      call,
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => {
+          gaveUp = true;
+          const err = new Error(`Query embedding gave no answer within ${timeoutMs}ms`);
+          err.name = 'TimeoutError';
+          reject(err);
+        }, timeoutMs);
+      }),
+    ]);
+
+    if (isUsable(vecs)) {
+      if (breaker) breaker.recordSuccess();
+      return {
+        vector: vecs[0] instanceof Float32Array ? vecs[0] : new Float32Array(vecs[0]),
+        skipped: '',
+      };
+    }
+    return { vector: null, skipped: 'embedding_error' };
+  } catch (err) {
+    if (breaker && classifyEmbeddingError(err) === 'service') {
+      breaker.recordFailure(err);
+    }
+    return { vector: null, skipped: isEmbeddingTimeoutError(err) ? 'embedding_timeout' : 'embedding_error' };
+  } finally {
+    if (deadline) clearTimeout(deadline);
+  }
+}
 
 const TRIM_PUNCT_RE = /^[?.!,:;'"`()\[\]{}]+|[?.!,:;'"`()\[\]{}]+$/g;
 const HANGUL_3PLUS_RE = /^[가-힣]{3,}$/;
@@ -384,6 +445,8 @@ function computeRecencyBoost(updatedAt) {
 /**
  * 2-stage RRF hybrid search across project, global, or both tiers.
  * Returns ONLY stage-1 summaries (never dumps full content).
+ * The result carries `vectorUsed`; when the query could not be embedded it also carries `vectorSkipped`
+ * ('embedding_timeout' | 'embedding_error' | 'circuit_open') and the results come from keyword and graph search.
  */
 export async function searchMemory(store, params = {}) {
   const {
@@ -397,6 +460,8 @@ export async function searchMemory(store, params = {}) {
     limit = 10,
     maxDistance = DEFAULT_MAX_VEC_DISTANCE,
     embeddingProvider = null,
+    embeddingBreaker = null,
+    queryTimeoutMs,
   } = params;
 
   const maxLimit = Math.max(1, Math.min(100, Number(limit) || 10));
@@ -493,16 +558,16 @@ export async function searchMemory(store, params = {}) {
 
   // 2. Lazy query embedding: ONLY call embeddingProvider.embed if at least one target tier has indexed vectors!
   let queryVec = null;
+  let vectorSkipped = '';
   const anyTierHasVectors = activeTiers.some((t) => t.vecRowCount > 0);
   if (anyTierHasVectors && embeddingProvider && typeof embeddingProvider.embed === 'function') {
-    try {
-      const vecs = await embeddingProvider.embed([trimmedQuery], { taskType: 'query' });
-      if (Array.isArray(vecs) && vecs[0] && vecs[0].length > 0) {
-        queryVec = vecs[0] instanceof Float32Array ? vecs[0] : new Float32Array(vecs[0]);
-      }
-    } catch {
-      queryVec = null;
-    }
+    const configuredTimeout = Number(queryTimeoutMs ?? store?.config?.embedding?.queryTimeoutMs);
+    const embedded = await embedQueryWithDeadline(embeddingProvider, trimmedQuery, {
+      timeoutMs: configuredTimeout > 0 ? configuredTimeout : DEFAULT_QUERY_TIMEOUT_MS,
+      breaker: embeddingBreaker,
+    });
+    queryVec = embedded.vector;
+    vectorSkipped = embedded.skipped;
   }
 
   // 3. Run keyword + vector search per tier
@@ -652,6 +717,7 @@ export async function searchMemory(store, params = {}) {
     query: trimmedQuery,
     scope,
     vectorUsed,
+    ...(vectorSkipped ? { vectorSkipped } : {}),
     totalReturned: topHits.length,
     results: topHits,
   };

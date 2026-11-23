@@ -1,60 +1,16 @@
 import { chunkMarkdown, splitLongText } from '../core/frontmatter.mjs';
 import { ensureVectorTable, readIndexMeta, syncFromDisk, withTransaction } from '../core/db.mjs';
-import { createGeminiProvider } from './gemini.mjs';
-import { createOpenAIProvider } from './openai.mjs';
-import { createOllamaProvider } from './ollama.mjs';
-import { createOnnxProvider } from './onnx.mjs';
+import { classifyEmbeddingError } from './breaker.mjs';
+import { MAX_EMBED_ATTEMPTS } from './failed.mjs';
+import { resolveEmbeddingProvider } from './resolve.mjs';
 
-const MAX_EMBED_ATTEMPTS = 3;
-
-function isAuthCircuitBreakError(err) {
-  if (!err) return false;
-  if (err.status === 401 || err.status === 403) return true;
-  const msg = String(err.message || '');
-  return /\b(?:401|403)\b/.test(msg) && /(?:embedding failed|unauthorized|forbidden|api key)/i.test(msg);
-}
-
-/**
- * Resolve an EmbeddingProvider from merged cortex config.
- * Returns null gracefully when provider is 'none' or unconfigured/unavailable.
- */
-export async function resolveEmbeddingProvider(config = {}) {
-  const emb = config.embedding || config || {};
-  const kind = String(emb.provider || 'auto').trim().toLowerCase();
-
-  if (kind === 'none' || kind === 'off' || kind === 'disabled') {
-    return null;
-  }
-  if (kind === 'gemini') {
-    return createGeminiProvider(emb);
-  }
-  if (kind === 'openai') {
-    return createOpenAIProvider(emb);
-  }
-  if (kind === 'ollama') {
-    return createOllamaProvider(emb);
-  }
-  if (kind === 'onnx') {
-    return await createOnnxProvider(emb);
-  }
-
-  // auto mode: check configured credentials/endpoints without blocking network probes
-  const gemini = createGeminiProvider(emb);
-  if (gemini) return gemini;
-
-  const openai = createOpenAIProvider(emb);
-  if (openai) return openai;
-
-  if (process.env.OLLAMA_HOST || emb.baseUrl) {
-    return createOllamaProvider(emb);
-  }
-
-  if (emb.onnxEnabled) {
-    return await createOnnxProvider(emb);
-  }
-
-  return null;
-}
+export {
+  classifyEmbeddingError,
+  createEmbeddingBreaker,
+  getSharedEmbeddingBreaker,
+} from './breaker.mjs';
+export { MAX_EMBED_ATTEMPTS, listFailedEmbeddings, retryFailedEmbeddings } from './failed.mjs';
+export { describeEmbeddingStatus, formatEmbeddingStatus, resolveEmbeddingProvider } from './resolve.mjs';
 
 function makeChunkPrefix(title, heading, safeMax) {
   const t = String(title || '').trim();
@@ -138,9 +94,32 @@ export function buildDocChunks(doc, { maxChars = 800, overlap = 100 } = {}) {
   return out;
 }
 
+function idleResult(reason, extra = {}) {
+  return {
+    provider: null,
+    processed: 0,
+    chunksIndexed: 0,
+    rebuiltTiers: [],
+    errors: 0,
+    circuitBroken: false,
+    more: false,
+    reason,
+    ...extra,
+  };
+}
+
 /**
  * Process pending (or model-mismatched) embeddings for one or both tiers.
  * Handles automatic doc_chunks_vec rebuild when embedding model or dimensions change.
+ *
+ * Failures are handled by kind (see `classifyEmbeddingError`):
+ *   - document: counted in the document's `embed_attempts`; after MAX_EMBED_ATTEMPTS it is no longer retried.
+ *   - service (timeout, network, HTTP 408/429/5xx): not counted against any document. The run stops,
+ *     `breaker` (when given) is opened, and the result has `reason: 'service_unavailable'`.
+ *   - auth (HTTP 401/403): not counted against any document. The run stops with `reason: 'auth_failed'`.
+ * While `breaker` is open nothing is attempted at all (`reason: 'circuit_open'`).
+ * `circuitBroken` is true whenever the run was stopped or skipped for one of these reasons.
+ * `more` is true when a tier still had a full batch of candidates, i.e. another run may find more work.
  */
 export async function processPendingEmbeddings(
   store,
@@ -150,19 +129,16 @@ export async function processPendingEmbeddings(
     maxDocs = 100,
     chunkMaxChars,
     chunkOverlap,
+    breaker = null,
   } = {},
 ) {
+  if (breaker && breaker.isOpen()) {
+    return idleResult('circuit_open', { circuitBroken: true });
+  }
+
   const activeProvider = provider || (await resolveEmbeddingProvider(store.config));
   if (!activeProvider || typeof activeProvider.embed !== 'function') {
-    return {
-      provider: null,
-      processed: 0,
-      chunksIndexed: 0,
-      rebuiltTiers: [],
-      errors: 0,
-      circuitBroken: false,
-      reason: 'no_provider',
-    };
+    return idleResult('no_provider');
   }
 
   const resolvedMaxChars = chunkMaxChars ?? store.config?.embedding?.chunkMaxChars ?? 800;
@@ -170,16 +146,18 @@ export async function processPendingEmbeddings(
   const maxChars = Math.max(64, Number(resolvedMaxChars) || 800);
   const overlap = Number.isFinite(Number(resolvedOverlap)) ? Math.max(0, Number(resolvedOverlap)) : 100;
   const scopes = scope === 'all' ? ['project', 'global'] : [scope];
+  const batchLimit = Math.max(1, Number(maxDocs) || 100);
 
   let totalProcessed = 0;
   let totalChunks = 0;
   let totalErrors = 0;
-  let circuitBroken = false;
+  let stopReason = '';
+  let more = false;
   const rebuiltTiers = [];
   let knownDims = Number(activeProvider.dimensions) || 0;
 
   for (const s of scopes) {
-    if (circuitBroken) break;
+    if (stopReason) break;
 
     const tier = typeof store.getTierIfExists === 'function'
       ? store.getTierIfExists(s)
@@ -216,6 +194,7 @@ export async function processPendingEmbeddings(
       if (res.rebuilt) rebuiltTiers.push(s);
     }
 
+    // Documents that have not failed yet go first, so one document that keeps failing cannot hold up the rest.
     const pendingRows = tier.db
       .prepare(`
         SELECT id, type, status, title, summary, content, hash
@@ -227,15 +206,25 @@ export async function processPendingEmbeddings(
             OR embed_status = 'error'
             OR (embed_status = 'ready' AND embed_model != ?)
           )
-        ORDER BY updated_at DESC
+        ORDER BY CASE WHEN embed_status = 'error' THEN 1 ELSE 0 END, updated_at DESC
         LIMIT ?
       `)
-      .all(MAX_EMBED_ATTEMPTS, activeProvider.model, Math.max(1, Number(maxDocs) || 100));
+      .all(MAX_EMBED_ATTEMPTS, activeProvider.model, batchLimit);
 
-    const recordErrorStmt = tier.db.prepare(`
+    const tierHasFullBatch = pendingRows.length >= batchLimit;
+
+    // A failure specific to the document counts toward its attempt cap ...
+    const recordDocFailureStmt = tier.db.prepare(`
       UPDATE docs
       SET embed_status = 'error',
           embed_attempts = embed_attempts + 1,
+          embed_error = ?
+      WHERE id = ?
+    `);
+    // ... a failure of the service (or of the credentials) is only noted; the document stays eligible.
+    const recordOutageStmt = tier.db.prepare(`
+      UPDATE docs
+      SET embed_status = 'error',
           embed_error = ?
       WHERE id = ?
     `);
@@ -257,17 +246,23 @@ export async function processPendingEmbeddings(
         );
       } catch (err) {
         totalErrors++;
+        const kind = classifyEmbeddingError(err);
         const errMsg = String(err?.message || err || 'Embedding provider failed').slice(0, 200);
         try {
-          recordErrorStmt.run(errMsg, doc.id);
+          (kind === 'document' ? recordDocFailureStmt : recordOutageStmt).run(errMsg, doc.id);
         } catch {
           // ignore if DB closed mid-shutdown
         }
-        if (isAuthCircuitBreakError(err)) {
-          circuitBroken = true;
-          break;
+        if (kind === 'document') {
+          continue;
         }
-        continue;
+        if (kind === 'service') {
+          stopReason = 'service_unavailable';
+          if (breaker) breaker.recordFailure(err);
+        } else {
+          stopReason = 'auth_failed';
+        }
+        break;
       }
 
       const detectedDims = Array.isArray(vectors) && vectors[0] ? vectors[0].length : 0;
@@ -280,12 +275,15 @@ export async function processPendingEmbeddings(
       if (!allValid) {
         totalErrors++;
         try {
-          recordErrorStmt.run('Invalid or mismatched vector dimensions returned by provider', doc.id);
+          recordDocFailureStmt.run('Invalid or mismatched vector dimensions returned by provider', doc.id);
         } catch {
           // ignore
         }
         continue;
       }
+
+      // The service answered usefully: a tripped breaker closes and postponed work is picked up again.
+      if (breaker) breaker.recordSuccess();
 
       if (!tableReady || detectedDims !== knownDims) {
         knownDims = detectedDims;
@@ -346,12 +344,14 @@ export async function processPendingEmbeddings(
         totalErrors++;
         const errMsg = String(err?.message || err || 'Vector commit failed').slice(0, 200);
         try {
-          recordErrorStmt.run(errMsg, doc.id);
+          recordDocFailureStmt.run(errMsg, doc.id);
         } catch {
           // ignore if DB closed
         }
       }
     }
+
+    if (tierHasFullBatch && !stopReason) more = true;
   }
 
   return {
@@ -362,38 +362,142 @@ export async function processPendingEmbeddings(
     chunksIndexed: totalChunks,
     rebuiltTiers,
     errors: totalErrors,
-    circuitBroken,
+    circuitBroken: Boolean(stopReason),
+    more,
+    ...(stopReason ? { reason: stopReason } : {}),
   };
+}
+
+// Extra wait after the breaker's pause before the queue tries again.
+const RETRY_SLACK_MS = 25;
+
+function samePath(a, b) {
+  const left = String(a || '');
+  const right = String(b || '');
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
 /**
  * Non-blocking debounced async embedding queue so memory_save returns immediately.
  * Tracks `inFlightPromise` and exposes `drain(timeoutMs)` for safe shutdown without closing DB mid-write.
+ *
+ * With a `breaker` (shared with search): the queue does not run while the breaker is open, keeps the postponed
+ * work and tries again when the pause is over; when the breaker closes after a success it schedules
+ * `recoverScope` so documents that piled up are embedded without waiting for the next save.
+ *
+ * `schedule('project', { projectDir })` queues another project's store (a save made with `project_dir`).
+ * That store is opened through `openProjectStore(projectDir)` for the run only and closed right after.
  */
-export function createEmbeddingQueue(store, { provider = null, getProvider = null, debounceMs = 150 } = {}) {
+export function createEmbeddingQueue(
+  store,
+  {
+    provider = null,
+    getProvider = null,
+    debounceMs = 150,
+    breaker = null,
+    maxDocs = 100,
+    recoverScope = 'all',
+    openProjectStore = null,
+    getProviderFor = null,
+  } = {},
+) {
   let timer = null;
+  let timerDue = 0;
   let inFlightPromise = null;
   let draining = false;
   const pendingScopes = new Set();
+  const pendingProjects = new Map(); // normalized path -> project directory
+
+  const hasPending = () => pendingScopes.size > 0 || pendingProjects.size > 0;
+
+  const nextDelay = () => (breaker && breaker.isOpen() ? breaker.remainingMs() + RETRY_SLACK_MS : debounceMs);
+
+  const projectKey = (projectDir) => {
+    const text = String(projectDir);
+    return process.platform === 'win32' ? text.toLowerCase() : text;
+  };
+
+  // True when the run stopped because the service is unavailable and the breaker will tell us when to return.
+  const pausedByService = (res) => Boolean(
+    breaker
+    && breaker.isOpen()
+    && res
+    && (res.reason === 'circuit_open' || res.reason === 'service_unavailable'),
+  );
 
   const flush = () => {
     if (inFlightPromise) return inFlightPromise;
-    if (pendingScopes.size === 0) return Promise.resolve();
+    if (!hasPending()) return Promise.resolve();
+    if (breaker && breaker.isOpen()) {
+      // Not now: keep what is pending and come back when the pause is over.
+      if (!draining) arm(nextDelay());
+      return Promise.resolve();
+    }
 
     const scopes = [...pendingScopes];
     pendingScopes.clear();
+    const projects = [...pendingProjects.values()];
+    pendingProjects.clear();
 
     inFlightPromise = (async () => {
+      let paused = false;
       try {
-        const scope = scopes.length > 1 ? 'all' : scopes[0];
-        const activeProvider = provider || (typeof getProvider === 'function' ? await getProvider() : null);
-        await processPendingEmbeddings(store, { scope, provider: activeProvider });
-      } catch {
-        // swallow background errors; docs remain pending/error for next run
+        if (scopes.length > 0) {
+          let res = null;
+          try {
+            const scope = scopes.length > 1 || scopes[0] === 'all' ? 'all' : scopes[0];
+            const activeProvider = provider || (typeof getProvider === 'function' ? await getProvider() : null);
+            res = await processPendingEmbeddings(store, { scope, provider: activeProvider, breaker, maxDocs });
+          } catch {
+            // swallow background errors; docs remain pending/error for next run
+          }
+          if (pausedByService(res)) {
+            paused = true;
+            for (const s of scopes) pendingScopes.add(s);
+          } else if (res && res.more && res.processed > 0) {
+            for (const s of scopes) pendingScopes.add(s);
+          }
+        }
+
+        for (const projectDir of projects) {
+          if (paused || (breaker && breaker.isOpen())) {
+            paused = true;
+            pendingProjects.set(projectKey(projectDir), projectDir);
+            continue;
+          }
+          let otherStore = null;
+          let res = null;
+          try {
+            otherStore = openProjectStore(projectDir);
+            const activeProvider = typeof getProviderFor === 'function'
+              ? await getProviderFor(otherStore)
+              : await resolveEmbeddingProvider(otherStore.config);
+            res = await processPendingEmbeddings(otherStore, {
+              scope: 'project',
+              provider: activeProvider,
+              breaker,
+              maxDocs,
+            });
+          } catch {
+            // swallow background errors; docs remain pending/error for next run
+          } finally {
+            try {
+              if (otherStore) otherStore.close();
+            } catch {
+              // ignore close errors
+            }
+          }
+          if (pausedByService(res)) {
+            paused = true;
+            pendingProjects.set(projectKey(projectDir), projectDir);
+          } else if (res && res.more && res.processed > 0) {
+            pendingProjects.set(projectKey(projectDir), projectDir);
+          }
+        }
       } finally {
         inFlightPromise = null;
-        if (!draining && pendingScopes.size > 0) {
-          schedule(Array.from(pendingScopes)[0]);
+        if (!draining && hasPending()) {
+          arm(nextDelay());
         }
       }
     })();
@@ -401,18 +505,40 @@ export function createEmbeddingQueue(store, { provider = null, getProvider = nul
     return inFlightPromise;
   };
 
-  const schedule = (scope = 'project') => {
-    if (draining) return;
-    pendingScopes.add(scope);
-    if (timer) return;
+  // Plan a run after `delayMs`, unless one is already planned for an earlier moment.
+  function arm(delayMs) {
+    const delay = Math.max(0, Number(delayMs) || 0);
+    const due = Date.now() + delay;
+    if (timer && timerDue <= due) return;
+    if (timer) clearTimeout(timer);
+    timerDue = due;
     timer = setTimeout(() => {
       timer = null;
       void flush();
-    }, debounceMs);
+    }, delay);
     if (typeof timer.unref === 'function') {
       timer.unref();
     }
+  }
+
+  const schedule = (scope = 'project', { projectDir } = {}) => {
+    if (draining) return;
+    const otherProject = projectDir && !samePath(projectDir, store?.projectRoot) ? String(projectDir) : '';
+    if (otherProject && scope !== 'global') {
+      // Another project's documents live in that project's own store.
+      if (typeof openProjectStore !== 'function') return;
+      pendingProjects.set(projectKey(otherProject), otherProject);
+    } else {
+      pendingScopes.add(scope);
+    }
+    arm(nextDelay());
   };
+
+  const unsubscribe = breaker && typeof breaker.onRecover === 'function'
+    ? breaker.onRecover(() => {
+        if (!draining) schedule(recoverScope);
+      })
+    : () => {};
 
   const cancel = () => {
     if (timer) {
@@ -420,10 +546,12 @@ export function createEmbeddingQueue(store, { provider = null, getProvider = nul
       timer = null;
     }
     pendingScopes.clear();
+    pendingProjects.clear();
   };
 
   const drain = async (timeoutMs = 3000) => {
     draining = true;
+    unsubscribe();
     cancel();
     if (!inFlightPromise) return;
 
@@ -446,5 +574,8 @@ export function createEmbeddingQueue(store, { provider = null, getProvider = nul
     }
   };
 
-  return { schedule, flush, cancel, drain };
+  /** Resolves when no run is in progress (the run that is in flight, if any, has finished). */
+  const whenIdle = () => inFlightPromise || Promise.resolve();
+
+  return { schedule, flush, cancel, drain, hasPending, whenIdle };
 }

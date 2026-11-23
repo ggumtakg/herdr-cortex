@@ -1,3 +1,7 @@
+import { markEmbeddingFailure } from './breaker.mjs';
+
+export const ONNX_DEFAULT_MODEL = 'Xenova/multilingual-e5-small';
+
 /**
  * Local ONNX embedding provider using lazy dynamic import of @huggingface/transformers.
  * Returns null gracefully if the optional package is not installed.
@@ -14,7 +18,7 @@ export async function createOnnxProvider(options = {}) {
     return null;
   }
 
-  const model = options.model || 'Xenova/multilingual-e5-small';
+  const model = options.model || ONNX_DEFAULT_MODEL;
   const dimensions = Number(options.dimensions) || 0;
   let extractorPromise = null;
 
@@ -26,7 +30,8 @@ export async function createOnnxProvider(options = {}) {
         })
         .catch((err) => {
           extractorPromise = null;
-          throw err;
+          // The model could not be loaded: nothing can be embedded right now, whatever the document is.
+          throw markEmbeddingFailure(err, 'service');
         });
     }
     return extractorPromise;

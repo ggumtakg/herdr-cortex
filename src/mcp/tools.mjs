@@ -205,11 +205,23 @@ export function createToolRegistry(
     promptsDir = path.join(REPO_ROOT, 'prompts'),
     getEmbeddingProvider = null,
     embeddingQueue = null,
+    embeddingBreaker = null,
     projectEnabled = null,
     extraTools = [],
   } = {},
 ) {
   const tools = new Map();
+
+  // Queue the embedding of a document that was just written. A write made with `project_dir` lands in another
+  // project's store, so the queue is told which project it was; the global tier is the same store either way.
+  const scheduleEmbedding = (scope, { projectDir, isDefaultStore }) => {
+    if (!embeddingQueue || typeof embeddingQueue.schedule !== 'function') return;
+    if (isDefaultStore || scope === 'global') {
+      embeddingQueue.schedule(scope);
+    } else {
+      embeddingQueue.schedule(scope, { projectDir });
+    }
+  };
 
   const isDefaultProjectEnabled = () => {
     if (typeof projectEnabled === 'boolean') return projectEnabled;
@@ -306,6 +318,7 @@ export function createToolRegistry(
           include_superseded: Boolean(args.include_superseded),
           limit: args.limit ?? 10,
           embeddingProvider: provider,
+          embeddingBreaker,
         });
       });
     },
@@ -380,9 +393,7 @@ export function createToolRegistry(
           return makeProjectExcludedError('memory_save', projectDir);
         }
         const saved = targetStore.saveDoc(args);
-        if (isDefaultStore && embeddingQueue && typeof embeddingQueue.schedule === 'function') {
-          embeddingQueue.schedule(saved.scope);
-        }
+        scheduleEmbedding(saved.scope, { projectDir, isDefaultStore });
         return saved;
       });
     },
@@ -421,9 +432,7 @@ export function createToolRegistry(
           return makeProjectExcludedError('memory_update', projectDir);
         }
         const updated = targetStore.updateDoc(args);
-        if (isDefaultStore && embeddingQueue && typeof embeddingQueue.schedule === 'function') {
-          embeddingQueue.schedule(updated.scope);
-        }
+        scheduleEmbedding(updated.scope, { projectDir, isDefaultStore });
         return updated;
       });
     },

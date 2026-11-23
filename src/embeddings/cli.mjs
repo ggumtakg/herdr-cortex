@@ -1,7 +1,15 @@
 import path from 'node:path';
 import { CortexStore } from '../core/store.mjs';
-import { isMainModule, isProjectEnabled, loadConfig } from '../core/config.mjs';
-import { processPendingEmbeddings, resolveEmbeddingProvider } from './index.mjs';
+import { EMBEDDING_PROVIDER_NAMES, isMainModule, isProjectEnabled, loadConfig } from '../core/config.mjs';
+import {
+  createEmbeddingBreaker,
+  describeEmbeddingStatus,
+  formatEmbeddingStatus,
+  listFailedEmbeddings,
+  processPendingEmbeddings,
+  resolveEmbeddingProvider,
+  retryFailedEmbeddings,
+} from './index.mjs';
 
 function parseArgs(argv) {
   const args = {
@@ -11,6 +19,7 @@ function parseArgs(argv) {
     provider: '',
     model: '',
     maxDocs: 200,
+    retryFailed: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -20,28 +29,85 @@ function parseArgs(argv) {
     else if (a === '--provider' && argv[i + 1]) args.provider = argv[++i];
     else if (a === '--model' && argv[i + 1]) args.model = argv[++i];
     else if (a === '--max-docs' && argv[i + 1]) args.maxDocs = Number(argv[++i]) || 200;
+    else if (a === '--retry-failed') args.retryFailed = true;
   }
   return args;
 }
 
-export async function runEmbedCli(argv = process.argv.slice(2), { provider: injectedProvider = null } = {}) {
+/**
+ * Embed pending documents once and print a JSON summary on stdout.
+ *
+ * Flags: --project <dir>, --global <dir>, --scope project|global|all, --max-docs <n>,
+ *   --provider <none|auto|gemini|openai|ollama|onnx>  use this provider for the run (embedding.provider)
+ *   --model <name>      model for the provider in use (embedding.<provider>.model)
+ *   --retry-failed      first reset the documents that reached the attempt cap, so they are tried again
+ *
+ * Before any work it prints on stderr which provider is in effect, where documents would be sent and any
+ * configuration problem. An unknown provider name, a provider without its API key, or --model without a
+ * provider to apply it to ends the run with exit code 1; so does any embedding error.
+ */
+export async function runEmbedCli(
+  argv = process.argv.slice(2),
+  {
+    provider: injectedProvider = null,
+    env = process.env,
+    stdout = process.stdout,
+    stderr = process.stderr,
+  } = {},
+) {
   const opts = parseArgs(argv);
-  const overrides = {};
-  if (opts.provider || opts.model) {
-    overrides.embedding = {
-      ...(opts.provider ? { provider: opts.provider } : {}),
-      ...(opts.model ? { model: opts.model } : {}),
-    };
+  const breaker = createEmbeddingBreaker();
+  const baseOverrides = opts.provider ? { embedding: { provider: opts.provider } } : undefined;
+
+  let config = loadConfig({ projectDir: opts.projectDir, globalDir: opts.globalDir, overrides: baseOverrides });
+  let usageError = '';
+
+  if (opts.model) {
+    // --model belongs to one provider's block: the one named by --provider, else the one the config selects.
+    const named = opts.provider.trim().toLowerCase();
+    const target = EMBEDDING_PROVIDER_NAMES.includes(named)
+      ? named
+      : describeEmbeddingStatus(config, { env, breaker }).provider;
+    if (target) {
+      config = loadConfig({
+        projectDir: opts.projectDir,
+        globalDir: opts.globalDir,
+        overrides: {
+          embedding: {
+            ...(opts.provider ? { provider: opts.provider } : {}),
+            [target]: { model: opts.model },
+          },
+        },
+      });
+    } else if (!injectedProvider) {
+      usageError = '--model was given but no embedding provider is in effect; '
+        + `add --provider <${EMBEDDING_PROVIDER_NAMES.join('|')}> or set embedding.provider in config.json.`;
+    }
   }
 
-  const config = loadConfig({ projectDir: opts.projectDir, globalDir: opts.globalDir, overrides });
+  const status = describeEmbeddingStatus(config, { env, breaker });
+  for (const line of formatEmbeddingStatus(status)) {
+    stderr.write(`[herdr-cortex] ${line}\n`);
+  }
+  if (usageError) stderr.write(`[herdr-cortex] ${usageError}\n`);
+
+  const configProblems = status.problems.map((problem) => problem.message);
+  const blocking = injectedProvider
+    ? null
+    : status.problems.find((problem) => problem.code === 'unknown_provider' || problem.code === 'missing_api_key');
+
+  const emit = (summary) => {
+    stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    return summary;
+  };
+
   const projectAllowed = isProjectEnabled(opts.projectDir, config);
 
   let effectiveScope = opts.scope;
   let skippedProject = false;
   if (!projectAllowed) {
     if (opts.scope === 'project') {
-      const skippedRes = {
+      return emit({
         provider: null,
         processed: 0,
         chunksIndexed: 0,
@@ -49,9 +115,8 @@ export async function runEmbedCli(argv = process.argv.slice(2), { provider: inje
         errors: 0,
         skipped: true,
         reason: 'project_disabled',
-      };
-      process.stdout.write(`${JSON.stringify(skippedRes, null, 2)}\n`);
-      return skippedRes;
+        ...(configProblems.length > 0 ? { configProblems } : {}),
+      });
     }
     if (opts.scope === 'all') {
       effectiveScope = 'global';
@@ -61,52 +126,68 @@ export async function runEmbedCli(argv = process.argv.slice(2), { provider: inje
 
   const store = new CortexStore({ projectDir: opts.projectDir, globalDir: opts.globalDir, config });
   try {
-    const provider = injectedProvider || (await resolveEmbeddingProvider(config));
+    const retryReset = opts.retryFailed ? retryFailedEmbeddings(store, { scope: effectiveScope }) : null;
 
     let totalProcessed = 0;
     let totalChunks = 0;
     let totalErrors = 0;
     let dimensions = 0;
-    let providerName = provider?.name || null;
-    let modelName = provider?.model || '';
+    let providerName = null;
+    let modelName = '';
     let circuitBroken = false;
     let reason = undefined;
+    let error = '';
     const rebuiltSet = new Set();
 
-    const maxIterations = 1000;
-    for (let iter = 0; iter < maxIterations; iter++) {
-      const batchRes = await processPendingEmbeddings(store, {
-        scope: effectiveScope,
-        provider,
-        maxDocs: opts.maxDocs,
-      });
+    if (usageError) {
+      reason = 'invalid_arguments';
+      error = usageError;
+    } else if (blocking) {
+      reason = blocking.code === 'unknown_provider' ? 'invalid_provider' : 'no_provider';
+      error = blocking.message;
+    } else {
+      const provider = injectedProvider || (await resolveEmbeddingProvider(config, { env }));
+      providerName = provider?.name || null;
+      modelName = provider?.model || '';
+      if (!provider) reason = 'no_provider';
 
-      if (batchRes.provider) providerName = batchRes.provider;
-      if (batchRes.model) modelName = batchRes.model;
-      if (batchRes.dimensions) dimensions = batchRes.dimensions;
-      if (batchRes.reason) reason = batchRes.reason;
-      for (const t of batchRes.rebuiltTiers || []) rebuiltSet.add(t);
+      const maxIterations = provider ? 1000 : 0;
+      for (let iter = 0; iter < maxIterations; iter++) {
+        const batchRes = await processPendingEmbeddings(store, {
+          scope: effectiveScope,
+          provider,
+          maxDocs: opts.maxDocs,
+          breaker,
+        });
 
-      totalProcessed += batchRes.processed || 0;
-      totalChunks += batchRes.chunksIndexed || 0;
-      totalErrors += batchRes.errors || 0;
+        if (batchRes.provider) providerName = batchRes.provider;
+        if (batchRes.model) modelName = batchRes.model;
+        if (batchRes.dimensions) dimensions = batchRes.dimensions;
+        if (batchRes.reason) reason = batchRes.reason;
+        for (const t of batchRes.rebuiltTiers || []) rebuiltSet.add(t);
 
-      if (batchRes.circuitBroken) {
-        circuitBroken = true;
-        break;
-      }
-      if (batchRes.reason === 'no_provider') {
-        break;
-      }
-      // Stop when no more docs were processed in this batch
-      if ((batchRes.processed || 0) === 0) {
-        break;
+        totalProcessed += batchRes.processed || 0;
+        totalChunks += batchRes.chunksIndexed || 0;
+        totalErrors += batchRes.errors || 0;
+
+        if (batchRes.circuitBroken) {
+          circuitBroken = true;
+          break;
+        }
+        if (batchRes.reason === 'no_provider') {
+          break;
+        }
+        // Stop when no more docs were processed in this batch
+        if ((batchRes.processed || 0) === 0) {
+          break;
+        }
       }
     }
 
     const summary = {
       provider: providerName,
       ...(modelName ? { model: modelName } : {}),
+      ...(providerName && status.host ? { sendsTo: status.host } : {}),
       dimensions,
       processed: totalProcessed,
       chunksIndexed: totalChunks,
@@ -115,14 +196,18 @@ export async function runEmbedCli(argv = process.argv.slice(2), { provider: inje
       circuitBroken,
       ...(skippedProject ? { skippedProject: true } : {}),
       ...(reason ? { reason } : {}),
+      ...(error ? { error } : {}),
+      // Documents the queue stopped retrying (attempt cap); `--retry-failed` gives them a fresh start.
+      failedDocuments: listFailedEmbeddings(store, { scope: effectiveScope }),
+      ...(retryReset ? { retryReset } : {}),
+      ...(configProblems.length > 0 ? { configProblems } : {}),
     };
 
-    if (totalErrors > 0) {
+    if (totalErrors > 0 || error) {
       process.exitCode = 1;
     }
 
-    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
-    return summary;
+    return emit(summary);
   } finally {
     store.close();
   }
