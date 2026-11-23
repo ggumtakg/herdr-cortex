@@ -442,11 +442,25 @@ function computeRecencyBoost(updatedAt) {
   return 0.002 * Math.exp(-ageDays / 30);
 }
 
+// Two tiers can share one query vector when they are embedded by the same provider and model.
+function isSameEmbeddingProvider(a, b) {
+  if (a === b) return true;
+  return Boolean(a?.name) && Boolean(a?.model) && a.name === b?.name && a.model === b?.model;
+}
+
 /**
  * 2-stage RRF hybrid search across project, global, or both tiers.
  * Returns ONLY stage-1 summaries (never dumps full content).
  * The result carries `vectorUsed`; when the query could not be embedded it also carries `vectorSkipped`
  * ('embedding_timeout' | 'embedding_error' | 'circuit_open') and the results come from keyword and graph search.
+ *
+ * Each tier is searched with a query vector from its own provider: `embeddingProviders` is
+ * { project, global } (the global tier follows the global settings, the project tier its own);
+ * `embeddingProvider` is one provider for every tier. The query is embedded once per distinct provider and
+ * model, all at the same time, each with the query timeout and the shared breaker. A tier whose index was
+ * built with another model than its provider now uses gets no vector search until it is re-embedded.
+ * `vectorSkipped` reports the first tier (project, then global) whose query embedding failed, even when the
+ * other tier contributed vector hits.
  */
 export async function searchMemory(store, params = {}) {
   const {
@@ -460,6 +474,7 @@ export async function searchMemory(store, params = {}) {
     limit = 10,
     maxDistance = DEFAULT_MAX_VEC_DISTANCE,
     embeddingProvider = null,
+    embeddingProviders = null,
     embeddingBreaker = null,
     queryTimeoutMs,
   } = params;
@@ -556,18 +571,42 @@ export async function searchMemory(store, params = {}) {
     };
   }
 
-  // 2. Lazy query embedding: ONLY call embeddingProvider.embed if at least one target tier has indexed vectors!
-  let queryVec = null;
+  // 2. Lazy query embedding: ONLY call a provider's embed if a target tier it serves has indexed vectors!
+  // One call per distinct provider, started together so the search waits for the query timeout at most once.
   let vectorSkipped = '';
-  const anyTierHasVectors = activeTiers.some((t) => t.vecRowCount > 0);
-  if (anyTierHasVectors && embeddingProvider && typeof embeddingProvider.embed === 'function') {
-    const configuredTimeout = Number(queryTimeoutMs ?? store?.config?.embedding?.queryTimeoutMs);
-    const embedded = await embedQueryWithDeadline(embeddingProvider, trimmedQuery, {
-      timeoutMs: configuredTimeout > 0 ? configuredTimeout : DEFAULT_QUERY_TIMEOUT_MS,
-      breaker: embeddingBreaker,
-    });
-    queryVec = embedded.vector;
-    vectorSkipped = embedded.skipped;
+  const providerForScope = (s) => {
+    const candidate = embeddingProviders && typeof embeddingProviders === 'object'
+      ? embeddingProviders[s]
+      : embeddingProvider;
+    return candidate && typeof candidate.embed === 'function' ? candidate : null;
+  };
+  const configuredTimeout = Number(queryTimeoutMs ?? store?.config?.embedding?.queryTimeoutMs);
+  const queryJobs = []; // { provider, promise }
+  for (const entry of activeTiers) {
+    entry.queryJob = null;
+    if (entry.vecRowCount <= 0) continue;
+    const tierProvider = providerForScope(entry.scope);
+    if (!tierProvider) continue;
+    // Vectors of another model cannot be compared with this provider's query vector.
+    if (entry.meta?.embedModel && tierProvider.model && entry.meta.embedModel !== tierProvider.model) continue;
+    let job = queryJobs.find((j) => isSameEmbeddingProvider(j.provider, tierProvider));
+    if (!job) {
+      job = {
+        provider: tierProvider,
+        promise: embedQueryWithDeadline(tierProvider, trimmedQuery, {
+          timeoutMs: configuredTimeout > 0 ? configuredTimeout : DEFAULT_QUERY_TIMEOUT_MS,
+          breaker: embeddingBreaker,
+        }),
+      };
+      queryJobs.push(job);
+    }
+    entry.queryJob = job;
+  }
+  await Promise.all(queryJobs.map((job) => job.promise));
+  for (const entry of activeTiers) {
+    const embedded = entry.queryJob ? await entry.queryJob.promise : null;
+    entry.queryVec = embedded ? embedded.vector : null;
+    if (embedded && embedded.skipped && !vectorSkipped) vectorSkipped = embedded.skipped;
   }
 
   // 3. Run keyword + vector search per tier
@@ -575,7 +614,7 @@ export async function searchMemory(store, params = {}) {
   const tierStates = [];
 
   for (const entry of activeTiers) {
-    const { scope: s, tier, vecRowCount, meta } = entry;
+    const { scope: s, tier, vecRowCount, meta, queryVec } = entry;
     const kwRanked = runKeywordSearch(tier.db, trimmedQuery, {
       whereSql,
       filterParams,

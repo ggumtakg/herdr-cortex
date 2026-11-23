@@ -24,13 +24,18 @@ import {
   recordSession,
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
-import { drainInbox, formatInboxForHookDetailed } from '../relay/inbox.mjs';
+import { deliverInboxForHook } from '../relay/inbox.mjs';
 import { extractAntigravityState, resolveAntigravityTranscriptPath } from './recent-turns.mjs';
 import { COMPACT_POINTER_INSTRUCTION } from './claude.mjs';
 
 const SAFE_CONV_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
 const ROLE_PROBE_BYTES = 16 * 1024;
 const SUBAGENT_MSG_RE = /\[Message\]\s+timestamp=[^\n]+\ssender=[0-9a-zA-Z_-]{8,}/i;
+// Most characters one hook call spends on relay messages. The inbox belongs to the terminal and lives in the
+// global store, so it is delivered whether or not the current project is approved (an excluded project
+// returns before any delivery). Only messages injected in full are acknowledged; a message too long for a
+// block of this size is announced once and then left for relay_inbox.
+const ANTIGRAVITY_INBOX_MAX_CHARS = 2500;
 const USER_STEP_FALLBACK_RE = /"(?:type|stepType|step_type|kind)"\s*:\s*"(?:[A-Z_]*_)?(?:USER_INPUT|USER_EXPLICIT)"/i;
 
 function wrapAntigravityInjectSteps(sections) {
@@ -374,20 +379,19 @@ export function handleAntigravitySessionStart(
     }
   }
 
-  // Budget-first inbox drain + partial ACK
-  if (projectTrusted && isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
+  // Budget-first relay inbox delivery (see ANTIGRAVITY_INBOX_MAX_CHARS)
+  if (isValidTerminalId(terminalId)) {
     const remaining = budget - used;
     if (remaining >= 120) {
       try {
-        const drained = drainInbox(projectDir, terminalId);
-        if (drained.messages.length > 0) {
-          const detailed = formatInboxForHookDetailed(drained.messages, {
-            maxChars: Math.min(2500, remaining),
-          });
-          if (detailed.text) {
-            pushSection(detailed.text);
-          }
-          drained.ack(detailed.includedIds);
+        const delivered = deliverInboxForHook(terminalId, {
+          globalDir: effectiveGlobalDir,
+          projectDir,
+          maxChars: Math.min(ANTIGRAVITY_INBOX_MAX_CHARS, remaining),
+          fullBlockChars: Math.min(ANTIGRAVITY_INBOX_MAX_CHARS, budget),
+        });
+        if (delivered.text) {
+          pushSection(delivered.text);
         }
       } catch {
         // ignore inbox errors in hook
@@ -603,20 +607,19 @@ export function handleAntigravityPreInvocation(
     atomicWriteJson(cpPaths.jsonPath, cpState);
   }
 
-  // 4. Budget-first relay inbox drain + partial ACK
-  if (projectTrusted && isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
+  // 4. Budget-first relay inbox delivery
+  if (isValidTerminalId(terminalId)) {
     const remaining = budget - used;
     if (remaining >= 120) {
       try {
-        const drained = drainInbox(projectDir, terminalId);
-        if (drained.messages.length > 0) {
-          const detailed = formatInboxForHookDetailed(drained.messages, {
-            maxChars: Math.min(2500, remaining),
-          });
-          if (detailed.text) {
-            pushSection(detailed.text);
-          }
-          drained.ack(detailed.includedIds);
+        const delivered = deliverInboxForHook(terminalId, {
+          globalDir: effectiveGlobalDir,
+          projectDir,
+          maxChars: Math.min(ANTIGRAVITY_INBOX_MAX_CHARS, remaining),
+          fullBlockChars: Math.min(ANTIGRAVITY_INBOX_MAX_CHARS, budget),
+        });
+        if (delivered.text) {
+          pushSection(delivered.text);
         }
       } catch {
         // ignore inbox errors in hook

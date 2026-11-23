@@ -43,20 +43,65 @@ export function sanitizeSingleLineTrigger(text, maxChars = MAX_WAKE_TRIGGER_CHAR
   return cleaned.slice(0, maxChars).trimEnd();
 }
 
+// `hc` addresses a tab on another machine as "<machine>/<terminal>" (for example "pc2/t3").
+const REMOTE_ADDRESS_RE = /^([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})\/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$/;
+
 /**
- * Normalize terminal activity metadata from `hc get` / `hc ls` output
- * to distinguish live vs dead and idle vs busy cleanly.
+ * Split a terminal address as printed by `hc ls`: { remote, machine, terminalId }.
+ * "t3" -> { remote: false, machine: '', terminalId: 't3' }; "pc2/t3" -> { remote: true, machine: 'pc2', terminalId: 't3' }.
+ * Relay works only between tabs of this machine (the inbox is a local file), so a remote address is
+ * recognized here and refused by the callers; it is never turned into a file path.
+ */
+export function parseTerminalAddress(address) {
+  const raw = typeof address === 'string' ? address.trim() : '';
+  const match = REMOTE_ADDRESS_RE.exec(raw);
+  if (match) return { remote: true, machine: match[1], terminalId: match[2] };
+  return { remote: false, machine: '', terminalId: raw };
+}
+
+// `status` as hc 0.1.21 prints it: a plain string in `hc ls` rows ("idle" / "working", absent for a bare
+// shell), an object { app, state, msg? } in `hc get` ("status": null for a bare shell).
+function readStatus(status) {
+  if (typeof status === 'string') {
+    return { state: status.trim().toLowerCase(), app: '' };
+  }
+  if (status && typeof status === 'object' && !Array.isArray(status)) {
+    return {
+      state: typeof status.state === 'string' ? status.state.trim().toLowerCase() : '',
+      app: typeof status.app === 'string' ? status.app.trim() : '',
+    };
+  }
+  return { state: '', app: '' };
+}
+
+/**
+ * Normalize one terminal from `hc ls --json` (a row) or `hc get <id> --json` into
+ * { terminalId, remote, machine, state, live, activity, idle, busy, blocked, error, unknown,
+ *   agentName, isBareShell, cwd, where }.
+ *
+ * `activity` is exactly one of:
+ *   'not_live' - the tab's `state` is not "live"
+ *   'shell'    - a bare shell (program name is a shell and hc reports no agent status)
+ *   'idle' | 'working' | 'blocked' | 'error' - what the agent's status says ('error' also when the tab's
+ *                own `state` is an error state)
+ *   'unknown'  - a live agent tab whose status is missing or not understood. Unknown is NOT busy:
+ *                callers must not report it as "busy", and must not treat it as idle either.
+ * `idle`, `busy`, `blocked`, `error` and `unknown` are the matching booleans (at most one is true).
  */
 export function detectTerminalActivity(terminal) {
   if (!terminal || typeof terminal !== 'object') {
     return {
       terminalId: '',
+      remote: false,
+      machine: '',
       state: 'unknown',
       live: false,
+      activity: 'not_live',
+      idle: false,
       busy: false,
       blocked: false,
       error: false,
-      idle: false,
+      unknown: false,
       agentName: '',
       isBareShell: false,
       cwd: '',
@@ -65,66 +110,42 @@ export function detectTerminalActivity(terminal) {
   }
 
   const terminalId = String(terminal.address || terminal.id || terminal.terminalId || '').trim();
+  const address = parseTerminalAddress(terminalId);
   const stateRaw = String(terminal.state || '').trim().toLowerCase();
   const live = stateRaw ? stateRaw === 'live' : true;
 
-  const agentName = String(
-    terminal.foreground?.name
-    || terminal.agent
-    || '',
-  ).trim();
-  const isBareShell = agentName ? BARE_SHELLS.has(agentName.toLowerCase()) : false;
+  const status = readStatus(terminal.status);
+  const programName = String(terminal.foreground?.name || terminal.agent || '').trim();
+  // A shell program without an agent status is a bare shell; when hc names an agent app for the tab
+  // (status.app), the tab is that agent even if its foreground program is a shell.
+  const isBareShell = Boolean(programName) && BARE_SHELLS.has(programName.toLowerCase()) && !status.app;
+  const agentName = status.app || programName;
 
   const cwd = String(terminal.foreground?.cwd || terminal.cwd || '').trim();
   const where = String(terminal.labels?.where || terminal.where || '').trim();
 
-  const candidateStatuses = [
-    terminal.activity,
-    terminal.status,
-    terminal.foreground?.status,
-    terminal.foreground?.state,
-    terminal.labels?.status,
-    terminal.labels?.activity,
-  ]
-    .filter((v) => typeof v === 'string' && v.trim() !== '')
-    .map((v) => v.trim().toLowerCase());
-
-  let busy = false;
-  let blocked = false;
-  let error = false;
-  let explicitIdle = false;
-
-  if (terminal.error === true || terminal.foreground?.error === true || candidateStatuses.some((s) => ERROR_STATES.has(s))) {
-    error = true;
-  }
-  if (terminal.blocked === true || terminal.foreground?.blocked === true || candidateStatuses.some((s) => BLOCKED_STATES.has(s))) {
-    blocked = true;
-  }
-
-  if (terminal.busy === true || terminal.foreground?.busy === true) {
-    busy = true;
-  } else if (terminal.idle === false || terminal.foreground?.idle === false) {
-    busy = true;
-  } else if (candidateStatuses.some((s) => BUSY_STATES.has(s))) {
-    busy = true;
-  } else if (
-    terminal.idle === true
-    || terminal.foreground?.idle === true
-    || candidateStatuses.some((s) => IDLE_STATES.has(s))
-  ) {
-    explicitIdle = true;
-  }
-
-  const idle = live && !busy && !blocked && !error && !isBareShell && explicitIdle;
+  let activity;
+  if (ERROR_STATES.has(stateRaw)) activity = 'error';
+  else if (!live) activity = 'not_live';
+  else if (isBareShell) activity = 'shell';
+  else if (ERROR_STATES.has(status.state)) activity = 'error';
+  else if (BLOCKED_STATES.has(status.state)) activity = 'blocked';
+  else if (BUSY_STATES.has(status.state)) activity = 'working';
+  else if (IDLE_STATES.has(status.state)) activity = 'idle';
+  else activity = 'unknown';
 
   return {
     terminalId,
+    remote: address.remote,
+    machine: address.machine,
     state: stateRaw || (live ? 'live' : 'unknown'),
     live,
-    busy: live && busy,
-    blocked: live && blocked,
-    error: live && error,
-    idle,
+    activity,
+    idle: activity === 'idle',
+    busy: activity === 'working',
+    blocked: activity === 'blocked',
+    error: activity === 'error',
+    unknown: activity === 'unknown',
     agentName,
     isBareShell,
     cwd,

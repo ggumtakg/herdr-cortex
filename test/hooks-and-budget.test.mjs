@@ -350,11 +350,11 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
     store.close();
 
     // Enqueue a peer relay message for tab-c1
-    enqueueMessage(env.projectDir, 'tab-c1', {
+    enqueueMessage('tab-c1', {
       from_terminal_id: 'tab-peer',
       message: 'Please review PR #42 after compaction.',
       context_docs: ['dec-budget-0'],
-    });
+    }, { globalDir: env.globalDir });
 
     // Write a Claude transcript
     const transcriptPath = path.join(env.root, 'claude-compact.jsonl');
@@ -433,10 +433,10 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
     assert.match(clearCtxOut.hookSpecificOutput.additionalContext, /Before \/clear assistant reply/);
 
     // 5. UserPromptSubmit drains inbox for HEAD and skips subagent
-    enqueueMessage(env.projectDir, 'tab-c1', {
+    enqueueMessage('tab-c1', {
       from_terminal_id: 'tab-2',
       message: 'Urgent build alert',
-    });
+    }, { globalDir: env.globalDir });
     const subPrompt = handleClaudeUserPrompt(
       { agent_id: 'sub-9', cwd: env.projectDir },
       { terminalId: 'tab-c1', globalDir: env.globalDir },
@@ -643,10 +643,10 @@ test('hooks/antigravity: SessionStart subagent skip, PreInvocation /compact poin
     assert.deepEqual(secondCp, {});
 
     // 5. PreInvocation drains relay inbox
-    enqueueMessage(env.projectDir, 'tab-a1', {
+    enqueueMessage('tab-a1', {
       from_terminal_id: 'tab-claude',
       message: 'Cross-tab relay handoff ready',
-    });
+    }, { globalDir: env.globalDir });
     const inboxOut = handleAntigravityPreInvocation(
       {
         conversationId: 'conv-root-1',

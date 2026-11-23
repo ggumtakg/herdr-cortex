@@ -5,7 +5,7 @@ import {
   getConfigProblems,
 } from '../core/config.mjs';
 import { getSharedEmbeddingBreaker } from './breaker.mjs';
-import { listFailedEmbeddings } from './failed.mjs';
+import { GIVEN_UP_REASONS, MAX_EMBED_SERVICE_FAILURES, listFailedEmbeddings } from './failed.mjs';
 import { resolveApiKey } from './provider-util.mjs';
 import {
   GEMINI_DEFAULT_BASE_URL,
@@ -196,6 +196,42 @@ export async function resolveEmbeddingProvider(config = {}, { env = process.env,
   }
 }
 
+/**
+ * Text that is equal for two configs exactly when they select the same provider with the same settings
+ * ('' when the config selects no provider). For comparison in memory only: it can contain a configured key.
+ */
+export function embeddingSelectionKey(config, { env = process.env } = {}) {
+  const plan = planEmbeddingProvider(config, { env });
+  return plan.selected ? JSON.stringify([plan.selected.kind, plan.selected.options]) : '';
+}
+
+/**
+ * The embedding providers of a store's two tiers: { project, global } (null = that tier is not embedded).
+ * The project tier follows `store.config` (global config plus this project's `projects["<path>"]` overlay);
+ * the global tier is shared by all projects and follows `store.globalConfig` (no overlay), so projects that
+ * are configured for different providers never rebuild the shared index with alternating models.
+ * When both select the same provider with the same settings, one instance serves both.
+ * `scopes` limits which tiers are resolved.
+ */
+export async function resolveTierEmbeddingProviders(
+  store,
+  { env = process.env, fetchImpl, scopes = ['project', 'global'], resolve = resolveEmbeddingProvider } = {},
+) {
+  const out = { project: null, global: null };
+  const projectConfig = store?.config || {};
+  const globalConfig = store?.globalConfig || projectConfig;
+  const options = { env, ...(fetchImpl ? { fetchImpl } : {}) };
+
+  const wantsProject = scopes.includes('project');
+  if (wantsProject) out.project = await resolve(projectConfig, options);
+  if (scopes.includes('global')) {
+    const shared = wantsProject
+      && embeddingSelectionKey(projectConfig, { env }) === embeddingSelectionKey(globalConfig, { env });
+    out.global = shared ? out.project : await resolve(globalConfig, options);
+  }
+  return out;
+}
+
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
 function parseHost(baseUrl) {
@@ -207,26 +243,8 @@ function parseHost(baseUrl) {
   }
 }
 
-/**
- * Describe what the embedding configuration does, for display by `npm run embed`, the installer and status commands.
- * Makes no network request and never includes a key value.
- *
- * Returns {
- *   setting,       // embedding.provider as configured: none | auto | gemini | openai | ollama | onnx | "<unknown text>"
- *   provider,      // provider that will actually be used, or null when nothing is embedded
- *   enabled,       // provider !== null
- *   model,         // model name the provider will use ('' when disabled)
- *   host,          // host[:port] documents and queries are sent to; null when disabled or in-process (onnx)
- *   local,         // true when no document text leaves this machine (disabled, onnx, or a loopback host)
- *   apiKeySource,  // 'env' | 'config' | null
- *   apiKeyEnv,     // name of the environment variable that supplies the key, or null
- *   breaker,       // { open, remainingMs, cooldownMs, openedAt, lastError } of this process's circuit breaker
- *   problems,      // [{ code, message, ... }] unknown_provider | missing_api_key | invalid_base_url
- *                  //   | legacy_embedding_keys | project_embedding_ignored
- *   failedDocuments // only when `store` is given: { project: { count, ids }, global: { count, ids } }
- * }
- */
-export function describeEmbeddingStatus(config = {}, { env = process.env, breaker, store = null } = {}) {
+// What one config selects: provider, model, destination, key source, and the problems found in it.
+function describeSelection(config, env) {
   const plan = planEmbeddingProvider(config, { env });
   const selected = plan.selected;
 
@@ -261,8 +279,7 @@ export function describeEmbeddingStatus(config = {}, { env = process.env, breake
     }
   }
 
-  const activeBreaker = breaker || getSharedEmbeddingBreaker();
-  const status = {
+  return {
     setting: plan.setting,
     provider: selected ? selected.kind : null,
     enabled: Boolean(selected),
@@ -271,9 +288,62 @@ export function describeEmbeddingStatus(config = {}, { env = process.env, breake
     local,
     apiKeySource: selected ? selected.apiKeySource : null,
     apiKeyEnv: selected ? selected.apiKeyEnv : null,
+    problems,
+  };
+}
+
+/**
+ * Describe what the embedding configuration does, for display by `npm run embed`, the installer and status commands.
+ * Makes no network request and never includes a key value.
+ *
+ * Returns {
+ *   setting,       // embedding.provider as configured: none | auto | gemini | openai | ollama | onnx | "<unknown text>"
+ *   provider,      // provider that will actually be used, or null when nothing is embedded
+ *   enabled,       // provider !== null
+ *   model,         // model name the provider will use ('' when disabled)
+ *   host,          // host[:port] documents and queries are sent to; null when disabled or in-process (onnx)
+ *   local,         // true when no document text leaves this machine (disabled, onnx, or a loopback host)
+ *   apiKeySource,  // 'env' | 'config' | null
+ *   apiKeyEnv,     // name of the environment variable that supplies the key, or null
+ *   breaker,       // { open, remainingMs, cooldownMs, openedAt, lastError } of this process's circuit breaker
+ *   problems,      // [{ code, message, ... }] unknown_provider | missing_api_key | invalid_base_url
+ *                  //   | legacy_embedding_keys | project_embedding_ignored
+ *   globalTier,    // only when the global tier (memory shared by all projects) is embedded with other settings
+ *                  //   than `config` selects, i.e. when `globalConfig` (or `store.globalConfig`) differs:
+ *                  //   { setting, provider, enabled, model, host, local, apiKeySource, apiKeyEnv, problems }.
+ *                  //   The top-level fields then describe the project tier only.
+ *   failedDocuments // only when `store` is given: per tier { count, ids, documents, byReason }
+ *                  //   (see `listFailedEmbeddings`)
+ * }
+ */
+export function describeEmbeddingStatus(
+  config = {},
+  { env = process.env, breaker, store = null, globalConfig = null } = {},
+) {
+  const selection = describeSelection(config, env);
+
+  const activeBreaker = breaker || getSharedEmbeddingBreaker();
+  const { problems, ...selected } = selection;
+  const status = {
+    ...selected,
     breaker: activeBreaker.describe(),
     problems,
   };
+
+  // The global tier never takes a project's overlay; say so when that makes a difference.
+  const sharedConfig = globalConfig || store?.globalConfig || null;
+  const globalSelection = sharedConfig ? describeSelection(sharedConfig, env) : null;
+  const differs = globalSelection && (
+    globalSelection.setting !== selection.setting
+    || embeddingSelectionKey(sharedConfig, { env }) !== embeddingSelectionKey(config, { env })
+  );
+  if (differs) {
+    const known = new Set(problems.map((problem) => problem.message));
+    status.globalTier = {
+      ...globalSelection,
+      problems: globalSelection.problems.filter((problem) => !known.has(problem.message)),
+    };
+  }
 
   if (store) {
     try {
@@ -289,25 +359,34 @@ export function describeEmbeddingStatus(config = {}, { env = process.env, breake
 /**
  * Render `describeEmbeddingStatus()` output as short human-readable lines (no key values).
  */
-export function formatEmbeddingStatus(status) {
-  const lines = [];
+function formatSelection(status) {
   if (!status?.enabled) {
     const why = status?.setting === 'none'
       ? 'provider is "none"'
       : status?.setting === 'auto'
         ? 'provider is "auto" and no provider is configured'
         : `provider "${status?.setting}" is not usable`;
-    lines.push(`embedding: off (${why}); nothing is sent anywhere.`);
+    return `off (${why}); nothing is sent anywhere.`;
+  }
+  const via = status.setting === status.provider ? '' : ` (chosen by "${status.setting}")`;
+  let where;
+  if (status.provider === 'onnx') where = 'runs in this process; documents stay on this machine';
+  else if (status.local) where = `sends documents and search queries to ${status.host} (this machine)`;
+  else where = `sends documents and search queries to ${status.host || 'an unparseable URL'}`;
+  let key = '';
+  if (status.apiKeySource === 'env') key = `; API key from environment variable ${status.apiKeyEnv}`;
+  else if (status.apiKeySource === 'config') key = `; API key from embedding.${status.provider}.apiKey in config.json`;
+  return `${status.provider}${via}, model ${status.model}; ${where}${key}.`;
+}
+
+export function formatEmbeddingStatus(status) {
+  const lines = [];
+  if (status?.globalTier) {
+    // Two providers in play: this project's memory follows its own settings, the shared global memory does not.
+    lines.push(`embedding (this project's memory): ${formatSelection(status)}`);
+    lines.push(`embedding (global memory, shared by all projects): ${formatSelection(status.globalTier)}`);
   } else {
-    const via = status.setting === status.provider ? '' : ` (chosen by "${status.setting}")`;
-    let where;
-    if (status.provider === 'onnx') where = 'runs in this process; documents stay on this machine';
-    else if (status.local) where = `sends documents and search queries to ${status.host} (this machine)`;
-    else where = `sends documents and search queries to ${status.host || 'an unparseable URL'}`;
-    let key = '';
-    if (status.apiKeySource === 'env') key = `; API key from environment variable ${status.apiKeyEnv}`;
-    else if (status.apiKeySource === 'config') key = `; API key from embedding.${status.provider}.apiKey in config.json`;
-    lines.push(`embedding: ${status.provider}${via}, model ${status.model}; ${where}${key}.`);
+    lines.push(`embedding: ${formatSelection(status)}`);
   }
 
   if (status?.breaker?.open) {
@@ -326,12 +405,27 @@ export function formatEmbeddingStatus(status) {
           `embedding gave up on ${entry.count} ${scope} document(s) after repeated failures: ${shown}${more} `
           + '(retry with: npm run embed -- --retry-failed)',
         );
+        const serviceCount = entry.byReason?.[GIVEN_UP_REASONS.service] || 0;
+        if (serviceCount > 0) {
+          const serviceIds = (entry.documents || [])
+            .filter((doc) => doc.reason === GIVEN_UP_REASONS.service)
+            .map((doc) => doc.id)
+            .slice(0, 10)
+            .join(', ');
+          lines.push(
+            `  ${serviceCount} of them because the embedding service failed ${MAX_EMBED_SERVICE_FAILURES} times `
+            + `on the same document (timeout, network or server error)${serviceIds ? `: ${serviceIds}` : ''}`,
+          );
+        }
       }
     }
   }
 
   for (const problem of status?.problems || []) {
     lines.push(`embedding config problem: ${problem.message}`);
+  }
+  for (const problem of status?.globalTier?.problems || []) {
+    lines.push(`embedding config problem (global memory): ${problem.message}`);
   }
   return lines;
 }

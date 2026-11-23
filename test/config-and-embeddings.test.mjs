@@ -7,6 +7,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 
 import {
   DEFAULT_CONFIG,
@@ -19,9 +20,11 @@ import {
   sanitizeProjectConfig,
 } from '../src/core/config.mjs';
 import { CortexStore } from '../src/core/store.mjs';
+import { readIndexMeta } from '../src/core/db.mjs';
 import { searchMemory } from '../src/core/search.mjs';
 import {
   MAX_EMBED_ATTEMPTS,
+  MAX_EMBED_SERVICE_FAILURES,
   classifyEmbeddingError,
   createEmbeddingBreaker,
   createEmbeddingQueue,
@@ -64,6 +67,8 @@ globalThis.fetch = (input, init) => {
 };
 
 const PROMPTS_DIR = path.join(REPO_ROOT, 'prompts');
+// What listFailedEmbeddings reports for a tier with no given-up document.
+const NO_FAILED_DOCUMENTS = { count: 0, ids: [], documents: [], byReason: { document_errors: 0, service_failures: 0 } };
 const EMBEDDING_ENV_NAMES = ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENAI_API_KEY', 'OLLAMA_HOST'];
 
 function makeTempEnv(prefix = 'herdr-cortex-emb-') {
@@ -220,9 +225,9 @@ function fakeResponse(status, body) {
 }
 
 /**
- * Local stand-in for an Ollama server: answers POST /api/embed with one vector per input.
+ * Local stand-in for an Ollama server: answers POST /api/embed with one vector (`vector`) per input.
  */
-async function startStubEmbedServer() {
+async function startStubEmbedServer({ vector = [1, 0, 0, 0] } = {}) {
   const requests = [];
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -237,7 +242,7 @@ async function startStubEmbedServer() {
       requests.push({ method: req.method, url: req.url, headers: req.headers, body });
       const inputs = Array.isArray(body.input) ? body.input : [];
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ embeddings: inputs.map(() => [1, 0, 0, 0]) }));
+      res.end(JSON.stringify({ embeddings: inputs.map(() => vector) }));
     });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -1196,7 +1201,7 @@ test('embed_attempts: an outage never counts against documents; only document-sp
     const noted = ids.map((id) => embedRow(store, 'project', id)).filter((row) => row.embed_status === 'error');
     assert.ok(noted.length >= 1);
     assert.match(noted[0].embed_error, /Fake embedding failed|fetch failed|timeout/);
-    assert.deepEqual(listFailedEmbeddings(store, { scope: 'project' }).project, { count: 0, ids: [] });
+    assert.deepEqual(listFailedEmbeddings(store, { scope: 'project' }).project, NO_FAILED_DOCUMENTS);
 
     // 401/403 are not the document's fault either
     provider.state.mode = '403';
@@ -1495,7 +1500,7 @@ test('given-up documents: counted with ids per tier in the status function and t
     saveNote(store, 'stuck-g1', { scope: 'global' });
     saveNote(store, 'stuck-but-superseded', { status: 'superseded' });
 
-    assert.deepEqual(listFailedEmbeddings(store), { project: { count: 0, ids: [] }, global: { count: 0, ids: [] } });
+    assert.deepEqual(listFailedEmbeddings(store), { project: NO_FAILED_DOCUMENTS, global: NO_FAILED_DOCUMENTS });
 
     const rejecting = makeProvider();
     rejecting.state.mode = '400';
@@ -1506,7 +1511,13 @@ test('given-up documents: counted with ids per tier in the status function and t
     const failed = listFailedEmbeddings(store);
     assert.equal(failed.project.count, 2);
     assert.deepEqual([...failed.project.ids].sort(), ['stuck-p1', 'stuck-p2']);
-    assert.deepEqual(failed.global, { count: 1, ids: ['stuck-g1'] });
+    assert.deepEqual(failed.global, {
+      count: 1,
+      ids: ['stuck-g1'],
+      documents: [{ id: 'stuck-g1', reason: 'document_errors', error: 'Fake embedding failed (400)' }],
+      byReason: { document_errors: 1, service_failures: 0 },
+    });
+    assert.deepEqual(failed.project.byReason, { document_errors: 2, service_failures: 0 });
     assert.deepEqual(Object.keys(listFailedEmbeddings(store, { scope: 'global' })), ['global']);
     assert.deepEqual(listFailedEmbeddings(store, { scope: 'project', maxIds: 1 }).project.ids.length, 1);
     assert.equal(listFailedEmbeddings(store, { scope: 'project', maxIds: 1 }).project.count, 2);
@@ -1543,7 +1554,7 @@ test('given-up documents: counted with ids per tier in the status function and t
     assert.deepEqual(retried.retryReset, { project: 2, global: 1 });
     assert.equal(retried.processed, 3);
     assert.equal(retried.errors, 0);
-    assert.deepEqual(retried.failedDocuments, { project: { count: 0, ids: [] }, global: { count: 0, ids: [] } });
+    assert.deepEqual(retried.failedDocuments, { project: NO_FAILED_DOCUMENTS, global: NO_FAILED_DOCUMENTS });
     assert.deepEqual(JSON.parse(stdout.text), retried);
     assert.equal(process.exitCode, 0);
 
@@ -1867,6 +1878,398 @@ test('MCP server: instructions mention supersedes for memory_update, and non-obj
     assert.equal(JSON.parse(unknownArg.result.content[0].text).error, 'UNKNOWN_ARGUMENT');
   } finally {
     store.close();
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// A document that keeps making the service fail is given up on in the end
+// ---------------------------------------------------------------------------------------------
+
+function serviceFailures(store, scope, id) {
+  return store.getTier(scope).db
+    .prepare('SELECT embed_service_failures FROM docs WHERE id = ?')
+    .get(id).embed_service_failures;
+}
+
+test('service-side failures are counted per document, apart from embed_attempts: after 10 on the same document it is given up on, listed with its reason, and --retry-failed resets it', async () => {
+  const env = makeTempEnv('cortex-emb-service-failures-');
+  const prevExitCode = process.exitCode;
+  let store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  try {
+    assert.equal(MAX_EMBED_SERVICE_FAILURES, 10);
+
+    saveNote(store, 'healthy-1');
+    saveNote(store, 'healthy-2');
+    // The newest document is tried first; this one makes the service answer 503 every time
+    saveNote(store, 'poison', { content: 'POISON-TEXT that the service chokes on' });
+    assert.equal(serviceFailures(store, 'project', 'poison'), 0);
+
+    const provider = makeProvider();
+    provider.state.mode = (texts) => (texts.join('\n').includes('POISON-TEXT') ? '503' : 'ok');
+    // No pause between runs: every call below stands for "the next breaker window"
+    const breaker = createEmbeddingBreaker({ cooldownMs: 0 });
+    const run = () => processPendingEmbeddings(store, { scope: 'project', provider, breaker });
+
+    // Run 1: the poison document fails first and stops the run
+    const first = await run();
+    assert.equal(first.reason, 'service_unavailable');
+    assert.equal(first.processed, 0);
+    assert.equal(serviceFailures(store, 'project', 'poison'), 1);
+    assert.equal(embedRow(store, 'project', 'poison').embed_attempts, 0, 'not counted as the document\'s own failure');
+
+    // Run 2: having failed, it now waits behind the others, which are embedded
+    const second = await run();
+    assert.equal(second.processed, 2);
+    assert.equal(second.reason, 'service_unavailable');
+    assert.equal(serviceFailures(store, 'project', 'poison'), 2);
+    assert.equal(embedRow(store, 'project', 'healthy-1').embed_status, 'ready');
+    assert.equal(serviceFailures(store, 'project', 'healthy-1'), 0);
+
+    // A change that leaves the text alone keeps the count
+    store.updateDoc({ id: 'poison', tags: ['still-the-same-text'] });
+    assert.equal(serviceFailures(store, 'project', 'poison'), 2);
+
+    for (let n = 3; n <= MAX_EMBED_SERVICE_FAILURES; n++) {
+      assert.deepEqual(listFailedEmbeddings(store, { scope: 'project' }).project, NO_FAILED_DOCUMENTS, `not given up before failure ${n}`);
+      const res = await run();
+      assert.equal(res.reason, 'service_unavailable', `run ${n}`);
+      assert.equal(serviceFailures(store, 'project', 'poison'), n);
+    }
+    assert.deepEqual(embedRow(store, 'project', 'poison'), {
+      embed_status: 'error',
+      embed_attempts: 0,
+      embed_error: 'Fake embedding failed (503)',
+    });
+
+    // Given up: the next runs do not touch it, so it no longer re-opens the breaker
+    const callsBefore = provider.state.calls;
+    const after = await run();
+    assert.equal(provider.state.calls, callsBefore);
+    assert.equal(after.errors, 0);
+    assert.equal(after.circuitBroken, false);
+    assert.equal('reason' in after, false);
+
+    // Listed with a reason that tells it apart from a document that failed on its own
+    saveNote(store, 'rejected', { content: 'REJECT-ME says the service with a 400' });
+    provider.state.mode = (texts) => (texts.join('\n').includes('REJECT-ME') ? '400' : 'ok');
+    for (let i = 0; i < MAX_EMBED_ATTEMPTS; i++) await run();
+    const failed = listFailedEmbeddings(store, { scope: 'project' }).project;
+    assert.equal(failed.count, 2);
+    assert.deepEqual(failed.byReason, { document_errors: 1, service_failures: 1 });
+    assert.deepEqual(
+      [...failed.documents].sort((a, b) => a.id.localeCompare(b.id)),
+      [
+        { id: 'poison', reason: 'service_failures', error: 'Fake embedding failed (503)' },
+        { id: 'rejected', reason: 'document_errors', error: 'Fake embedding failed (400)' },
+      ],
+    );
+    const lines = formatEmbeddingStatus(describeEmbeddingStatus(store.config, { env: {}, breaker, store })).join('\n');
+    assert.match(lines, /embedding gave up on 2 project document\(s\) after repeated failures/);
+    assert.match(lines, /1 of them because the embedding service failed 10 times on the same document \(timeout, network or server error\): poison/);
+
+    // New content gives the document a fresh start ...
+    store.updateDoc({ id: 'poison', content: 'POISON-TEXT, edited but still poisonous' });
+    assert.equal(serviceFailures(store, 'project', 'poison'), 0);
+    assert.equal(listFailedEmbeddings(store, { scope: 'project' }).project.byReason.service_failures, 0);
+    provider.state.mode = (texts) => (texts.join('\n').includes('POISON-TEXT') ? 'timeout' : 'ok');
+    await run();
+    assert.equal(serviceFailures(store, 'project', 'poison'), 1);
+    // ... and so does a successful embedding
+    provider.state.mode = 'ok';
+    saveNote(store, 'flaky', { content: 'Body of a document that failed a few times during an outage' });
+    store.getTier('project').db.prepare("UPDATE docs SET embed_service_failures = 4, embed_status = 'error' WHERE id = 'flaky'").run();
+    await run();
+    assert.equal(embedRow(store, 'project', 'flaky').embed_status, 'ready');
+    assert.equal(serviceFailures(store, 'project', 'flaky'), 0);
+    assert.equal(embedRow(store, 'project', 'poison').embed_status, 'ready');
+
+    // --retry-failed resets a document given up for this reason too
+    store.getTier('project').db
+      .prepare("UPDATE docs SET embed_service_failures = 10, embed_status = 'error', embed_error = 'Fake embedding failed (503)' WHERE id = 'poison'")
+      .run();
+    store.getTier('project').db.prepare("DELETE FROM doc_chunks_vec WHERE doc_id = 'poison'").run();
+    assert.equal(listFailedEmbeddings(store, { scope: 'project' }).project.byReason.service_failures, 1);
+    store.close();
+    store = null;
+
+    const working = makeProvider();
+    process.exitCode = 0;
+    const plain = await runEmbedCli(
+      ['--project', env.projectDir, '--global', env.globalDir],
+      { provider: working, env: {}, stdout: makeSink(), stderr: makeSink() },
+    );
+    assert.deepEqual(plain.failedDocuments.project.byReason, { document_errors: 1, service_failures: 1 });
+    assert.equal(plain.failedDocuments.project.documents.find((doc) => doc.id === 'poison').reason, 'service_failures');
+    assert.equal(working.state.calls, 0);
+
+    const retried = await runEmbedCli(
+      ['--project', env.projectDir, '--global', env.globalDir, '--retry-failed'],
+      { provider: working, env: {}, stdout: makeSink(), stderr: makeSink() },
+    );
+    assert.deepEqual(retried.retryReset, { project: 2, global: 0 });
+    assert.equal(retried.processed, 2);
+    assert.deepEqual(retried.failedDocuments.project, NO_FAILED_DOCUMENTS);
+
+    store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+    assert.equal(serviceFailures(store, 'project', 'poison'), 0);
+    assert.equal(embedRow(store, 'project', 'poison').embed_status, 'ready');
+
+    // --- An index created before this column existed gets it on open ---
+    const dbPath = store.getTier('project').dbPath;
+    store.close();
+    store = null;
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('ALTER TABLE docs DROP COLUMN embed_service_failures;');
+    assert.equal(raw.prepare('PRAGMA table_info(docs)').all().some((col) => col.name === 'embed_service_failures'), false);
+    raw.close();
+    store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+    assert.equal(serviceFailures(store, 'project', 'poison'), 0);
+    saveNote(store, 'after-migration');
+    assert.equal((await processPendingEmbeddings(store, { scope: 'project', provider: working })).processed, 1);
+  } finally {
+    process.exitCode = prevExitCode;
+    if (store) store.close();
+    env.cleanup();
+  }
+});
+
+test('a long outage is not charged to one document: service failures rotate over the waiting documents', async () => {
+  const env = makeTempEnv('cortex-emb-outage-spread-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+  try {
+    const ids = ['wait-a', 'wait-b', 'wait-c'];
+    for (const id of ids) saveNote(store, id);
+    const provider = makeProvider();
+    provider.state.mode = 'network';
+    const breaker = createEmbeddingBreaker({ cooldownMs: 0 });
+
+    // 18 windows of an outage: more than the per-document limit, spread over three documents
+    for (let window = 0; window < 18; window++) {
+      const res = await processPendingEmbeddings(store, { scope: 'project', provider, breaker });
+      assert.equal(res.reason, 'service_unavailable');
+    }
+    assert.deepEqual(ids.map((id) => serviceFailures(store, 'project', id)), [6, 6, 6]);
+    assert.deepEqual(listFailedEmbeddings(store, { scope: 'project' }).project, NO_FAILED_DOCUMENTS);
+
+    provider.state.mode = 'ok';
+    const back = await processPendingEmbeddings(store, { scope: 'project', provider, breaker });
+    assert.equal(back.processed, 3);
+    assert.deepEqual(ids.map((id) => serviceFailures(store, 'project', id)), [0, 0, 0]);
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// The global tier always uses the global embedding settings
+// ---------------------------------------------------------------------------------------------
+
+test('global tier embedding: follows the global settings only; per-project settings embed and search that project\'s tier, and a second project never rebuilds the shared index', async () => {
+  const env = makeTempEnv('cortex-emb-tiers-');
+  const prevExitCode = process.exitCode;
+  // Three stand-in Ollama servers with different vector sizes: a query vector of the wrong provider
+  // could not match anything in the other provider's index
+  const stubX = await startStubEmbedServer({ vector: [1, 0, 0, 0] });
+  const stubY = await startStubEmbedServer({ vector: [0, 1, 0] });
+  const stubZ = await startStubEmbedServer({ vector: [0, 0, 1, 0, 0] });
+  const runtimes = [];
+  try {
+    const projA = env.projectDir;
+    const projB = path.join(env.root, 'project-b');
+    const projC = path.join(env.root, 'project-c');
+    for (const dir of [projB, projC]) {
+      fs.mkdirSync(dir, { recursive: true });
+      approveProject(dir, { globalDir: env.globalDir });
+    }
+    writeGlobalConfig(env, {
+      embedding: { provider: 'ollama', ollama: { baseUrl: stubY.url, model: 'model-y' } },
+      projects: {
+        [projA]: { embedding: { ollama: { baseUrl: stubX.url, model: 'model-x' } } },
+        [projB]: { embedding: { ollama: { baseUrl: stubZ.url, model: 'model-z' } } },
+      },
+    });
+
+    const startRuntime = (projectDir) => {
+      const runtime = createServerRuntime({
+        projectDir,
+        globalDir: env.globalDir,
+        promptsDir: PROMPTS_DIR,
+        embeddingBreaker: createEmbeddingBreaker(),
+        queueDebounceMs: 5,
+        input: new PassThrough(),
+        output: new PassThrough(),
+      });
+      runtimes.push(runtime);
+      return runtime;
+    };
+    const call = async (runtime, name, args) => {
+      const resp = await runtime.server.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } });
+      assert.ok(!resp.result.isError, resp.result.content[0].text);
+      return JSON.parse(resp.result.content[0].text);
+    };
+    const isReady = (store, scope, id) => embedRow(store, scope, id)?.embed_status === 'ready';
+    const inputsOf = (stub) => stub.requests.flatMap((req) => req.body.input);
+    const modelsOf = (stub) => [...new Set(stub.requests.map((req) => req.body.model))];
+    const globalMeta = (store) => {
+      const meta = readIndexMeta(store.getTier('global').db);
+      return { model: meta.embedModel, dimensions: meta.dimensions };
+    };
+
+    // --- Project A (model-x): its documents go to X, the global document goes to Y ---
+    const runtimeA = startRuntime(projA);
+    await call(runtimeA, 'memory_save', { id: 'a-doc', type: 'knowledge', title: 'Alpha note', summary: 'Harbor logistics in project A', content: 'ALPHA-PROJECT-BODY' });
+    await call(runtimeA, 'memory_save', { id: 'g-doc', scope: 'global', type: 'knowledge', title: 'Shared note', summary: 'A preference shared by all projects', content: 'GLOBAL-SHARED-BODY' });
+    await waitFor(() => isReady(runtimeA.store, 'project', 'a-doc') && isReady(runtimeA.store, 'global', 'g-doc'), { label: 'project A embedded' });
+
+    assert.deepEqual(modelsOf(stubX), ['model-x']);
+    assert.deepEqual(modelsOf(stubY), ['model-y']);
+    assert.ok(inputsOf(stubX).some((text) => text.includes('ALPHA-PROJECT-BODY')));
+    assert.equal(inputsOf(stubX).some((text) => text.includes('GLOBAL-SHARED-BODY')), false, 'the global document never went to the project\'s provider');
+    assert.ok(inputsOf(stubY).some((text) => text.includes('GLOBAL-SHARED-BODY')));
+    assert.equal(inputsOf(stubY).some((text) => text.includes('ALPHA-PROJECT-BODY')), false);
+    assert.deepEqual(globalMeta(runtimeA.store), { model: 'model-y', dimensions: 3 });
+    assert.equal(readIndexMeta(runtimeA.store.getTier('project').db).embedModel, 'model-x');
+    assert.equal(readIndexMeta(runtimeA.store.getTier('project').db).dimensions, 4);
+    assert.equal(stubZ.requests.length, 0);
+
+    // A search embeds the query once with each tier's provider and gets vector hits from both tiers
+    // (the query shares no word with either document, so every hit is a vector hit)
+    const beforeX = stubX.requests.length;
+    const beforeY = stubY.requests.length;
+    const foundA = await call(runtimeA, 'memory_search', { query: 'zzqx-unrelated-words', scope: 'all' });
+    assert.equal(foundA.vectorUsed, true);
+    assert.equal('vectorSkipped' in foundA, false);
+    assert.deepEqual(foundA.results.map((r) => `${r.scope}:${r.id}`).sort(), ['global:g-doc', 'project:a-doc']);
+    assert.deepEqual(stubX.requests.slice(beforeX).map((req) => req.body.input), [['zzqx-unrelated-words']]);
+    assert.deepEqual(stubY.requests.slice(beforeY).map((req) => req.body.input), [['zzqx-unrelated-words']]);
+
+    // Status and `npm run embed` name both providers when they differ
+    const statusA = describeEmbeddingStatus(runtimeA.store.config, { env: {}, breaker: createEmbeddingBreaker(), store: runtimeA.store });
+    assert.equal(statusA.model, 'model-x');
+    assert.equal(statusA.host, new URL(stubX.url).host);
+    assert.deepEqual(
+      { provider: statusA.globalTier.provider, model: statusA.globalTier.model, host: statusA.globalTier.host, local: statusA.globalTier.local },
+      { provider: 'ollama', model: 'model-y', host: new URL(stubY.url).host, local: true },
+    );
+    const statusLines = formatEmbeddingStatus(statusA);
+    assert.match(statusLines[0], /^embedding \(this project's memory\): ollama, model model-x; /);
+    assert.match(statusLines[1], /^embedding \(global memory, shared by all projects\): ollama, model model-y; /);
+    await runtimeA.shutdown();
+
+    const stderrA = makeSink();
+    process.exitCode = 0;
+    const summaryA = await runEmbedCli(['--project', projA, '--global', env.globalDir], { env: {}, stdout: makeSink(), stderr: stderrA });
+    assert.equal(summaryA.errors, 0);
+    assert.equal(summaryA.model, 'model-x');
+    assert.deepEqual(
+      { project: summaryA.tiers.project.model, global: summaryA.tiers.global.model },
+      { project: 'model-x', global: 'model-y' },
+    );
+    assert.equal(summaryA.tiers.project.sendsTo, new URL(stubX.url).host);
+    assert.equal(summaryA.tiers.global.sendsTo, new URL(stubY.url).host);
+    assert.deepEqual(summaryA.rebuiltTiers, []);
+    assert.match(stderrA.text, /embedding \(this project's memory\): ollama, model model-x/);
+    assert.match(stderrA.text, /embedding \(global memory, shared by all projects\): ollama, model model-y/);
+
+    // --- Project B (model-z) opens the same global store: the shared index is left as it is ---
+    const yDocumentRequests = stubY.requests.length;
+    const runtimeB = startRuntime(projB);
+    await call(runtimeB, 'memory_save', { id: 'b-doc', type: 'knowledge', title: 'Beta note', summary: 'Harbor logistics in project B', content: 'BETA-PROJECT-BODY' });
+    await waitFor(() => isReady(runtimeB.store, 'project', 'b-doc'), { label: 'project B embedded' });
+    await runtimeB.embeddingQueue.whenIdle();
+
+    assert.deepEqual(modelsOf(stubZ), ['model-z']);
+    assert.ok(inputsOf(stubZ).some((text) => text.includes('BETA-PROJECT-BODY')));
+    assert.equal(inputsOf(stubZ).some((text) => text.includes('GLOBAL-SHARED-BODY')), false, 'project B\'s provider did not re-embed the global document');
+    assert.deepEqual(globalMeta(runtimeB.store), { model: 'model-y', dimensions: 3 }, 'the global vector table was not rebuilt');
+    assert.equal(isReady(runtimeB.store, 'global', 'g-doc'), true);
+    assert.equal(vectorCount(runtimeB.store, 'global', 'g-doc'), 1);
+    assert.equal(stubY.requests.length, yDocumentRequests, 'nothing was embedded again for the global tier');
+
+    const foundB = await call(runtimeB, 'memory_search', { query: 'zzqx-unrelated-words', scope: 'all' });
+    assert.equal(foundB.vectorUsed, true);
+    assert.deepEqual(foundB.results.map((r) => `${r.scope}:${r.id}`).sort(), ['global:g-doc', 'project:b-doc']);
+    await runtimeB.shutdown();
+
+    // --- Project C has no settings of its own: one provider serves both tiers, one query embedding ---
+    const runtimeC = startRuntime(projC);
+    await call(runtimeC, 'memory_save', { id: 'c-doc', type: 'knowledge', title: 'Gamma note', summary: 'Harbor logistics in project C', content: 'GAMMA-PROJECT-BODY' });
+    await waitFor(() => isReady(runtimeC.store, 'project', 'c-doc'), { label: 'project C embedded' });
+    const providersC = await runtimeC.getEmbeddingProviders();
+    assert.equal(providersC.project, providersC.global, 'the same provider instance for both tiers');
+    const statusC = describeEmbeddingStatus(runtimeC.store.config, { env: {}, breaker: createEmbeddingBreaker(), store: runtimeC.store });
+    assert.equal('globalTier' in statusC, false);
+    assert.match(formatEmbeddingStatus(statusC)[0], /^embedding: ollama, model model-y; /);
+    const beforeQueryC = stubY.requests.length;
+    const foundC = await call(runtimeC, 'memory_search', { query: 'zzqx-unrelated-words', scope: 'all' });
+    assert.deepEqual(foundC.results.map((r) => `${r.scope}:${r.id}`).sort(), ['global:g-doc', 'project:c-doc']);
+    assert.equal(stubY.requests.length - beforeQueryC, 1, 'the query vector is reused for the second tier');
+
+    // --- The same through the library calls, with injected providers per tier ---
+    const fakeX = makeProvider({ name: 'fake-x', model: 'fake-x-v1', dimensions: 4 });
+    const fakeY = makeProvider({ name: 'ollama', model: 'model-y', dimensions: 3 });
+    fakeY.embed = async (texts) => {
+      fakeY.state.calls++;
+      fakeY.state.texts.push(texts);
+      if (fakeY.state.mode !== 'ok') throw makeFailure(fakeY.state.mode);
+      return texts.map(() => new Float32Array([0, 1, 0]));
+    };
+    await call(runtimeC, 'memory_save', { id: 'g-doc-2', scope: 'global', type: 'knowledge', title: 'Second shared note', summary: 'Another shared preference', content: 'GLOBAL-SECOND-BODY' });
+    await waitFor(() => isReady(runtimeC.store, 'global', 'g-doc-2'), { label: 'second global document embedded' });
+    await runtimeC.shutdown();
+
+    const store = new CortexStore({ projectDir: projC, globalDir: env.globalDir });
+    try {
+      saveNote(store, 'c-doc-2');
+      saveNote(store, 'g-doc-3', { scope: 'global' });
+      const res = await processPendingEmbeddings(store, { scope: 'all', providers: { project: fakeX, global: fakeY } });
+      assert.deepEqual(res.rebuiltTiers, ['project'], 'only the tier whose provider changed is rebuilt');
+      assert.deepEqual(
+        { project: [res.tiers.project.provider, res.tiers.project.model, res.tiers.project.processed], global: [res.tiers.global.provider, res.tiers.global.model, res.tiers.global.processed] },
+        { project: ['fake-x', 'fake-x-v1', 2], global: ['ollama', 'model-y', 1] },
+      );
+      assert.equal(fakeY.state.texts.flat().some((text) => text.includes('c-doc')), false);
+      assert.equal(fakeX.state.texts.flat().some((text) => text.includes('g-doc')), false);
+
+      // A tier without a provider is skipped, the other one is still served
+      saveNote(store, 'g-doc-4', { scope: 'global' });
+      saveNote(store, 'c-doc-3');
+      const partial = await processPendingEmbeddings(store, { scope: 'all', providers: { project: null, global: fakeY } });
+      assert.equal(partial.processed, 1);
+      assert.equal(embedRow(store, 'project', 'c-doc-3').embed_status, 'pending');
+      assert.equal((await processPendingEmbeddings(store, { scope: 'all', providers: { project: null, global: null } })).reason, 'no_provider');
+
+      // Search: one failing provider does not take the other tier's vector hits away
+      fakeX.state.calls = 0;
+      fakeY.state.calls = 0;
+      const both = await searchMemory(store, { query: 'zzqx-unrelated-words', scope: 'all', embeddingProviders: { project: fakeX, global: fakeY } });
+      assert.equal(both.vectorUsed, true);
+      assert.deepEqual([fakeX.state.calls, fakeY.state.calls], [1, 1]);
+      assert.ok(both.results.some((r) => r.scope === 'project') && both.results.some((r) => r.scope === 'global'));
+
+      fakeX.state.mode = '503';
+      const half = await searchMemory(store, { query: 'zzqx-unrelated-words', scope: 'all', embeddingProviders: { project: fakeX, global: fakeY } });
+      assert.equal(half.vectorSkipped, 'embedding_error');
+      assert.equal(half.vectorUsed, true);
+      assert.deepEqual([...new Set(half.results.map((r) => r.scope))], ['global']);
+      fakeX.state.mode = 'ok';
+
+      // A tier whose index was built with another model gets no vector search from the wrong provider
+      const wrong = makeProvider({ name: 'fake-w', model: 'fake-w-v1', dimensions: 4 });
+      const mismatched = await searchMemory(store, { query: 'zzqx-unrelated-words', scope: 'project', embeddingProvider: wrong });
+      assert.equal(mismatched.vectorUsed, false);
+      assert.equal(wrong.state.calls, 0);
+    } finally {
+      store.close();
+    }
+
+    assert.deepEqual(blockedFetches, []);
+  } finally {
+    process.exitCode = prevExitCode;
+    for (const runtime of runtimes) await runtime.shutdown();
+    await Promise.all([stubX.close(), stubY.close(), stubZ.close()]);
     env.cleanup();
   }
 });

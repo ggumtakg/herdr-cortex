@@ -4,8 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
-import { atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
+import { REPO_ROOT, atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
 import { CortexStore } from '../src/core/store.mjs';
 import {
   EXCLUDED_SERVER_INSTRUCTIONS,
@@ -13,18 +15,44 @@ import {
   createMcpServer,
 } from '../src/mcp/server.mjs';
 import { recordSession } from '../src/revive/tracker.mjs';
-import { createHcClient, sanitizeSingleLineTrigger } from '../src/relay/hc.mjs';
 import {
+  createHcClient,
+  detectTerminalActivity,
+  parseTerminalAddress,
+  sanitizeSingleLineTrigger,
+} from '../src/relay/hc.mjs';
+import {
+  INBOX_LOCK_FILE,
+  INBOX_PREVIEW_MAX_CHARS,
   ackMessage,
+  countPendingMessages,
+  deliverInboxForHook,
   drainInbox,
   enqueueMessage,
   formatInboxForHook,
   formatInboxForHookDetailed,
+  formatLongMessageNotice,
+  getLegacyProjectInboxDir,
   getTerminalInboxDir,
   peekInbox,
 } from '../src/relay/inbox.mjs';
+import { handleClaudeSessionStart, handleClaudeUserPrompt } from '../src/hooks/claude.mjs';
+import { handleAntigravityPreInvocation } from '../src/hooks/antigravity.mjs';
 import { approveProject } from '../src/core/trust.mjs';
 import { UNTRUSTED_MEMORY_PREAMBLE } from '../src/core/budget.mjs';
+
+// Safety net: anything in this file that forgets to pass its temp `globalDir` (or the legacy revive home)
+// lands in a throw-away folder, never in the real home directory.
+const FALLBACK_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-cortex-relay-home-'));
+process.env.HERDR_CORTEX_TEST_HOME = FALLBACK_HOME;
+delete process.env.HERDR_CORTEX_HOME;
+process.on('exit', () => {
+  try {
+    fs.rmSync(FALLBACK_HOME, { recursive: true, force: true });
+  } catch {
+    // best effort
+  }
+});
 
 // The fake `execFileSync` of these tests never starts a process; an absolute `hcBin` is used as is, so the
 // client does not look for a real `hc` on PATH.
@@ -36,133 +64,239 @@ function makeTempEnv(prefix = 'herdr-cortex-relay-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const projectDir = path.join(root, 'project');
   const globalDir = path.join(root, 'global');
-  fs.mkdirSync(projectDir, { recursive: true });
-  fs.mkdirSync(globalDir, { recursive: true });
+  const homeDir = path.join(root, 'home');
+  const promptsDir = path.join(root, 'prompts');
+  for (const dir of [projectDir, globalDir, homeDir, promptsDir]) fs.mkdirSync(dir, { recursive: true });
+  atomicWriteText(path.join(promptsDir, 'HEAD_CORE.md'), '# HEAD_CORE\n\n- Delegate high-resolution work.\n');
   // The project folder of every test environment is approved, as a user would do with cortex-trust.
   approveProject(projectDir, { globalDir });
   return {
     root,
     projectDir,
     globalDir,
+    homeDir,
+    promptsDir,
     cleanup() {
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
 }
 
-test('relay/inbox: terminalId validation, FIFO enqueue/peek, .taking-<pid> claim/ack, stale crash recovery, and .broken/ quarantine', () => {
-  const env = makeTempEnv();
-  try {
-    // 1. Strict terminalId validation blocks traversal, leading dash option injection, and reserved Windows names
-    for (const badId of ['../escape', 'tab/1', 'tab\\1', '-flag', '--json', '_lead', 'CON', 'nul', 'a'.repeat(65), '']) {
-      assert.throws(() => enqueueMessage(env.projectDir, badId, { message: 'x' }), /Invalid terminalId/);
-    }
+// ---------------------------------------------------------------------------------------------
+// `hc` 0.1.21 output, in the shapes captured from a real installation (paths and labels are stand-ins).
+//   hc ls --json : rows with `status` as a plain string, absent for a bare shell; `agent` is the app name
+//                  of an agent tab and the shell's executable name for a bare shell; a tab on another
+//                  machine has an address like "pc2/t3".
+//   hc get --json: `status` is an object { app, state, msg? } for an agent tab and null for a bare shell.
+// ---------------------------------------------------------------------------------------------
 
-    // 2. Enqueue two messages atomically and peek non-destructively
-    const m1 = enqueueMessage(env.projectDir, 'tab-2', {
+const REAL_HC_LS = {
+  hidden_finished: 1,
+  machines: [{ name: 'pc2', state: 'connected' }],
+  terminals: [
+    { address: 't1', agent: 'claude-code', cwd: 'C:\\Users\\dev', state: 'live', status: 'working', turn: 50, where: '작업 / 1' },
+    { address: 't2', agent: 'powershell.exe', cwd: 'C:\\Users\\dev\\Desktop\\작업', state: 'live', turn: 0, where: '작업 / 2' },
+    { address: 'pc2/t3', agent: 'claude-code', cwd: 'C:\\Users\\other', state: 'live', status: 'idle', turn: 1, where: 'projects / Claude Code' },
+  ],
+};
+
+function hcLsRow({ address, agent = 'claude-code', cwd = 'C:\\Users\\dev', status, state = 'live', turn = 1, where = 'work / 1' }) {
+  return { address, agent, cwd, state, ...(status ? { status } : {}), turn, where };
+}
+
+// `hc get <id> --json` of an agent tab. `status` may be overridden to model output this code cannot interpret.
+function hcGetAgent({ address, cwd = 'C:\\Users\\dev', statusState = 'idle', msg, state = 'live', status, where = 'work / 1' }) {
+  return {
+    address,
+    cwd: 'C:\\Users\\dev',
+    foreground: { argv: ['C:\\Users\\dev\\.local\\bin\\claude.exe'], cwd, name: 'claude.exe', pid: 9432 },
+    labels: { where },
+    state,
+    status: status !== undefined
+      ? status
+      : { app: 'claude-code', ...(msg ? { msg } : {}), state: statusState },
+  };
+}
+
+function hcGetShell({ address, cwd = 'C:\\Users\\dev', where = 'work / 2' }) {
+  return {
+    address,
+    cwd,
+    foreground: {
+      argv: ['C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '-NoExit'],
+      cwd,
+      name: 'powershell.exe',
+      pid: 7120,
+    },
+    labels: { where },
+    state: 'live',
+    status: null,
+  };
+}
+
+/**
+ * An hc client whose `hc` is a table: `ls` (object or function) answers `hc ls --json`, `get[id]` answers
+ * `hc get <id> --json`. Every call is recorded in `calls`; `sent` lists the `hc send` calls
+ * ({ ifCond, to, trigger }). `rejectIfFlag` makes `hc send --if` fail like an hc that does not know the flag.
+ */
+function makeFakeHc({ ls = { terminals: [] }, get = {} } = {}) {
+  const state = { calls: [], sent: [], rejectIfFlag: false };
+  const client = createHcClient({
+    hcBin: FAKE_HC_BIN,
+    execFileSync(bin, args, options) {
+      // hc is always started by absolute path, from the folder that contains it
+      assert.equal(bin, FAKE_HC_BIN);
+      assert.equal(options.cwd, path.dirname(FAKE_HC_BIN));
+      state.calls.push([...args]);
+      if (args[0] === 'ls') {
+        assert.deepEqual(args, ['ls', '--json']);
+        return JSON.stringify(typeof ls === 'function' ? ls() : ls);
+      }
+      if (args[0] === 'get') {
+        assert.equal(args[2], '--json');
+        if (!Object.prototype.hasOwnProperty.call(get, args[1])) {
+          return JSON.stringify({ error: `terminal ${args[1]} not found` });
+        }
+        return JSON.stringify(get[args[1]]);
+      }
+      if (args[0] === 'send') {
+        assert.equal(args.includes('--force'), false, 'the relay never forces a wake trigger into a tab');
+        if (args[1] === '--if') {
+          if (state.rejectIfFlag) {
+            const err = new Error('unknown flag: --if');
+            err.stderr = 'unknown flag: --if';
+            throw err;
+          }
+          state.sent.push({ ifCond: args[2], to: args[3], trigger: args[4] });
+        } else {
+          state.sent.push({ ifCond: null, to: args[1], trigger: args[2] });
+        }
+        return '';
+      }
+      throw new Error(`Unexpected hc call: ${args.join(' ')}`);
+    },
+  });
+  return Object.assign(client, { state });
+}
+
+async function callTool(server, name, args = {}, meta) {
+  const resp = await server.handleMessage({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name, arguments: args, ...(meta ? { _meta: meta } : {}) },
+  });
+  return { isError: Boolean(resp.result.isError), data: JSON.parse(resp.result.content[0].text) };
+}
+
+async function withTerminalId(terminalId, fn) {
+  const prev = process.env.HC_TERMINAL_ID;
+  process.env.HC_TERMINAL_ID = terminalId;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.HC_TERMINAL_ID;
+    else process.env.HC_TERMINAL_ID = prev;
+  }
+}
+
+function claudePrompt(env, terminalId, cwd = env.projectDir) {
+  const out = handleClaudeUserPrompt({ cwd }, { terminalId, globalDir: env.globalDir });
+  return out.hookSpecificOutput?.additionalContext || '';
+}
+
+// ---------------------------------------------------------------------------------------------
+// A1: the inbox lives in the global store
+// ---------------------------------------------------------------------------------------------
+
+test('relay/inbox: messages live in <globalDir>/state/inbox/<terminalId>/; terminalId validation, FIFO enqueue/peek, ack by id, .broken/ quarantine', () => {
+  const env = makeTempEnv();
+  const opts = { globalDir: env.globalDir };
+  try {
+    // 1. Strict terminalId validation blocks traversal, leading dash option injection, reserved Windows names
+    //    and addresses of other machines; nothing is created for a rejected id
+    for (const badId of ['../escape', 'tab/1', 'tab\\1', '-flag', '--json', '_lead', 'CON', 'nul', 'a'.repeat(65), '', 'pc2/t3']) {
+      assert.throws(() => enqueueMessage(badId, { message: 'x' }, opts), /Invalid terminalId/);
+      assert.throws(() => drainInbox(badId, opts), /Invalid terminalId/);
+    }
+    assert.equal(fs.existsSync(path.join(env.globalDir, 'state', 'inbox')), false);
+
+    // 2. Reading an inbox that does not exist creates nothing
+    const inboxDir = getTerminalInboxDir('tab-2', opts);
+    assert.equal(inboxDir, path.join(env.globalDir, 'state', 'inbox', 'tab-2'));
+    assert.deepEqual(drainInbox('tab-2', opts).messages, []);
+    assert.equal(peekInbox('tab-2', opts).count, 0);
+    assert.equal(countPendingMessages('tab-2', opts), 0);
+    assert.deepEqual(deliverInboxForHook('tab-2', opts).text, '');
+    assert.equal(fs.existsSync(inboxDir), false);
+
+    // 3. Enqueue two messages atomically and peek non-destructively
+    const m1 = enqueueMessage('tab-2', {
       id: 'msg-1',
       from_terminal_id: 'tab-1',
       message: 'First message\nwith multiline body',
       context_docs: ['dec-1', 'base-p0'],
-    });
-    const m2 = enqueueMessage(env.projectDir, 'tab-2', {
+    }, opts);
+    const m2 = enqueueMessage('tab-2', {
       id: 'msg-2',
       from_terminal_id: 'tab-1',
       message: 'Second message',
-    });
+    }, opts);
+    assert.equal(path.dirname(m1.filePath), inboxDir);
+    assert.match(m1.fileName, /^\d{15}-[0-9a-f]{8}\.json$/);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(m1.filePath, 'utf8'))), [
+      'id', 'from_terminal_id', 'to_terminal_id', 'message', 'context_docs', 'created_at',
+    ]);
+    assert.equal(fs.existsSync(path.join(env.projectDir, '.memory')), false, 'nothing is created in a project folder');
 
-    const peeked = peekInbox(env.projectDir, 'tab-2');
+    const peeked = peekInbox('tab-2', opts);
     assert.equal(peeked.count, 2);
     assert.deepEqual(peeked.messages.map((m) => m.id), ['msg-1', 'msg-2']);
     assert.deepEqual(peeked.messages[0].context_docs, ['dec-1', 'base-p0']);
+    assert.deepEqual(peeked.messages.map((m) => m.announced), [false, false]);
+    assert.equal(countPendingMessages('tab-2', opts), 2);
 
-    // 3. ackMessage removes a specific message cleanly
-    const ackOne = ackMessage(env.projectDir, 'tab-2', 'msg-1');
-    assert.equal(ackOne.acked, true);
-    assert.equal(peekInbox(env.projectDir, 'tab-2').count, 1);
+    // 4. ackMessage removes a specific message (by id or by file stem) and leaves no lock behind
+    assert.deepEqual(ackMessage('tab-2', 'msg-1', opts), {
+      acked: true,
+      terminalId: 'tab-2',
+      messageId: 'msg-1',
+      fileName: m1.fileName,
+    });
+    assert.deepEqual(ackMessage('tab-2', 'no-such-message', opts), { acked: false, terminalId: 'tab-2', messageId: 'no-such-message' });
+    assert.throws(() => ackMessage('tab-2', '../escape', opts), /Invalid messageId/);
+    assert.equal(peekInbox('tab-2', opts).count, 1);
+    assert.deepEqual(fs.readdirSync(inboxDir), [m2.fileName]);
 
-    // 4. Plant a corrupt JSON file + simulate a crashed consumer (.taking-999999-dead/)
-    const inboxDir = getTerminalInboxDir(env.projectDir, 'tab-2');
+    // 5. Files that are not message JSON: a peek reports them, a drain quarantines them into .broken/
     atomicWriteText(path.join(inboxDir, '999999999999999-corrupt.json'), '{not valid json');
+    atomicWriteText(path.join(inboxDir, '999999999999998-noshape.json'), '{"id":"x"}');
+    const peekedCorrupt = peekInbox('tab-2', opts);
+    assert.equal(peekedCorrupt.count, 1);
+    assert.equal(peekedCorrupt.notices.filter((n) => n.startsWith('Unreadable inbox file')).length, 2);
 
-    const crashedTakingDir = path.join(inboxDir, '.taking-999999-crashed');
-    fs.mkdirSync(crashedTakingDir, { recursive: true });
-    atomicWriteJson(path.join(crashedTakingDir, '000000000000001-recovered.json'), {
-      id: 'msg-recovered',
-      from_terminal_id: 'tab-3',
-      to_terminal_id: 'tab-2',
-      message: 'Recovered after dead PID crash',
-      context_docs: [],
-      created_at: '2026-11-22T10:00:00.000Z',
-    });
+    const drained = drainInbox('tab-2', opts);
+    assert.equal(drained.busy, false);
+    assert.deepEqual(drained.messages.map((m) => m.id), ['msg-2']);
+    assert.equal(drained.notices.filter((n) => n.startsWith('Quarantined corrupt inbox file')).length, 2);
+    assert.deepEqual(fs.readdirSync(path.join(inboxDir, '.broken')).sort(), [
+      '999999999999998-noshape.json',
+      '999999999999999-corrupt.json',
+    ]);
 
-    // Also simulate a live PID whose .taking dir exceeded staleMs
-    const staleTakingDir = path.join(inboxDir, '.taking-12345-old');
-    fs.mkdirSync(staleTakingDir, { recursive: true });
-    atomicWriteJson(path.join(staleTakingDir, '000000000000002-stale.json'), {
-      id: 'msg-stale',
-      from_terminal_id: 'tab-4',
-      to_terminal_id: 'tab-2',
-      message: 'Recovered after stale timeout',
-      context_docs: [],
-      created_at: '2026-11-22T10:01:00.000Z',
-    });
-    const oldTime = new Date(Date.now() - 700_000);
-    fs.utimesSync(staleTakingDir, oldTime, oldTime);
+    // Messages are never moved to claim them: until ack() they are still in the inbox
+    assert.equal(peekInbox('tab-2', opts).count, 1);
+    assert.deepEqual(drained.ack(), { acked: 1, kept: 0 });
+    assert.equal(drained.ack().alreadyAcked, true);
+    assert.equal(peekInbox('tab-2', opts).count, 0);
+    assert.deepEqual(fs.readdirSync(inboxDir), ['.broken']);
 
-    // Drain recovers dead-PID dir and stale-time dir, quarantines corrupt JSON into .broken/
-    const drained = drainInbox(env.projectDir, 'tab-2', {
-      staleMs: 600_000,
-      isPidAlive: (pid) => pid === 12345, // 999999 is dead, 12345 is alive but stale
-    });
-
-    assert.equal(drained.messages.length, 3);
-    const drainedIds = drained.messages.map((m) => m.id);
-    assert.ok(drainedIds.includes('msg-recovered'));
-    assert.ok(drainedIds.includes('msg-stale'));
-    assert.ok(drainedIds.includes(m2.id));
-
-    // Verify corrupt JSON was quarantined into .broken/
-    const brokenFiles = fs.readdirSync(path.join(inboxDir, '.broken'));
-    assert.ok(brokenFiles.some((f) => f.includes('corrupt.json')));
-    assert.ok(drained.notices.some((n) => n.includes('Quarantined corrupt')));
-    assert.ok(drained.notices.some((n) => n.includes('dead pid 999999')));
-    assert.ok(drained.notices.some((n) => n.includes('older than 600000ms')));
-
-    // Before ack(): claim dir exists and holds the messages
-    assert.equal(fs.existsSync(drained.claimDir), true);
-    assert.equal(peekInbox(env.projectDir, 'tab-2').count, 0);
-
-    // Call ack(): removes claimed files and .taking-* dir cleanly (idempotent on second call)
-    const ackRes1 = drained.ack();
-    assert.equal(ackRes1.acked, 3);
-    assert.equal(fs.existsSync(drained.claimDir), false);
-    const ackRes2 = drained.ack();
-    assert.equal(ackRes2.alreadyAcked, true);
-    assert.ok(m1.id);
-
-    // 5. peekInbox also recovers stale .taking-* directories left by dead PIDs
-    const stalePeekDir = path.join(inboxDir, '.taking-888888-peekdead');
-    fs.mkdirSync(stalePeekDir, { recursive: true });
-    atomicWriteJson(path.join(stalePeekDir, '000000000000009-peekrec.json'), {
-      id: 'msg-peek-recovered',
-      from_terminal_id: 'tab-9',
-      to_terminal_id: 'tab-2',
-      message: 'Recovered during peekInbox',
-      context_docs: [],
-      created_at: '2026-11-22T10:09:00.000Z',
-    });
-    const peekRecovered = peekInbox(env.projectDir, 'tab-2', { isPidAlive: () => false });
-    assert.equal(peekRecovered.count, 1);
-    assert.equal(peekRecovered.messages[0].id, 'msg-peek-recovered');
-    assert.ok(peekRecovered.notices.some((n) => n.includes('dead pid 888888')));
-
-    // 6. formatInboxForHook strictly never exceeds maxChars including footer / trim notices
+    // 6. formatInboxForHook strictly never exceeds maxChars including the footer
     const longMsgs = [
       { id: 'm-1', from_terminal_id: 't1', message: 'A'.repeat(120), context_docs: [] },
       { id: 'm-2', from_terminal_id: 't1', message: 'B'.repeat(120), context_docs: [] },
     ];
-    for (const budget of [40, 90, 180, 220]) {
+    for (const budget of [40, 90, 180, 220, 400, 700]) {
       const formatted = formatInboxForHook(longMsgs, { maxChars: budget });
       assert.ok(formatted.length <= budget, `Expected length <= ${budget}, got ${formatted.length}`);
     }
@@ -171,59 +305,499 @@ test('relay/inbox: terminalId validation, FIFO enqueue/peek, .taking-<pid> claim
   }
 });
 
-test('relay/hc: listTerminals, getTerminal idle/busy detection, single-line sendTrigger, and graceful missing hc', () => {
-  const sentCalls = [];
-  const mockExec = (bin, args, options) => {
-    // hc is always started by absolute path, from the folder that contains it
-    assert.equal(bin, FAKE_HC_BIN);
-    assert.equal(options.cwd, path.dirname(FAKE_HC_BIN));
-    if (args[0] === 'ls') {
-      return JSON.stringify({
-        terminals: [
-          { address: 't1', state: 'live', agent: 'claude', idle: true, cwd: 'G:\\proj', where: 'proj / Claude' },
-          { address: 't2', state: 'live', agent: 'agy', busy: true, cwd: 'G:\\proj', where: 'proj / Antigravity' },
-          { address: 't3', state: 'exited', agent: 'powershell.exe', cwd: 'G:\\other', where: 'other' },
-        ],
-      });
-    }
-    if (args[0] === 'get' && args[1] === 't1') {
-      return JSON.stringify({ address: 't1', state: 'live', foreground: { name: 'claude', status: 'idle' } });
-    }
-    if (args[0] === 'get' && args[1] === 't2') {
-      return JSON.stringify({ address: 't2', state: 'live', foreground: { name: 'agy', busy: true } });
-    }
-    if (args[0] === 'send') {
-      sentCalls.push({ id: args[1], text: args[2] });
-      return '';
-    }
-    throw new Error(`Unexpected hc args: ${args.join(' ')}`);
-  };
+test('relay/inbox migration: what an approved project still keeps in <project>/.memory/state/inbox/<tab>/ moves to the global inbox once, and the emptied folder is removed', () => {
+  const env = makeTempEnv('cortex-inbox-migrate-');
+  const opts = { globalDir: env.globalDir };
+  try {
+    const legacyDir = getLegacyProjectInboxDir(env.projectDir, 'tab-m');
+    assert.equal(legacyDir, path.join(env.projectDir, '.memory', 'state', 'inbox', 'tab-m'));
+    const legacyMessage = (id, text) => ({
+      id,
+      from_terminal_id: 'tab-9',
+      to_terminal_id: 'tab-m',
+      message: text,
+      context_docs: [],
+      created_at: '2026-11-20T10:00:00.000Z',
+    });
+    atomicWriteJson(path.join(legacyDir, '000001700000000-aaaa0001.json'), legacyMessage('old-1', 'Old message one'));
+    atomicWriteJson(path.join(legacyDir, '000001700000001-aaaa0002.json'), legacyMessage('old-2', 'Old message two'));
+    // a claim directory left by a consumer of the previous layout that died, and a quarantined file
+    atomicWriteJson(path.join(legacyDir, '.taking-999999-crashed', '000001600000000-bbbb0001.json'), legacyMessage('old-claimed', 'Claimed by a dead process'));
+    atomicWriteText(path.join(legacyDir, '.broken', '000001500000000-bad.json'), 'not json');
+    // another terminal's old inbox in the same project
+    const otherLegacyDir = getLegacyProjectInboxDir(env.projectDir, 'tab-other');
+    atomicWriteJson(path.join(otherLegacyDir, '000001700000002-cccc0001.json'), { ...legacyMessage('other-1', 'For the other tab'), to_terminal_id: 'tab-other' });
 
-  const hc = createHcClient({ execFileSync: mockExec, hcBin: FAKE_HC_BIN });
+    enqueueMessage('tab-m', { id: 'new-1', from_terminal_id: 'tab-9', message: 'Sent after the move' }, opts);
+
+    // Without the session's project nothing outside the global inbox is looked at
+    assert.deepEqual(peekInbox('tab-m', opts).messages.map((m) => m.id), ['new-1']);
+    assert.equal(fs.existsSync(legacyDir), true);
+
+    // With it: moved (oldest first by file name), the old directory and its .broken/ are gone
+    const peeked = peekInbox('tab-m', { ...opts, projectDir: env.projectDir, isPidAlive: () => false });
+    assert.deepEqual(peeked.messages.map((m) => m.id), ['old-claimed', 'old-1', 'old-2', 'new-1']);
+    assert.ok(peeked.notices.some((n) => /Recovered 1 message\(s\) from stale claim dir \.taking-999999-crashed \(dead pid 999999\)/.test(n)));
+    assert.ok(peeked.notices.includes("Moved 3 message(s) from the project's old inbox into the global inbox."));
+    assert.equal(fs.existsSync(legacyDir), false);
+    assert.equal(fs.existsSync(otherLegacyDir), true, 'other terminals are left alone');
+    const inboxDir = getTerminalInboxDir('tab-m', opts);
+    assert.deepEqual(fs.readdirSync(path.join(inboxDir, '.broken')), ['000001500000000-bad.json']);
+    assert.equal(fs.existsSync(path.join(inboxDir, INBOX_LOCK_FILE)), false);
+
+    // A second look moves nothing and reports nothing
+    const again = peekInbox('tab-m', { ...opts, projectDir: env.projectDir });
+    assert.equal(again.count, 4);
+    assert.deepEqual(again.notices, []);
+
+    // The hooks do the same move for their terminal, deliver the message, and remove the empty old inbox folder
+    const otherCtx = claudePrompt(env, 'tab-other');
+    assert.match(otherCtx, /^> For the other tab$/m);
+    assert.equal(fs.existsSync(path.join(env.projectDir, '.memory', 'state', 'inbox')), false);
+    assert.equal(claudePrompt(env, 'tab-other'), '');
+
+    const mCtx = claudePrompt(env, 'tab-m');
+    for (const text of ['Claimed by a dead process', 'Old message one', 'Old message two', 'Sent after the move']) {
+      assert.ok(mCtx.includes(`> ${text}`), text);
+    }
+    assert.equal(peekInbox('tab-m', opts).count, 0);
+  } finally {
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// A3: one consumer at a time
+// ---------------------------------------------------------------------------------------------
+
+test('relay/inbox lock: one consumer at a time (.lock, exclusive create, pid + time); a loser does not wait and loses nothing; locks of dead or stuck consumers are replaced', () => {
+  const env = makeTempEnv('cortex-inbox-lock-');
+  const opts = { globalDir: env.globalDir };
+  try {
+    for (let i = 1; i <= 3; i++) {
+      enqueueMessage('tab-L', { id: `m-${i}`, from_terminal_id: 'tab-1', message: `Message number ${i}` }, opts);
+    }
+    const inboxDir = getTerminalInboxDir('tab-L', opts);
+    assert.equal(INBOX_LOCK_FILE, '.lock');
+    const lockPath = path.join(inboxDir, INBOX_LOCK_FILE);
+    const readLock = () => JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+
+    // The first consumer holds the lock from the claim until its ack
+    const first = drainInbox('tab-L', opts);
+    assert.equal(first.busy, false);
+    assert.equal(first.messages.length, 3);
+    const held = readLock();
+    assert.deepEqual(Object.keys(held), ['pid', 'acquiredAt', 'token']);
+    assert.equal(held.pid, process.pid);
+    assert.ok(Math.abs(Date.now() - held.acquiredAt) < 60_000);
+
+    // Everybody else gets "nothing to deliver now" at once, and the messages stay
+    const started = Date.now();
+    const second = drainInbox('tab-L', opts);
+    assert.equal(second.busy, true);
+    assert.deepEqual(second.messages, []);
+    assert.deepEqual(second.notices, []);
+    assert.deepEqual(second.ack(), { acked: 0, kept: 0 });
+    const hookTry = deliverInboxForHook('tab-L', { ...opts, maxChars: 5000 });
+    assert.equal(hookTry.busy, true);
+    assert.equal(hookTry.text, '');
+    assert.equal(claudePrompt(env, 'tab-L'), '', 'the hook injects nothing while another consumer delivers');
+    assert.deepEqual(ackMessage('tab-L', 'm-1', opts), { acked: false, terminalId: 'tab-L', messageId: 'm-1', busy: true });
+    assert.ok(Date.now() - started < 1500, 'nobody waited for the lock');
+    assert.equal(peekInbox('tab-L', opts).count, 3, 'nothing was lost (and a peek needs no lock)');
+    assert.equal(readLock().token, held.token, 'the holder keeps its lock');
+
+    // The holder acknowledges part of the batch: the lock is released, the rest is delivered by the next drain
+    assert.deepEqual(first.ack(['m-1']), { acked: 1, kept: 2 });
+    assert.equal(fs.existsSync(lockPath), false);
+    const later = deliverInboxForHook('tab-L', { ...opts, maxChars: 5000 });
+    assert.deepEqual(later.deliveredIds, ['m-2', 'm-3']);
+    assert.equal(later.busy, false);
+    assert.equal(fs.existsSync(lockPath), false);
+    assert.equal(peekInbox('tab-L', opts).count, 0);
+
+    // release() without ack keeps every message
+    enqueueMessage('tab-L', { id: 'm-4', from_terminal_id: 'tab-1', message: 'Message number 4' }, opts);
+    const peeking = drainInbox('tab-L', opts);
+    assert.equal(fs.existsSync(lockPath), true);
+    peeking.release();
+    assert.equal(fs.existsSync(lockPath), false);
+    assert.equal(peekInbox('tab-L', opts).count, 1);
+
+    // A lock whose process is gone is replaced at once, without any notice about broken files
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, acquiredAt: Date.now(), token: 'dead' }));
+    const afterDead = drainInbox('tab-L', { ...opts, isPidAlive: (pid) => pid !== 999999 });
+    assert.equal(afterDead.busy, false);
+    assert.deepEqual(afterDead.messages.map((m) => m.id), ['m-4']);
+    assert.deepEqual(afterDead.notices, []);
+    assert.equal(readLock().pid, process.pid);
+    afterDead.release();
+
+    // A live process keeps its lock ...
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 12345, acquiredAt: Date.now() - 1000, token: 'slow' }));
+    assert.equal(drainInbox('tab-L', { ...opts, isPidAlive: () => true }).busy, true);
+    assert.equal(readLock().token, 'slow');
+    // ... unless the lock is older than the staleness limit
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 12345, acquiredAt: Date.now() - 700_000, token: 'stuck' }));
+    assert.equal(drainInbox('tab-L', { ...opts, isPidAlive: () => true, staleMs: 800_000 }).busy, true);
+    const afterStuck = drainInbox('tab-L', { ...opts, isPidAlive: () => true, staleMs: 600_000 });
+    assert.equal(afterStuck.busy, false);
+    assert.equal(readLock().pid, process.pid);
+    afterStuck.release();
+
+    // A lock file without content yet (its owner is just writing it) is respected; one left empty is not
+    fs.writeFileSync(lockPath, '');
+    assert.equal(drainInbox('tab-L', opts).busy, true);
+    const afterEmpty = drainInbox('tab-L', { ...opts, nowMs: Date.now() + 60_000 });
+    assert.equal(afterEmpty.busy, false);
+    assert.deepEqual(afterEmpty.ack(), { acked: 1, kept: 0 });
+    assert.deepEqual(fs.readdirSync(inboxDir), []);
+  } finally {
+    env.cleanup();
+  }
+});
+
+const DRAIN_WORKER_SOURCE = `
+import fs from 'node:fs';
+const [inboxModuleUrl, globalDir, terminalId, goFile, stopFile] = process.argv.slice(2);
+const { drainInbox } = await import(inboxModuleUrl);
+const pause = new Int32Array(new SharedArrayBuffer(4));
+const delivered = [];
+const notices = [];
+let busy = 0;
+let rounds = 0;
+let emptyAfterStop = 0;
+while (!fs.existsSync(goFile)) Atomics.wait(pause, 0, 0, 2);
+while (emptyAfterStop < 25) {
+  rounds++;
+  const drained = drainInbox(terminalId, { globalDir });
+  notices.push(...drained.notices);
+  if (drained.busy) {
+    busy++;
+    continue;
+  }
+  if (drained.messages.length === 0) {
+    if (fs.existsSync(stopFile)) emptyAfterStop++;
+    Atomics.wait(pause, 0, 0, 1);
+    continue;
+  }
+  emptyAfterStop = 0;
+  // Like a hook with a small budget: deliver a few, leave the rest for a later drain.
+  const take = drained.messages.slice(0, 3).map((m) => m.id);
+  const res = drained.ack(take);
+  if (res.acked !== take.length) notices.push('ack mismatch: ' + JSON.stringify(res));
+  delivered.push(...take);
+}
+process.stdout.write(JSON.stringify({ delivered, notices, busy, rounds }));
+`;
+
+test('relay/inbox concurrency: several processes draining one inbox deliver every message exactly once, with no quarantine notice and nothing lost', async () => {
+  const env = makeTempEnv('cortex-inbox-procs-');
+  const opts = { globalDir: env.globalDir };
+  const WORKERS = 6;
+  const MESSAGES = 240;
+  try {
+    const workerPath = path.join(env.root, 'drain-worker.mjs');
+    fs.writeFileSync(workerPath, DRAIN_WORKER_SOURCE);
+    const goFile = path.join(env.root, 'go');
+    const stopFile = path.join(env.root, 'stop');
+    const inboxModuleUrl = pathToFileURL(path.join(REPO_ROOT, 'src', 'relay', 'inbox.mjs')).href;
+
+    // A first batch is already waiting when the workers start at the same moment
+    const sentIds = [];
+    const send = () => {
+      const id = `msg-${String(sentIds.length).padStart(4, '0')}`;
+      enqueueMessage('tab-shared', { id, from_terminal_id: 'tab-1', message: `payload of ${id}` }, opts);
+      sentIds.push(id);
+    };
+    for (let i = 0; i < 60; i++) send();
+
+    const workers = Array.from({ length: WORKERS }, () => new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ['--no-warnings', workerPath, inboxModuleUrl, env.globalDir, 'tab-shared', goFile, stopFile],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk; });
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.on('error', reject);
+      child.on('close', (code) => {
+        if (code !== 0) reject(new Error(`drain worker exited with ${code}: ${stderr}`));
+        else resolve(JSON.parse(stdout));
+      });
+    }));
+
+    await new Promise((resolve) => setTimeout(resolve, 300)); // let every worker reach its start line
+    fs.writeFileSync(goFile, '');
+    // ... and more messages keep arriving while they drain
+    while (sentIds.length < MESSAGES) {
+      for (let i = 0; i < 6 && sentIds.length < MESSAGES; i++) send();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    fs.writeFileSync(stopFile, '');
+
+    const results = await Promise.all(workers);
+    const delivered = results.flatMap((r) => r.delivered);
+    const notices = results.flatMap((r) => r.notices);
+    const busyTotal = results.reduce((sum, r) => sum + r.busy, 0);
+
+    assert.equal(delivered.length, MESSAGES, 'every message was delivered, none twice');
+    assert.deepEqual([...new Set(delivered)].sort(), [...sentIds].sort(), 'exactly the messages that were sent');
+    assert.deepEqual(notices, [], 'no quarantine or recovery notices');
+    assert.ok(busyTotal > 0, 'the workers really competed for the lock');
+    assert.ok(results.filter((r) => r.delivered.length > 0).length >= 2, 'more than one process delivered messages');
+
+    const inboxDir = getTerminalInboxDir('tab-shared', opts);
+    assert.deepEqual(fs.readdirSync(inboxDir), [], 'no message, lock file or .broken folder is left');
+  } finally {
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// A4: a message longer than the injection budget
+// ---------------------------------------------------------------------------------------------
+
+test('relay/inbox partial delivery: a message that fits but has no room left waits for the next prompt; only fully injected messages are acknowledged', () => {
+  const env = makeTempEnv('cortex-partial-ack-');
+  const opts = { globalDir: env.globalDir };
+  try {
+    enqueueMessage('tab-p1', { id: 'msg-fit', from_terminal_id: 'tab-0', message: 'Short message 1' }, opts);
+    enqueueMessage('tab-p1', { id: 'msg-wait', from_terminal_id: 'tab-0', message: 'Second message '.repeat(20) }, opts);
+
+    // Block of 170 characters next to the preamble: the first message fits, the second does not fit the
+    // room that is left. It would fit a block of the size the caller names as its largest, so it is not
+    // announced: it waits, and a footer points to relay_inbox.
+    const budget = 170 + INBOX_PREAMBLE_COST + 2;
+    const d1 = drainInbox('tab-p1', opts);
+    assert.equal(d1.messages.length, 2);
+    const det1 = formatInboxForHookDetailed(d1.messages, { maxChars: budget, fullBlockChars: 9000 });
+    assert.deepEqual(det1.includedIds, ['msg-fit']);
+    assert.deepEqual(det1.announcedIds, []);
+    assert.deepEqual(det1.omittedIds, ['msg-wait']);
+    assert.ok(det1.text.length <= budget);
+    assert.ok(det1.text.endsWith('(+remaining relay messages available via relay_inbox)'));
+    assert.deepEqual(d1.ack(det1.includedIds), { acked: 1, kept: 1 });
+
+    const remaining = peekInbox('tab-p1', opts);
+    assert.deepEqual(remaining.messages.map((m) => [m.id, m.announced]), [['msg-wait', false]]);
+
+    // The same through the hook helper: nothing fits now, the message stays untouched ...
+    const tight = deliverInboxForHook('tab-p1', { ...opts, maxChars: budget, fullBlockChars: 9000 });
+    assert.deepEqual(tight.deliveredIds, []);
+    assert.deepEqual(tight.announcedIds, []);
+    assert.deepEqual(tight.waitingIds, ['msg-wait']);
+    assert.equal(peekInbox('tab-p1', opts).messages[0].announced, false);
+    // ... and the next prompt with a full block delivers it whole
+    const roomy = deliverInboxForHook('tab-p1', { ...opts, maxChars: 9000 });
+    assert.deepEqual(roomy.deliveredIds, ['msg-wait']);
+    assert.equal(peekInbox('tab-p1', opts).count, 0);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('relay/hooks: a message longer than the injection budget is announced once, does not hold up later messages, and stays in the inbox until relay_inbox acknowledges it', async () => {
+  const env = makeTempEnv('cortex-inbox-long-');
+  const opts = { globalDir: env.globalDir };
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  try {
+    const server = createMcpServer({ store, hcClient: makeFakeHc() });
+    const longBody = `BEGIN-OF-LONG ${'0123456789'.repeat(1597)}${' END-OF-LONG'.padStart(16)}`;
+    assert.equal(longBody.length, 16000);
+    const long = enqueueMessage('tab-long', { from_terminal_id: 'tab-1', message: longBody, context_docs: ['dec-1'] }, opts);
+    const short = enqueueMessage('tab-long', { from_terminal_id: 'tab-1', message: 'SHORT-FOLLOW-UP' }, opts);
+
+    // --- first prompt: the announcement of the long message plus the short message in full ---
+    const first = claudePrompt(env, 'tab-long');
+    assert.ok(first.length <= 9000);
+    const noticeLine = `[long message: 16000 characters; only the first ${INBOX_PREVIEW_MAX_CHARS} are shown below, and this notice is not repeated. `
+      + 'Read the full text with relay_inbox(action="peek"), then acknowledge it with '
+      + `relay_inbox(action="ack", message_id="${long.id}").]`;
+    assert.equal(formatLongMessageNotice(long.id, 16000, 600), noticeLine);
+    assert.equal(first, [
+      `## Incoming Herdr Relay Messages (2)\n${UNTRUSTED_MEMORY_PREAMBLE}`,
+      [
+        `### [${long.id}] from tab-1 @ ${long.message.created_at}`,
+        'Context docs: [[dec-1]]',
+        noticeLine,
+        `> ${longBody.slice(0, 600)}`,
+      ].join('\n'),
+      `### [${short.id}] from tab-1 @ ${short.message.created_at}\n> SHORT-FOLLOW-UP`,
+    ].join('\n\n'));
+    assert.doesNotMatch(first, /END-OF-LONG/);
+
+    // The short one was acknowledged; the long one is still stored in full, now marked as announced
+    const stored = JSON.parse(fs.readFileSync(long.filePath, 'utf8'));
+    assert.equal(stored.message, longBody);
+    assert.ok(Number.isFinite(Date.parse(stored.announced_at)));
+    assert.equal(fs.existsSync(short.filePath), false);
+
+    // --- following prompts: nothing for either; a new message is delivered normally ---
+    assert.equal(claudePrompt(env, 'tab-long'), '');
+    const startCtx = handleClaudeSessionStart(
+      { session_id: 'sess-long', source: 'startup', cwd: env.projectDir },
+      { terminalId: 'tab-long', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    ).hookSpecificOutput.additionalContext;
+    assert.doesNotMatch(startCtx, /Incoming Herdr Relay Messages|BEGIN-OF-LONG/);
+
+    const third = enqueueMessage('tab-long', { from_terminal_id: 'tab-1', message: 'THIRD-MESSAGE' }, opts);
+    const next = claudePrompt(env, 'tab-long');
+    assert.equal(next, [
+      `## Incoming Herdr Relay Messages (1)\n${UNTRUSTED_MEMORY_PREAMBLE}`,
+      `### [${third.id}] from tab-1 @ ${third.message.created_at}\n> THIRD-MESSAGE`,
+    ].join('\n\n'));
+    assert.equal(claudePrompt(env, 'tab-long'), '');
+
+    // --- relay_inbox: the full body and the announced flag; gone after ack ---
+    await withTerminalId('tab-long', async () => {
+      const peek = await callTool(server, 'relay_inbox', { action: 'peek' });
+      assert.equal(peek.data.count, 1);
+      assert.equal(peek.data.messages[0].id, long.id);
+      assert.equal(peek.data.messages[0].message, longBody);
+      assert.equal(peek.data.messages[0].announced, true);
+      assert.equal(peek.data.messages[0].announced_at, stored.announced_at);
+
+      const ack = await callTool(server, 'relay_inbox', { action: 'ack', message_id: long.id });
+      assert.equal(ack.data.acked, true);
+      assert.equal((await callTool(server, 'relay_inbox', { action: 'peek' })).data.count, 0);
+    });
+    assert.equal(claudePrompt(env, 'tab-long'), '');
+    assert.deepEqual(fs.readdirSync(getTerminalInboxDir('tab-long', opts)), []);
+
+    // --- relay_send itself sets no length limit ---
+    const hc = makeFakeHc({ get: { 'tab-long': hcGetAgent({ address: 'tab-long', cwd: env.projectDir }) } });
+    const sender = createMcpServer({ store, hcClient: hc });
+    const sent = await withTerminalId('tab-1', () => callTool(sender, 'relay_send', { to_terminal_id: 'tab-long', message: longBody, wake: 'never' }));
+    assert.equal(sent.data.queued, true);
+    assert.equal(peekInbox('tab-long', opts).messages[0].message.length, 16000);
+
+    // --- Antigravity PreInvocation: same rule with its own block size ---
+    const agy = handleAntigravityPreInvocation(
+      { conversationId: 'conv-long', rootConversationId: 'conv-long', cwd: env.projectDir, lastUserInput: 'continue' },
+      { terminalId: 'tab-long', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    const agyText = agy.injectSteps.map((step) => step.systemMessage.systemMessage).join('\n\n');
+    assert.match(agyText, /\[long message: 16000 characters; only the first 600 are shown below/);
+    assert.doesNotMatch(agyText, /END-OF-LONG/);
+    const agyAgain = handleAntigravityPreInvocation(
+      { conversationId: 'conv-long', rootConversationId: 'conv-long', cwd: env.projectDir, lastUserInput: 'continue' },
+      { terminalId: 'tab-long', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.deepEqual(agyAgain, {});
+    assert.equal(peekInbox('tab-long', opts).messages[0].announced, true);
+
+    // --- a message that only lacks room in SessionStart's smaller share waits for UserPromptSubmit ---
+    store.saveDoc({ id: 'dec-overview', type: 'decision', title: 'Overview entry', summary: 'Makes SessionStart share its budget' });
+    const medium = `MEDIUM-BEGIN ${'m'.repeat(3000)} MEDIUM-END`;
+    enqueueMessage('tab-mid', { from_terminal_id: 'tab-1', message: medium }, opts);
+    const midStart = handleClaudeSessionStart(
+      { session_id: 'sess-mid', source: 'startup', cwd: env.projectDir },
+      { terminalId: 'tab-mid', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    ).hookSpecificOutput.additionalContext;
+    assert.doesNotMatch(midStart, /MEDIUM-BEGIN|long message/);
+    assert.match(midStart, /\(\+remaining relay messages available via relay_inbox\)/);
+    assert.equal(peekInbox('tab-mid', opts).messages[0].announced, false);
+    const midPrompt = claudePrompt(env, 'tab-mid');
+    assert.match(midPrompt, /MEDIUM-BEGIN m+ MEDIUM-END$/);
+    assert.equal(peekInbox('tab-mid', opts).count, 0);
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// A5: the real hc status shapes
+// ---------------------------------------------------------------------------------------------
+
+test('relay/hc: reads real hc ls rows (string status) and hc get results (object status); unknown is not busy; single-line sendTrigger; graceful missing hc', () => {
+  const hc = makeFakeHc({
+    ls: REAL_HC_LS,
+    get: {
+      t1: hcGetAgent({ address: 't1', cwd: 'C:\\Users\\dev\\Desktop\\작업', statusState: 'working', msg: 'Editing ...', where: '작업 / 1' }),
+      t2: hcGetShell({ address: 't2', cwd: 'C:\\Users\\dev\\Desktop\\작업', where: '작업 / 2' }),
+      t4: hcGetAgent({ address: 't4', statusState: 'idle' }),
+    },
+  });
+
+  // hc ls --json
   const ls = hc.listTerminals();
   assert.equal(ls.ok, true);
   assert.equal(ls.terminals.length, 3);
-  assert.equal(ls.terminals[0].idle, true);
-  assert.equal(ls.terminals[0].busy, false);
-  assert.equal(ls.terminals[1].busy, true);
-  assert.equal(ls.terminals[1].idle, false);
-  assert.equal(ls.terminals[2].live, false);
+  const [working, shell, remote] = ls.terminals;
+  assert.deepEqual(
+    { id: working.terminalId, live: working.live, activity: working.activity, busy: working.busy, idle: working.idle, unknown: working.unknown, shell: working.isBareShell, agent: working.agentName, where: working.where },
+    { id: 't1', live: true, activity: 'working', busy: true, idle: false, unknown: false, shell: false, agent: 'claude-code', where: '작업 / 1' },
+  );
+  assert.deepEqual(
+    { id: shell.terminalId, live: shell.live, activity: shell.activity, busy: shell.busy, idle: shell.idle, unknown: shell.unknown, shell: shell.isBareShell, agent: shell.agentName },
+    { id: 't2', live: true, activity: 'shell', busy: false, idle: false, unknown: false, shell: true, agent: 'powershell.exe' },
+  );
+  assert.deepEqual(
+    { id: remote.terminalId, remote: remote.remote, machine: remote.machine, activity: remote.activity, idle: remote.idle },
+    { id: 'pc2/t3', remote: true, machine: 'pc2', activity: 'idle', idle: true },
+  );
+  assert.equal(working.remote, false);
 
+  // hc get <id> --json: `status` is an object
   const g1 = hc.getTerminal('t1');
   assert.equal(g1.ok, true);
-  assert.equal(g1.status.idle, true);
-
+  assert.deepEqual(
+    { activity: g1.status.activity, busy: g1.status.busy, idle: g1.status.idle, shell: g1.status.isBareShell, agent: g1.status.agentName, cwd: g1.status.cwd, where: g1.status.where },
+    { activity: 'working', busy: true, idle: false, shell: false, agent: 'claude-code', cwd: 'C:\\Users\\dev\\Desktop\\작업', where: '작업 / 1' },
+  );
+  const g4 = hc.getTerminal('t4');
+  assert.deepEqual([g4.status.activity, g4.status.idle, g4.status.busy], ['idle', true, false]);
   const g2 = hc.getTerminal('t2');
-  assert.equal(g2.ok, true);
-  assert.equal(g2.status.busy, true);
-  assert.equal(g2.status.idle, false);
+  assert.deepEqual([g2.status.activity, g2.status.isBareShell, g2.status.idle, g2.status.busy, g2.status.unknown], ['shell', true, false, false, false]);
+
+  // A live agent tab whose status cannot be interpreted is "unknown": not idle, and not busy either
+  for (const oddStatus of [null, {}, { app: 'claude-code' }, { app: 'claude-code', state: 'compacting' }, 'compacting', 7]) {
+    const odd = detectTerminalActivity(hcGetAgent({ address: 't5', status: oddStatus }));
+    assert.deepEqual(
+      [odd.activity, odd.unknown, odd.busy, odd.idle, odd.live, odd.isBareShell],
+      ['unknown', true, false, false, true, false],
+      JSON.stringify(oddStatus),
+    );
+  }
+  assert.equal(detectTerminalActivity(hcLsRow({ address: 't6' })).activity, 'unknown', 'an agent row without status');
+  // Other states
+  assert.equal(detectTerminalActivity(hcGetAgent({ address: 't7', statusState: 'blocked' })).activity, 'blocked');
+  assert.equal(detectTerminalActivity(hcGetAgent({ address: 't7', statusState: 'error' })).activity, 'error');
+  const finished = detectTerminalActivity(hcLsRow({ address: 't8', state: 'finished', status: 'idle' }));
+  assert.deepEqual([finished.activity, finished.live, finished.idle], ['not_live', false, false]);
+  // A tab that hc reports as an agent is not a bare shell even when its foreground program is a shell
+  const wrapped = detectTerminalActivity({ ...hcGetShell({ address: 't9' }), status: { app: 'claude-code', state: 'idle' } });
+  assert.deepEqual([wrapped.activity, wrapped.isBareShell, wrapped.agentName], ['idle', false, 'claude-code']);
+
+  // Addresses
+  assert.deepEqual(parseTerminalAddress('pc2/t3'), { remote: true, machine: 'pc2', terminalId: 't3' });
+  assert.deepEqual(parseTerminalAddress(' t3 '), { remote: false, machine: '', terminalId: 't3' });
+  assert.equal(parseTerminalAddress('../escape').remote, false);
+  assert.throws(() => hc.getTerminal('pc2/t3'), /Invalid terminalId/);
+
+  // An API error answer
+  const apiErr = hc.getTerminal('t-missing');
+  assert.equal(apiErr.ok, false);
+  assert.equal(apiErr.code, 'HC_API_ERROR');
 
   // Multiline text gets strictly collapsed to a single line
-  const sendRes = hc.sendTrigger('t1', 'Line 1\nLine 2\r\n\tLine 3');
+  const sendRes = hc.sendTrigger('t4', 'Line 1\nLine 2\r\n\tLine 3');
   assert.equal(sendRes.ok, true);
   assert.equal(sendRes.sent, 'Line 1 Line 2 Line 3');
-  assert.equal(sentCalls[0].text.includes('\n'), false);
+  assert.deepEqual(hc.state.sent[0], { ifCond: null, to: 't4', trigger: 'Line 1 Line 2 Line 3' });
   assert.equal(sanitizeSingleLineTrigger('a\nb\nc'), 'a b c');
+
+  // `--if idle`, with a fallback for an hc that does not know the flag
+  hc.sendTrigger('t4', 'ping', { ifIdle: true });
+  assert.deepEqual(hc.state.sent[1], { ifCond: 'idle', to: 't4', trigger: 'ping' });
+  hc.state.rejectIfFlag = true;
+  const callsBefore = hc.state.calls.length;
+  assert.equal(hc.sendTrigger('t4', 'ping', { ifIdle: true }).ok, true);
+  assert.deepEqual(hc.state.calls.slice(callsBefore), [['send', '--if', 'idle', 't4', 'ping'], ['send', 't4', 'ping']]);
 
   // Missing hc binary degrades gracefully
   const missingHc = createHcClient({
@@ -242,11 +816,8 @@ test('relay/hc: listTerminals, getTerminal idle/busy detection, single-line send
 test('relay/tools + MCP server: exposes all 10 tools and runs relay_tabs, relay_send (wake auto/always/never), and relay_inbox', async () => {
   const env = makeTempEnv();
   const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
-  const prevTerminalId = process.env.HC_TERMINAL_ID;
 
   try {
-    process.env.HC_TERMINAL_ID = 't1';
-
     // Save a project doc + saved revive session for t2
     store.saveDoc({
       id: 'dec-relay-1',
@@ -261,188 +832,141 @@ test('relay/tools + MCP server: exposes all 10 tools and runs relay_tabs, relay_
       agent: 'antigravity',
       payload: { conversationId: 'conv-t2-abc', cwd: env.projectDir },
       globalDir: env.globalDir,
+      legacyHome: env.homeDir,
     });
 
-    const sentTriggers = [];
-    const mockHc = createHcClient({
-      hcBin: FAKE_HC_BIN,
-      execFileSync(_bin, args) {
-        if (args[0] === 'ls') {
-          return JSON.stringify({
-            terminals: [
-              { address: 't1', state: 'live', agent: 'claude', idle: true, cwd: env.projectDir, where: 'proj / Claude' },
-              { address: 't2', state: 'live', agent: 'agy', idle: true, cwd: env.projectDir, where: 'proj / Antigravity' },
-              { address: 't3', state: 'live', agent: 'claude', busy: true, cwd: env.projectDir, where: 'proj / Worker' },
-            ],
-          });
-        }
-        if (args[0] === 'get' && args[1] === 't2') {
-          return JSON.stringify({ address: 't2', state: 'live', agent: 'agy', idle: true });
-        }
-        if (args[0] === 'get' && args[1] === 't3') {
-          return JSON.stringify({ address: 't3', state: 'live', agent: 'claude', busy: true });
-        }
-        if (args[0] === 'send') {
-          if (args[1] === '--if') {
-            sentTriggers.push({ ifCond: args[2], to: args[3], trigger: args[4] });
-          } else {
-            sentTriggers.push({ ifCond: null, to: args[1], trigger: args[2] });
-          }
-          return '';
-        }
-        throw new Error(`Unexpected hc call: ${args.join(' ')}`);
+    const hc = makeFakeHc({
+      ls: {
+        terminals: [
+          hcLsRow({ address: 't1', cwd: env.projectDir, status: 'idle', where: 'proj / 1' }),
+          hcLsRow({ address: 't2', cwd: env.projectDir, status: 'idle', where: 'proj / 2' }),
+          hcLsRow({ address: 't3', cwd: env.projectDir, status: 'working', where: 'proj / 3' }),
+        ],
+      },
+      get: {
+        t2: hcGetAgent({ address: 't2', cwd: env.projectDir, statusState: 'idle' }),
+        t3: hcGetAgent({ address: 't3', cwd: env.projectDir, statusState: 'working', msg: 'Editing ...' }),
       },
     });
+    const server = createMcpServer({ store, hcClient: hc });
 
-    const server = createMcpServer({
-      store,
-      hcClient: mockHc,
+    await withTerminalId('t1', async () => {
+      // 1. Verify tools/list exposes all 10 tools (6 memory_* + 3 relay_* + 1 cortex_prompt)
+      const listResp = await server.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      const toolNames = listResp.result.tools.map((t) => t.name).sort();
+      assert.deepEqual(toolNames, [
+        'cortex_prompt',
+        'memory_graph',
+        'memory_overview',
+        'memory_read',
+        'memory_save',
+        'memory_search',
+        'memory_update',
+        'relay_inbox',
+        'relay_send',
+        'relay_tabs',
+      ]);
+
+      // 2. relay_tabs merges hc ls + saved revive sessions + project memory sessions
+      const tabs = (await callTool(server, 'relay_tabs')).data;
+      assert.equal(tabs.hcAvailable, true);
+      assert.equal(tabs.currentTerminalId, 't1');
+      assert.equal(tabs.tabs.length, 3);
+      const t2Tab = tabs.tabs.find((t) => t.terminalId === 't2');
+      assert.equal(t2Tab.sameProject, true);
+      assert.equal(t2Tab.idle, true);
+      assert.equal(t2Tab.activity, 'idle');
+      assert.equal(t2Tab.relayCapable, true);
+      assert.equal(t2Tab.savedSession.sessionId, 'conv-t2-abc');
+      assert.equal(tabs.tabs.find((t) => t.terminalId === 't3').busy, true);
+      assert.equal(tabs.tabs.find((t) => t.terminalId === 't1').isCurrent, true);
+      assert.equal(tabs.projectSessions[0].session, 'stage-2');
+
+      // 3. relay_send with wake="auto" to IDLE t2 -> saves multiline body in inbox + sends short single-line trigger
+      const multilineBody = 'Line A: review schema\nLine B: verify tests\nLine C: report back';
+      const sendIdle = (await callTool(server, 'relay_send', {
+        to_terminal_id: 't2',
+        message: multilineBody,
+        context_docs: ['dec-relay-1'],
+        wake: 'auto',
+      })).data;
+      assert.equal(sendIdle.queued, true);
+      assert.equal(sendIdle.woke, true);
+      assert.equal(sendIdle.wakeReason, 'sent_auto_idle');
+      assert.equal(hc.state.sent.length, 1);
+      assert.equal(hc.state.sent[0].ifCond, 'idle');
+      assert.equal(hc.state.sent[0].to, 't2');
+      // NEVER sends raw multiline body via hc send!
+      assert.equal(hc.state.sent[0].trigger.includes('\n'), false);
+      assert.equal(hc.state.sent[0].trigger.includes('Line A'), false);
+      assert.match(hc.state.sent[0].trigger, /relay_inbox/);
+
+      // 4. relay_send with wake="auto" to a WORKING t3 -> enqueues message, skips hc send
+      const sendBusy = (await callTool(server, 'relay_send', { to_terminal_id: 't3', message: 'Wait until free', wake: 'auto' })).data;
+      assert.equal(sendBusy.queued, true);
+      assert.equal(sendBusy.woke, false);
+      assert.equal(sendBusy.wakeReason, 'target_busy');
+      assert.equal(hc.state.sent.length, 1);
+
+      // 5. relay_send with wake="always" to the WORKING t3 -> sends the trigger (queued behind its turn), no --if
+      const sendAlways = (await callTool(server, 'relay_send', { to_terminal_id: 't3', message: 'Urgent override', wake: 'always' })).data;
+      assert.equal(sendAlways.woke, true);
+      assert.equal(sendAlways.wakeReason, 'sent_always');
+      assert.equal(hc.state.sent.length, 2);
+      assert.equal(hc.state.sent[1].ifCond, null);
+      assert.equal(hc.state.sent[1].to, 't3');
+
+      // 6. relay_send with wake="never" to IDLE t2 -> does NOT call hc send
+      const sendNever = (await callTool(server, 'relay_send', { to_terminal_id: 't2', message: 'Silent delivery', wake: 'never' })).data;
+      assert.equal(sendNever.woke, false);
+      assert.equal(sendNever.wakeReason, 'wake_disabled');
+      assert.equal(hc.state.sent.length, 2);
+
+      // The messages are in the global inbox; the project got no inbox folder
+      assert.equal(countPendingMessages('t2', { globalDir: env.globalDir }), 2);
+      assert.equal(fs.existsSync(path.join(env.projectDir, '.memory', 'state', 'inbox')), false);
+      const tabsAfter = (await callTool(server, 'relay_tabs')).data;
+      assert.equal(tabsAfter.tabs.find((t) => t.terminalId === 't2').pendingInboxCount, 2);
+      assert.equal(tabsAfter.tabs.find((t) => t.terminalId === 't3').pendingInboxCount, 2);
+
+      // 7. relay_inbox peek & ack for t2
+      process.env.HC_TERMINAL_ID = 't2';
+      const peek = (await callTool(server, 'relay_inbox', { action: 'peek' })).data;
+      assert.equal(peek.count, 2);
+      assert.equal(peek.messages[0].message, multilineBody);
+      assert.deepEqual(peek.messages[0].context_docs, ['dec-relay-1']);
+      assert.equal(peek.messages[0].announced, false);
+
+      const ack = (await callTool(server, 'relay_inbox', { action: 'ack', message_id: peek.messages[0].id })).data;
+      assert.equal(ack.acked, true);
+      assert.equal((await callTool(server, 'relay_inbox', { action: 'peek' })).data.count, 1);
+
+      // ack "all" removes the rest
+      const ackAll = (await callTool(server, 'relay_inbox', { action: 'ack', message_id: 'all' })).data;
+      assert.equal(ackAll.acked, true);
+      assert.equal(ackAll.ackedCount, 1);
+      assert.equal((await callTool(server, 'relay_inbox', { action: 'peek' })).data.count, 0);
+
+      // While a hook holds the terminal's lock, an ack reports "busy" after a short wait and changes nothing
+      process.env.HC_TERMINAL_ID = 't3';
+      const holder = drainInbox('t3', { globalDir: env.globalDir });
+      assert.equal(holder.messages.length, 2);
+      const busyAck = (await callTool(server, 'relay_inbox', { action: 'ack', message_id: 'all' })).data;
+      assert.equal(busyAck.busy, true);
+      assert.equal(busyAck.acked, false);
+      const busyOne = (await callTool(server, 'relay_inbox', { action: 'ack', message_id: holder.messages[0].id })).data;
+      assert.equal(busyOne.busy, true);
+      assert.equal(busyOne.acked, false);
+      holder.release();
+      assert.equal((await callTool(server, 'relay_inbox', { action: 'peek' })).data.count, 2);
     });
-
-    // 1. Verify tools/list exposes all 10 tools (6 memory_* + 3 relay_* + 1 cortex_prompt)
-    const listResp = await server.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
-    const toolNames = listResp.result.tools.map((t) => t.name).sort();
-    assert.deepEqual(toolNames, [
-      'cortex_prompt',
-      'memory_graph',
-      'memory_overview',
-      'memory_read',
-      'memory_save',
-      'memory_search',
-      'memory_update',
-      'relay_inbox',
-      'relay_send',
-      'relay_tabs',
-    ]);
-
-    // 2. relay_tabs merges hc ls + saved revive sessions + project memory sessions
-    const tabsResp = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'tools/call',
-      params: { name: 'relay_tabs', arguments: {} },
-    });
-    const tabsData = JSON.parse(tabsResp.result.content[0].text);
-    assert.equal(tabsData.hcAvailable, true);
-    assert.equal(tabsData.currentTerminalId, 't1');
-    assert.equal(tabsData.tabs.length, 3);
-    const t2Tab = tabsData.tabs.find((t) => t.terminalId === 't2');
-    assert.equal(t2Tab.sameProject, true);
-    assert.equal(t2Tab.savedSession.sessionId, 'conv-t2-abc');
-    assert.equal(tabsData.projectSessions[0].session, 'stage-2');
-
-    // 3. relay_send with wake="auto" to IDLE t2 -> saves multiline body in inbox + sends short single-line trigger
-    const multilineBody = 'Line A: review schema\nLine B: verify tests\nLine C: report back';
-    const sendIdleResp = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 3,
-      method: 'tools/call',
-      params: {
-        name: 'relay_send',
-        arguments: {
-          to_terminal_id: 't2',
-          message: multilineBody,
-          context_docs: ['dec-relay-1'],
-          wake: 'auto',
-        },
-      },
-    });
-    const sendIdleData = JSON.parse(sendIdleResp.result.content[0].text);
-    assert.equal(sendIdleData.queued, true);
-    assert.equal(sendIdleData.woke, true);
-    assert.equal(sendIdleData.wakeReason, 'sent_auto_idle');
-    assert.equal(sentTriggers.length, 1);
-    assert.equal(sentTriggers[0].ifCond, 'idle');
-    assert.equal(sentTriggers[0].to, 't2');
-    // NEVER sends raw multiline body via hc send!
-    assert.equal(sentTriggers[0].trigger.includes('\n'), false);
-    assert.equal(sentTriggers[0].trigger.includes('Line A'), false);
-    assert.match(sentTriggers[0].trigger, /relay_inbox/);
-
-    // 4. relay_send with wake="auto" to BUSY t3 -> enqueues message, skips hc send
-    const sendBusyResp = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 4,
-      method: 'tools/call',
-      params: {
-        name: 'relay_send',
-        arguments: { to_terminal_id: 't3', message: 'Wait until free', wake: 'auto' },
-      },
-    });
-    const sendBusyData = JSON.parse(sendBusyResp.result.content[0].text);
-    assert.equal(sendBusyData.queued, true);
-    assert.equal(sendBusyData.woke, false);
-    assert.equal(sendBusyData.wakeReason, 'target_busy');
-    assert.equal(sentTriggers.length, 1);
-
-    // 5. relay_send with wake="always" to BUSY t3 -> sends short wake trigger
-    const sendAlwaysResp = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 5,
-      method: 'tools/call',
-      params: {
-        name: 'relay_send',
-        arguments: { to_terminal_id: 't3', message: 'Urgent override', wake: 'always' },
-      },
-    });
-    const sendAlwaysData = JSON.parse(sendAlwaysResp.result.content[0].text);
-    assert.equal(sendAlwaysData.woke, true);
-    assert.equal(sendAlwaysData.wakeReason, 'sent_always');
-    assert.equal(sentTriggers.length, 2);
-
-    // 6. relay_send with wake="never" to IDLE t2 -> does NOT call hc send
-    const sendNeverResp = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 6,
-      method: 'tools/call',
-      params: {
-        name: 'relay_send',
-        arguments: { to_terminal_id: 't2', message: 'Silent delivery', wake: 'never' },
-      },
-    });
-    const sendNeverData = JSON.parse(sendNeverResp.result.content[0].text);
-    assert.equal(sendNeverData.woke, false);
-    assert.equal(sendNeverData.wakeReason, 'wake_disabled');
-    assert.equal(sentTriggers.length, 2);
-
-    // 7. relay_inbox peek & ack for t2
-    process.env.HC_TERMINAL_ID = 't2';
-    const peekResp = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 7,
-      method: 'tools/call',
-      params: { name: 'relay_inbox', arguments: { action: 'peek' } },
-    });
-    const peekData = JSON.parse(peekResp.result.content[0].text);
-    assert.equal(peekData.count, 2);
-    assert.equal(peekData.messages[0].message, multilineBody);
-    assert.deepEqual(peekData.messages[0].context_docs, ['dec-relay-1']);
-
-    const ackResp = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 8,
-      method: 'tools/call',
-      params: { name: 'relay_inbox', arguments: { action: 'ack', message_id: peekData.messages[0].id } },
-    });
-    const ackData = JSON.parse(ackResp.result.content[0].text);
-    assert.equal(ackData.acked, true);
-
-    const peekAfter = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 9,
-      method: 'tools/call',
-      params: { name: 'relay_inbox', arguments: { action: 'peek' } },
-    });
-    assert.equal(JSON.parse(peekAfter.result.content[0].text).count, 1);
   } finally {
-    if (prevTerminalId === undefined) delete process.env.HC_TERMINAL_ID;
-    else process.env.HC_TERMINAL_ID = prevTerminalId;
     store.close();
     env.cleanup();
   }
 });
 
-test('regression: cross-project relay_send and relay_tabs route messages to target terminal project inbox', async () => {
+test('relay_send across projects: the message goes to the global inbox of the target terminal, nothing is written into either project', async () => {
   const env = makeTempEnv('herdr-cortex-xproj-');
   const projectX = path.join(env.root, 'project-x');
   const projectY = path.join(env.root, 'project-y');
@@ -451,282 +975,378 @@ test('regression: cross-project relay_send and relay_tabs route messages to targ
 
   const storeX = new CortexStore({ projectDir: projectX, globalDir: env.globalDir, disableVec: true });
   const storeY = new CortexStore({ projectDir: projectY, globalDir: env.globalDir, disableVec: true });
-  const prevTerminalId = process.env.HC_TERMINAL_ID;
 
   try {
-    process.env.HC_TERMINAL_ID = 'tab-a';
-    const mockHc = createHcClient({
-      hcBin: FAKE_HC_BIN,
-      execFileSync(_bin, args) {
-        if (args[0] === 'ls') {
-          return JSON.stringify({
-            terminals: [
-              { address: 'tab-a', state: 'live', agent: 'claude', idle: true, cwd: projectX, where: 'proj-x / Claude' },
-              { address: 'tab-b', state: 'live', agent: 'agy', idle: true, cwd: projectY, where: 'proj-y / Antigravity' },
-            ],
-          });
-        }
-        if (args[0] === 'get' && args[1] === 'tab-b') {
-          return JSON.stringify({ address: 'tab-b', state: 'live', agent: 'agy', idle: true, cwd: projectY });
-        }
-        if (args[0] === 'send') {
-          return '';
-        }
-        throw new Error(`Unexpected hc call: ${args.join(' ')}`);
+    const hc = makeFakeHc({
+      ls: {
+        terminals: [
+          hcLsRow({ address: 'tab-a', cwd: projectX, status: 'idle', where: 'proj-x / 1' }),
+          hcLsRow({ address: 'tab-b', cwd: projectY, status: 'idle', where: 'proj-y / 1' }),
+        ],
       },
+      get: { 'tab-b': hcGetAgent({ address: 'tab-b', cwd: projectY, statusState: 'idle' }) },
+    });
+    const serverA = createMcpServer({ store: storeX, hcClient: hc });
+    const serverB = createMcpServer({ store: storeY, hcClient: hc });
+
+    // Server A (in Project X, not approved) sends to Tab B (in Project Y, not approved either)
+    await withTerminalId('tab-a', async () => {
+      const send = (await callTool(serverA, 'relay_send', {
+        to_terminal_id: 'tab-b',
+        message: 'Cross-project handoff from X to Y',
+        context_docs: ['base-p0'],
+        wake: 'auto',
+      })).data;
+      assert.equal(send.queued, true);
+      assert.equal(send.woke, true);
+      assert.equal(path.resolve(send.target_project_dir), path.resolve(projectY));
+
+      // One file in the global inbox of tab-b; both project folders are untouched
+      const inboxDir = getTerminalInboxDir('tab-b', { globalDir: env.globalDir });
+      assert.equal(fs.readdirSync(inboxDir).filter((name) => name.endsWith('.json')).length, 1);
+      assert.deepEqual(fs.readdirSync(projectX), []);
+      assert.deepEqual(fs.readdirSync(projectY), []);
+
+      // relay_tabs from Server A reports Tab B's pendingInboxCount
+      const tabs = (await callTool(serverA, 'relay_tabs')).data;
+      const tabB = tabs.tabs.find((t) => t.terminalId === 'tab-b');
+      assert.equal(tabB.sameProject, false);
+      assert.equal(tabB.pendingInboxCount, 1);
     });
 
-    const serverA = createMcpServer({ store: storeX, hcClient: mockHc });
-    const serverB = createMcpServer({ store: storeY, hcClient: mockHc });
-
-    // Server A (in Project X) sends to Tab B (in Project Y)
-    const sendResp = await serverA.handleMessage({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tools/call',
-      params: {
-        name: 'relay_send',
-        arguments: {
-          to_terminal_id: 'tab-b',
-          message: 'Cross-project handoff from X to Y',
-          context_docs: ['base-p0'],
-          wake: 'auto',
-        },
-      },
+    // Server B (in Project Y) peeks via relay_inbox, and the hook of tab-b delivers the message although
+    // project Y is not approved: the inbox is the terminal's, not the project's
+    await withTerminalId('tab-b', async () => {
+      const peek = (await callTool(serverB, 'relay_inbox', { action: 'peek' })).data;
+      assert.equal(peek.count, 1);
+      assert.equal(peek.messages[0].message, 'Cross-project handoff from X to Y');
     });
-    const sendData = JSON.parse(sendResp.result.content[0].text);
-    assert.equal(sendData.queued, true);
-    assert.equal(sendData.woke, true);
-    assert.equal(path.resolve(sendData.target_project_dir), path.resolve(projectY));
-
-    // Project X must NOT hold Tab B's message; Project Y MUST hold it
-    assert.equal(peekInbox(projectX, 'tab-b').count, 0);
-    assert.equal(peekInbox(projectY, 'tab-b').count, 1);
-
-    // relay_tabs from Server A reports Tab B's pendingInboxCount from Project Y
-    const tabsResp = await serverA.handleMessage({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'tools/call',
-      params: { name: 'relay_tabs', arguments: {} },
-    });
-    const tabsData = JSON.parse(tabsResp.result.content[0].text);
-    const tabB = tabsData.tabs.find((t) => t.terminalId === 'tab-b');
-    assert.equal(tabB.sameProject, false);
-    assert.equal(tabB.pendingInboxCount, 1);
-
-    // Server B (in Project Y) peeks via relay_inbox and drainInbox receives the message cleanly
-    process.env.HC_TERMINAL_ID = 'tab-b';
-    const peekB = await serverB.handleMessage({
-      jsonrpc: '2.0',
-      id: 3,
-      method: 'tools/call',
-      params: { name: 'relay_inbox', arguments: { action: 'peek' } },
-    });
-    const peekBData = JSON.parse(peekB.result.content[0].text);
-    assert.equal(peekBData.count, 1);
-    assert.equal(peekBData.messages[0].message, 'Cross-project handoff from X to Y');
-
-    const drainedY = drainInbox(projectY, 'tab-b');
-    assert.equal(drainedY.messages.length, 1);
-    assert.equal(drainedY.messages[0].message, 'Cross-project handoff from X to Y');
-    drainedY.ack();
-    assert.equal(peekInbox(projectY, 'tab-b').count, 0);
+    assert.match(claudePrompt(env, 'tab-b', projectY), /^> Cross-project handoff from X to Y$/m);
+    assert.equal(peekInbox('tab-b', { globalDir: env.globalDir }).count, 0);
+    assert.deepEqual(fs.readdirSync(projectY), []);
   } finally {
-    if (prevTerminalId === undefined) delete process.env.HC_TERMINAL_ID;
-    else process.env.HC_TERMINAL_ID = prevTerminalId;
     storeX.close();
     storeY.close();
     env.cleanup();
   }
 });
 
-test('P0-5 regression: inbox partial ACK preserves omitted and truncated messages in inbox', () => {
-  const env = makeTempEnv('cortex-partial-ack-');
+// ---------------------------------------------------------------------------------------------
+// A5 / A6: wake policies
+// ---------------------------------------------------------------------------------------------
+
+test('relay_send wake: auto wakes only an idle agent and reports an unreadable status as target_status_unknown (not busy); always also wakes a working agent but never a bare shell, a tab that is not live, or one in an error state', async () => {
+  const env = makeTempEnv('cortex-hc-wake-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
   try {
-    // Case 1: 2 messages where only the 1st fits -> 1st is acked, 2nd is restored back into inbox
-    enqueueMessage(env.projectDir, 'tab-p1', { id: 'msg-fit', from_terminal_id: 'tab-0', message: 'Short message 1' });
-    enqueueMessage(env.projectDir, 'tab-p1', { id: 'msg-omit', from_terminal_id: 'tab-0', message: 'Second message '.repeat(20) });
+    const agent = (address, extra = {}) => hcGetAgent({ address, cwd: env.projectDir, ...extra });
+    const hc = makeFakeHc({
+      get: {
+        't-idle': agent('t-idle', { statusState: 'idle' }),
+        't-working': agent('t-working', { statusState: 'working', msg: 'Editing ...' }),
+        't-shell': hcGetShell({ address: 't-shell', cwd: env.projectDir }),
+        't-nostatus': agent('t-nostatus', { status: null }),
+        't-nostate': agent('t-nostate', { status: { app: 'claude-code' } }),
+        't-odd': agent('t-odd', { statusState: 'compacting' }),
+        't-finished': agent('t-finished', { state: 'finished' }),
+        't-error': agent('t-error', { statusState: 'error' }),
+        't-blocked': agent('t-blocked', { statusState: 'blocked' }),
+      },
+    });
+    const server = createMcpServer({ store, hcClient: hc });
 
-    const d1 = drainInbox(env.projectDir, 'tab-p1');
-    assert.equal(d1.messages.length, 2);
-    const budget1 = 170 + INBOX_PREAMBLE_COST + 2;
-    const det1 = formatInboxForHookDetailed(d1.messages, { maxChars: budget1 });
-    assert.deepEqual(det1.includedIds, ['msg-fit']);
-    assert.deepEqual(det1.omittedIds, ['msg-omit']);
-    assert.deepEqual(det1.truncatedIds, []);
-    assert.ok(det1.text.length <= budget1);
+    const send = async (to, wake) => {
+      const before = hc.state.sent.length;
+      const res = await callTool(server, 'relay_send', { to_terminal_id: to, message: `to ${to} with ${wake}`, wake });
+      assert.equal(res.isError, false, `${to}/${wake}`);
+      assert.equal(res.data.queued, true, `${to}/${wake}: the message is stored whatever happens to the wake`);
+      return { ...res.data, sentNow: hc.state.sent.slice(before) };
+    };
 
-    const ack1 = d1.ack(det1.includedIds);
-    assert.equal(ack1.acked, 1);
-    assert.equal(ack1.restored, 1);
-    assert.equal(fs.existsSync(d1.claimDir), false);
+    await withTerminalId('t1', async () => {
+      const expectations = [
+        // [target, wake, woke, reason, how the trigger was sent]
+        ['t-idle', 'auto', true, 'sent_auto_idle', 'idle'],
+        ['t-idle', 'always', true, 'sent_always', null],
+        ['t-working', 'auto', false, 'target_busy'],
+        ['t-working', 'always', true, 'sent_always', null],
+        ['t-shell', 'auto', false, 'target_is_bare_shell'],
+        ['t-shell', 'always', false, 'target_is_bare_shell'],
+        ['t-nostatus', 'auto', false, 'target_status_unknown'],
+        ['t-nostate', 'auto', false, 'target_status_unknown'],
+        ['t-odd', 'auto', false, 'target_status_unknown'],
+        ['t-odd', 'always', true, 'sent_always', null],
+        ['t-finished', 'auto', false, 'target_not_live'],
+        ['t-finished', 'always', false, 'target_not_live'],
+        ['t-error', 'auto', false, 'target_error'],
+        ['t-error', 'always', false, 'target_error'],
+        ['t-blocked', 'auto', false, 'target_blocked'],
+        ['t-gone', 'auto', false, 'hc_unavailable'],
+        ['t-gone', 'always', false, 'hc_unavailable'],
+        ['t-idle', 'never', false, 'wake_disabled'],
+      ];
+      for (const [to, wake, woke, reason, ifCond] of expectations) {
+        const res = await send(to, wake);
+        assert.deepEqual([res.woke, res.wakeReason], [woke, reason], `${to}/${wake}`);
+        assert.equal(res.wakeRequested, wake);
+        if (woke) {
+          assert.equal(res.sentNow.length, 1, `${to}/${wake}`);
+          assert.equal(res.sentNow[0].to, to);
+          assert.equal(res.sentNow[0].ifCond, ifCond, `${to}/${wake}`);
+          assert.equal(res.triggerSent, res.sentNow[0].trigger);
+        } else {
+          assert.deepEqual(res.sentNow, [], `${to}/${wake}: nothing is typed into the tab`);
+        }
+      }
+      assert.match((await send('t-gone', 'auto')).wakeError, /t-gone not found/);
 
-    // Omitted message MUST still be present in inbox
-    const remaining1 = peekInbox(env.projectDir, 'tab-p1');
-    assert.equal(remaining1.count, 1);
-    assert.equal(remaining1.messages[0].id, 'msg-omit');
+      // relay_tabs shows the unknown state instead of calling the tab busy
+      const lsHc = makeFakeHc({
+        ls: {
+          terminals: [
+            ...REAL_HC_LS.terminals,
+            hcLsRow({ address: 't4', cwd: env.projectDir, where: 'proj / 4' }), // an agent row without status
+          ],
+        },
+      });
+      const tabs = (await callTool(createMcpServer({ store, hcClient: lsHc }), 'relay_tabs')).data.tabs;
+      const byId = new Map(tabs.map((t) => [t.terminalId, t]));
+      assert.deepEqual(
+        [byId.get('t4').activity, byId.get('t4').statusUnknown, byId.get('t4').busy, byId.get('t4').idle],
+        ['unknown', true, false, false],
+      );
+      assert.deepEqual([byId.get('t1').activity, byId.get('t1').busy, byId.get('t1').statusUnknown], ['working', true, false]);
+      assert.deepEqual([byId.get('t2').activity, byId.get('t2').isBareShell, byId.get('t2').agent], ['shell', true, 'powershell.exe']);
 
-    // Case 2: Single oversized message is truncated -> includedIds is [] -> message restored for relay_inbox!
-    const d2 = drainInbox(env.projectDir, 'tab-p1');
-    const det2 = formatInboxForHookDetailed(d2.messages, { maxChars: 140 + INBOX_PREAMBLE_COST + 2 });
-    assert.deepEqual(det2.includedIds, []);
-    assert.deepEqual(det2.truncatedIds, ['msg-omit']);
-    assert.match(det2.text, /\[\.\.\.trimmed, inspect via relay_inbox\]/);
+      // from_terminal_id validated strictly
+      const badFrom = await callTool(server, 'relay_send', { to_terminal_id: 't-idle', from_terminal_id: '../escape', message: 'hi', wake: 'never' });
+      assert.equal(badFrom.isError, true);
 
-    const ack2 = d2.ack(det2.includedIds);
-    assert.equal(ack2.acked, 0);
-    assert.equal(ack2.restored, 1);
-    assert.equal(peekInbox(env.projectDir, 'tab-p1').count, 1);
-    assert.equal(peekInbox(env.projectDir, 'tab-p1').messages[0].id, 'msg-omit');
+      // Subagent (including camelCase meta.isSubagent: true) cannot call relay_send or relay_inbox(ack), CAN call relay_inbox(peek)
+      const subSend = await callTool(server, 'relay_send', { to_terminal_id: 't-idle', message: 'subagent unauthorized' }, { isSubagent: true });
+      assert.equal(subSend.isError, true);
+      assert.equal(subSend.data.error, 'SUBAGENT_WRITE_DENIED');
+      const subAck = await callTool(server, 'relay_inbox', { action: 'ack', message_id: 'all', terminal_id: 't-shell' }, { isSubagent: true });
+      assert.equal(subAck.isError, true);
+      assert.equal(subAck.data.error, 'SUBAGENT_WRITE_DENIED');
+      const subPeek = await callTool(server, 'relay_inbox', { action: 'peek', terminal_id: 't-shell' }, { isSubagent: true });
+      assert.equal(subPeek.isError, false);
+      assert.equal(subPeek.data.count, 2);
+    });
   } finally {
+    store.close();
     env.cleanup();
   }
 });
 
-test('P0-6 & P0-7 regression: hc blocked/error/done/isBareShell/foreground.cwd/error-json/--if fallback, and subagent relay denial', async () => {
-  const env = makeTempEnv('cortex-hc-guard-');
+// ---------------------------------------------------------------------------------------------
+// A7: tabs on another machine
+// ---------------------------------------------------------------------------------------------
+
+test('relay and remote tabs: relay_send to "pc2/t3" fails with REMOTE_TERMINAL_UNSUPPORTED, relay_tabs lists the tab as remote and not relay-capable', async () => {
+  const env = makeTempEnv('cortex-relay-remote-');
   const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
-  const prevTid = process.env.HC_TERMINAL_ID;
   try {
-    process.env.HC_TERMINAL_ID = 't1';
-    const sendLog = [];
-    let rejectIfFlag = false;
+    // The remote tab's folder has the same path text as this project: still not "the same project"
+    const ls = {
+      ...REAL_HC_LS,
+      terminals: REAL_HC_LS.terminals.map((row) => (row.address === 'pc2/t3' ? { ...row, cwd: env.projectDir } : row)),
+    };
+    const hc = makeFakeHc({ ls });
+    const server = createMcpServer({ store, hcClient: hc });
 
-    const mockHc = createHcClient({
-      hcBin: FAKE_HC_BIN,
-      execFileSync(_bin, args) {
-        if (args[0] === 'ls') {
-          return JSON.stringify({
-            terminals: [
-              { address: 't-blocked', state: 'live', foreground: { name: 'claude', status: 'blocked', cwd: 'G:\\fg-cwd' }, cwd: 'G:\\outer-cwd' },
-              { address: 't-error', state: 'live', foreground: { name: 'claude', status: 'error' } },
-              { address: 't-unknown', state: 'live', foreground: { name: 'claude' } },
-              { address: 't-done', state: 'live', foreground: { name: 'claude', status: 'done' } },
-              { address: 't-shell', state: 'live', foreground: { name: 'powershell.exe', status: 'idle' } },
-            ],
-          });
-        }
-        if (args[0] === 'get' && args[1] === 't-shell') {
-          return JSON.stringify({ address: 't-shell', state: 'live', foreground: { name: 'powershell.exe', status: 'idle', cwd: env.projectDir } });
-        }
-        if (args[0] === 'get' && args[1] === 't-blocked') {
-          return JSON.stringify({ address: 't-blocked', state: 'live', foreground: { name: 'claude', status: 'blocked', cwd: env.projectDir } });
-        }
-        if (args[0] === 'get' && args[1] === 't-done') {
-          return JSON.stringify({ address: 't-done', state: 'live', foreground: { name: 'claude', status: 'done', cwd: env.projectDir } });
-        }
-        if (args[0] === 'get' && args[1] === 't-api-err') {
-          return JSON.stringify({ error: 'terminal not found' });
-        }
-        if (args[0] === 'send') {
-          sendLog.push([...args]);
-          if (rejectIfFlag && args[1] === '--if') {
-            const err = new Error('unknown flag: --if');
-            err.stderr = 'unknown flag: --if';
-            throw err;
-          }
-          return '';
-        }
-        throw new Error(`Unexpected hc call: ${args.join(' ')}`);
-      },
+    await withTerminalId('t3', async () => {
+      const sent = await callTool(server, 'relay_send', { to_terminal_id: 'pc2/t3', message: 'hello over there', wake: 'always' });
+      assert.equal(sent.isError, true);
+      assert.equal(sent.data.error, 'REMOTE_TERMINAL_UNSUPPORTED');
+      assert.equal(sent.data.terminal_id, 'pc2/t3');
+      assert.equal(sent.data.machine, 'pc2');
+      assert.match(sent.data.message, /only between tabs on the same machine/);
+      assert.deepEqual(hc.state.calls, [], 'hc was not asked about, or made to type into, the remote tab');
+      assert.equal(fs.existsSync(path.join(env.globalDir, 'state', 'inbox')), false, 'nothing was queued');
+
+      // An address that is simply malformed keeps the generic validation error
+      const malformed = await callTool(server, 'relay_send', { to_terminal_id: '../escape', message: 'x' });
+      assert.equal(malformed.isError, true);
+      assert.equal(malformed.data.error, 'TOOL_EXECUTION_ERROR');
+      assert.match(malformed.data.message, /Invalid terminalId/);
+
+      const remoteInbox = await callTool(server, 'relay_inbox', { action: 'peek', terminal_id: 'pc2/t3' });
+      assert.equal(remoteInbox.isError, true);
+      assert.equal(remoteInbox.data.error, 'REMOTE_TERMINAL_UNSUPPORTED');
+
+      const tabs = (await callTool(server, 'relay_tabs')).data;
+      assert.equal(tabs.tabs.length, 3, 'the remote tab is listed, not dropped');
+      const remoteTab = tabs.tabs.find((t) => t.terminalId === 'pc2/t3');
+      assert.deepEqual(
+        {
+          remote: remoteTab.remote,
+          machine: remoteTab.machine,
+          relayCapable: remoteTab.relayCapable,
+          sameProject: remoteTab.sameProject,
+          isCurrent: remoteTab.isCurrent,
+          pendingInboxCount: remoteTab.pendingInboxCount,
+          activity: remoteTab.activity,
+          agent: remoteTab.agent,
+        },
+        { remote: true, machine: 'pc2', relayCapable: false, sameProject: false, isCurrent: false, pendingInboxCount: 0, activity: 'idle', agent: 'claude-code' },
+      );
+      const localTab = tabs.tabs.find((t) => t.terminalId === 't1');
+      assert.deepEqual([localTab.remote, localTab.relayCapable, 'machine' in localTab], [false, true, false]);
+
+      // only_same_project never includes a remote tab
+      const same = (await callTool(server, 'relay_tabs', { only_same_project: true })).data;
+      assert.deepEqual(same.tabs.map((t) => t.terminalId), []);
     });
-
-    // 1. detectTerminalActivity: blocked, error, unknown, isBareShell are NOT idle; done IS idle; foreground.cwd wins
-    const ls = mockHc.listTerminals();
-    assert.equal(ls.ok, true);
-    const byId = new Map(ls.terminals.map((t) => [t.terminalId, t]));
-    assert.equal(byId.get('t-blocked').idle, false);
-    assert.equal(byId.get('t-blocked').blocked, true);
-    assert.equal(byId.get('t-blocked').cwd, 'G:\\fg-cwd');
-    assert.equal(byId.get('t-error').idle, false);
-    assert.equal(byId.get('t-error').error, true);
-    assert.equal(byId.get('t-unknown').idle, false);
-    assert.equal(byId.get('t-done').idle, true);
-    assert.equal(byId.get('t-shell').isBareShell, true);
-    assert.equal(byId.get('t-shell').idle, false);
-
-    // 2. parsed.error returns ok: false
-    const apiErr = mockHc.getTerminal('t-api-err');
-    assert.equal(apiErr.ok, false);
-    assert.equal(apiErr.code, 'HC_API_ERROR');
-
-    // 3. sendTrigger --if idle fallback when flag rejected
-    rejectIfFlag = true;
-    const fbRes = mockHc.sendTrigger('t-done', 'ping', { ifIdle: true });
-    assert.equal(fbRes.ok, true);
-    assert.deepEqual(sendLog[0], ['send', '--if', 'idle', 't-done', 'ping']);
-    assert.deepEqual(sendLog[1], ['send', 't-done', 'ping']);
-    rejectIfFlag = false;
-
-    const server = createMcpServer({ store, hcClient: mockHc });
-
-    // 4. wake="auto" blocks bare shell with target_is_bare_shell and does NOT call hc send
-    const sendLogCountBefore = sendLog.length;
-    const bareRes = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tools/call',
-      params: { name: 'relay_send', arguments: { to_terminal_id: 't-shell', message: 'Do not type in bare shell', wake: 'auto' } },
-    });
-    const bareData = JSON.parse(bareRes.result.content[0].text);
-    assert.equal(bareData.queued, true);
-    assert.equal(bareData.woke, false);
-    assert.equal(bareData.wakeReason, 'target_is_bare_shell');
-    assert.equal(sendLog.length, sendLogCountBefore);
-
-    // 5. from_terminal_id validated strictly
-    const badFrom = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'tools/call',
-      params: { name: 'relay_send', arguments: { to_terminal_id: 't-done', from_terminal_id: '../escape', message: 'hi', wake: 'never' } },
-    });
-    assert.equal(badFrom.result.isError, true);
-
-    // 6. Subagent (including camelCase meta.isSubagent: true) cannot call relay_send or relay_inbox(ack), CAN call relay_inbox(peek)
-    const subSend = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 3,
-      method: 'tools/call',
-      params: {
-        name: 'relay_send',
-        arguments: { to_terminal_id: 't-done', message: 'subagent unauthorized' },
-        _meta: { isSubagent: true },
-      },
-    });
-    assert.equal(subSend.result.isError, true);
-    assert.equal(JSON.parse(subSend.result.content[0].text).error, 'SUBAGENT_WRITE_DENIED');
-
-    const subAck = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 4,
-      method: 'tools/call',
-      params: {
-        name: 'relay_inbox',
-        arguments: { action: 'ack', message_id: 'all', terminal_id: 't-shell' },
-        _meta: { isSubagent: true },
-      },
-    });
-    assert.equal(subAck.result.isError, true);
-    assert.equal(JSON.parse(subAck.result.content[0].text).error, 'SUBAGENT_WRITE_DENIED');
-
-    const subPeek = await server.handleMessage({
-      jsonrpc: '2.0',
-      id: 5,
-      method: 'tools/call',
-      params: {
-        name: 'relay_inbox',
-        arguments: { action: 'peek', terminal_id: 't-shell' },
-        _meta: { isSubagent: true },
-      },
-    });
-    assert.ok(!subPeek.result.isError);
-    assert.equal(JSON.parse(subPeek.result.content[0].text).count, 1);
   } finally {
-    if (prevTid === undefined) delete process.env.HC_TERMINAL_ID;
-    else process.env.HC_TERMINAL_ID = prevTid;
     store.close();
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// A8: the same folder reached through a junction
+// ---------------------------------------------------------------------------------------------
+
+test('relay/tools and project_dir: a folder reached through a junction is the same project (compared by real path)', async () => {
+  const env = makeTempEnv('cortex-relay-junction-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  try {
+    const junction = path.join(env.root, 'project-link');
+    fs.symlinkSync(env.projectDir, junction, 'junction');
+    const elsewhere = path.join(env.root, 'elsewhere');
+    fs.mkdirSync(elsewhere);
+
+    recordSession({
+      terminalId: 't-saved',
+      agent: 'claude',
+      payload: { session_id: 'sess-saved', cwd: junction },
+      globalDir: env.globalDir,
+      legacyHome: env.homeDir,
+    });
+
+    const hc = makeFakeHc({
+      ls: {
+        terminals: [
+          hcLsRow({ address: 't-direct', cwd: env.projectDir, status: 'idle' }),
+          hcLsRow({ address: 't-link', cwd: junction, status: 'idle' }),
+          hcLsRow({ address: 't-case', cwd: process.platform === 'win32' ? env.projectDir.toUpperCase() : env.projectDir, status: 'idle' }),
+          hcLsRow({ address: 't-else', cwd: elsewhere, status: 'idle' }),
+        ],
+      },
+    });
+    const scheduled = [];
+    const server = createMcpServer({
+      store,
+      hcClient: hc,
+      embeddingQueue: { schedule: (...args) => scheduled.push(args) },
+    });
+
+    await withTerminalId('t-direct', async () => {
+      const tabs = (await callTool(server, 'relay_tabs')).data;
+      const same = Object.fromEntries(tabs.tabs.map((t) => [t.terminalId, t.sameProject]));
+      assert.deepEqual(same, { 't-direct': true, 't-link': true, 't-case': true, 't-else': false });
+      assert.equal(tabs.savedSessions.find((s) => s.terminalId === 't-saved').sameProject, true);
+      const onlySame = (await callTool(server, 'relay_tabs', { only_same_project: true })).data;
+      assert.deepEqual(onlySame.tabs.map((t) => t.terminalId), ['t-direct', 't-link', 't-case']);
+    });
+
+    // project_dir naming the default project through the junction uses the default store: the embedding queue
+    // is told about the default project, not about "another project" at the junction path
+    const saved = await callTool(server, 'memory_save', {
+      id: 'dec-via-link',
+      type: 'decision',
+      title: 'Saved through the junction',
+      summary: 'Same project',
+      project_dir: junction,
+    });
+    assert.equal(saved.isError, false);
+    assert.deepEqual(scheduled, [['project']]);
+    assert.equal(store.readDoc({ id: 'dec-via-link', scope: 'project' }).title, 'Saved through the junction');
+
+    // A really different folder still goes through its own store
+    approveProject(elsewhere, { globalDir: env.globalDir });
+    scheduled.length = 0;
+    const other = await callTool(server, 'memory_save', { id: 'dec-else', type: 'decision', title: 'Elsewhere', summary: 'Other project', project_dir: elsewhere });
+    assert.equal(other.isError, false);
+    assert.deepEqual(scheduled, [['project', { projectDir: elsewhere }]]);
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// A2: the exclusion policy covers every relay entry point
+// ---------------------------------------------------------------------------------------------
+
+test('excluded project: relay_tabs, relay_send and relay_inbox (peek and ack) return PROJECT_EXCLUDED, hooks deliver nothing there, and the messages wait in the global inbox', async () => {
+  const env = makeTempEnv('cortex-relay-excluded-');
+  const excludedProj = path.join(env.root, 'excluded_relay_proj');
+  fs.mkdirSync(excludedProj, { recursive: true });
+  approveProject(excludedProj, { globalDir: env.globalDir });
+  atomicWriteJson(path.join(env.globalDir, 'config.json'), { mode: 'all', excludedProjects: ['excluded_relay_proj'] });
+
+  const excludedStore = new CortexStore({ projectDir: excludedProj, globalDir: env.globalDir, disableVec: true });
+  const enabledStore = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  try {
+    const hc = makeFakeHc({
+      ls: { terminals: [hcLsRow({ address: 't-ex', cwd: excludedProj, status: 'idle' })] },
+      get: { 't-ex': hcGetAgent({ address: 't-ex', cwd: excludedProj, statusState: 'idle' }) },
+    });
+    const excludedServer = createMcpServer({ store: excludedStore, hcClient: hc });
+    const opts = { globalDir: env.globalDir };
+    // A message that reached the tab's inbox before it moved into the excluded project
+    const waiting = enqueueMessage('t-ex', { from_terminal_id: 't1', message: 'WAITING-MESSAGE' }, opts);
+
+    await withTerminalId('t-ex', async () => {
+      const calls = [
+        ['relay_tabs', {}],
+        ['relay_tabs', { only_same_project: true }],
+        ['relay_send', { to_terminal_id: 't1', message: 'blocked' }],
+        ['relay_inbox', {}],
+        ['relay_inbox', { action: 'peek' }],
+        ['relay_inbox', { action: 'ack', message_id: waiting.id }],
+        ['relay_inbox', { action: 'ack', message_id: 'all' }],
+      ];
+      for (const [name, args] of calls) {
+        const res = await callTool(excludedServer, name, args);
+        assert.equal(res.isError, true, `${name} ${JSON.stringify(args)}`);
+        assert.equal(res.data.error, 'PROJECT_EXCLUDED', `${name} ${JSON.stringify(args)}`);
+        assert.equal(res.data.tool, name);
+        assert.equal(res.data.project_dir, path.resolve(excludedProj));
+      }
+      assert.deepEqual(hc.state.calls, [], 'hc is not consulted for an excluded project');
+    });
+
+    // Hooks do not deliver in the excluded project either
+    assert.equal(claudePrompt(env, 't-ex', excludedProj), '');
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 'sess-ex', source: 'startup', cwd: excludedProj },
+        { terminalId: 't-ex', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+    assert.equal(peekInbox('t-ex', opts).count, 1, 'the message was neither delivered nor deleted');
+    assert.equal(fs.existsSync(path.join(excludedProj, '.memory')), false);
+
+    // A tab working in an excluded project is not a relay target
+    const enabledServer = createMcpServer({ store: enabledStore, hcClient: hc });
+    await withTerminalId('t1', async () => {
+      const refused = await callTool(enabledServer, 'relay_send', { to_terminal_id: 't-ex', message: 'Cannot land in excluded project' });
+      assert.equal(refused.isError, true);
+      assert.equal(refused.data.error, 'TARGET_PROJECT_EXCLUDED');
+      assert.equal(countPendingMessages('t-ex', opts), 1);
+      // ... while relay tools of an enabled project work
+      assert.equal((await callTool(enabledServer, 'relay_tabs')).isError, false);
+    });
+
+    // Once the same terminal works in an enabled project again, the waiting message is delivered
+    assert.match(claudePrompt(env, 't-ex', env.projectDir), /^> WAITING-MESSAGE$/m);
+  } finally {
+    excludedStore.close();
+    enabledStore.close();
     env.cleanup();
   }
 });
@@ -749,7 +1369,7 @@ test('P0-3, P0-11, P1-8, P1-11, P2-5 regression: MCP excludedProjects enforcemen
 
   try {
     // 1. Check schema fixes & SERVER_INSTRUCTIONS
-    const enabledServer = createMcpServer({ store: enabledStore });
+    const enabledServer = createMcpServer({ store: enabledStore, hcClient: makeFakeHc() });
     const initEnabled = await enabledServer.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
     assert.equal(initEnabled.result.instructions, SERVER_INSTRUCTIONS);
     assert.match(SERVER_INSTRUCTIONS, /preferences/);
@@ -771,109 +1391,56 @@ test('P0-3, P0-11, P1-8, P1-11, P2-5 regression: MCP excludedProjects enforcemen
     assert.equal(rootsNotif, null);
 
     // 2. Excluded project server: instructions, PROJECT_EXCLUDED blocks, global reads/writes allowed, NEVER creates .memory/
-    const excludedServer = createMcpServer({ store: excludedStore });
+    const excludedServer = createMcpServer({ store: excludedStore, hcClient: makeFakeHc() });
     const initExcluded = await excludedServer.handleMessage({ jsonrpc: '2.0', id: 3, method: 'initialize', params: {} });
     assert.equal(initExcluded.result.instructions, EXCLUDED_SERVER_INSTRUCTIONS);
+    assert.match(EXCLUDED_SERVER_INSTRUCTIONS, /relay_tabs\/relay_send\/relay_inbox/);
 
-    const saveProjBlocked = await excludedServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 4,
-      method: 'tools/call',
-      params: { name: 'memory_save', arguments: { type: 'decision', title: 'Blocked', summary: 'Must fail' } },
-    });
-    assert.equal(saveProjBlocked.result.isError, true);
-    assert.equal(JSON.parse(saveProjBlocked.result.content[0].text).error, 'PROJECT_EXCLUDED');
+    const saveProjBlocked = await callTool(excludedServer, 'memory_save', { type: 'decision', title: 'Blocked', summary: 'Must fail' });
+    assert.equal(saveProjBlocked.isError, true);
+    assert.equal(saveProjBlocked.data.error, 'PROJECT_EXCLUDED');
 
-    const updateProjBlocked = await excludedServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 5,
-      method: 'tools/call',
-      params: { name: 'memory_update', arguments: { id: 'dec-1', status: 'done' } },
-    });
-    assert.equal(updateProjBlocked.result.isError, true);
-    assert.equal(JSON.parse(updateProjBlocked.result.content[0].text).error, 'PROJECT_EXCLUDED');
+    const updateProjBlocked = await callTool(excludedServer, 'memory_update', { id: 'dec-1', status: 'done' });
+    assert.equal(updateProjBlocked.isError, true);
+    assert.equal(updateProjBlocked.data.error, 'PROJECT_EXCLUDED');
 
-    const relayBlocked = await excludedServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 6,
-      method: 'tools/call',
-      params: { name: 'relay_send', arguments: { to_terminal_id: 't2', message: 'blocked' } },
-    });
-    assert.equal(relayBlocked.result.isError, true);
-    assert.equal(JSON.parse(relayBlocked.result.content[0].text).error, 'PROJECT_EXCLUDED');
+    const relayBlocked = await callTool(excludedServer, 'relay_send', { to_terminal_id: 't2', message: 'blocked' });
+    assert.equal(relayBlocked.isError, true);
+    assert.equal(relayBlocked.data.error, 'PROJECT_EXCLUDED');
 
     // Global save + overview + search work on excluded project without EVER creating <excluded>/.memory/
-    const saveGlobal = await excludedServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 7,
-      method: 'tools/call',
-      params: {
-        name: 'memory_save',
-        arguments: { scope: 'global', type: 'knowledge', category: 'preferences', title: 'Global Pref', summary: 'Use Korean' },
-      },
+    const saveGlobal = await callTool(excludedServer, 'memory_save', {
+      scope: 'global', type: 'knowledge', category: 'preferences', title: 'Global Pref', summary: 'Use Korean',
     });
-    assert.ok(!saveGlobal.result.isError);
+    assert.equal(saveGlobal.isError, false);
 
-    const ovExcluded = await excludedServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 8,
-      method: 'tools/call',
-      params: { name: 'memory_overview', arguments: { format: 'json' } },
-    });
-    const ovExData = JSON.parse(ovExcluded.result.content[0].text);
-    assert.equal(ovExData.projectExcluded, true);
-    assert.equal(ovExData.globalPreferences.length, 1);
+    const ovExcluded = await callTool(excludedServer, 'memory_overview', { format: 'json' });
+    assert.equal(ovExcluded.data.projectExcluded, true);
+    assert.equal(ovExcluded.data.globalPreferences.length, 1);
 
-    const searchExcluded = await excludedServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 9,
-      method: 'tools/call',
-      params: { name: 'memory_search', arguments: { query: 'Korean', scope: 'all' } },
-    });
-    assert.ok(JSON.parse(searchExcluded.result.content[0].text).results.length >= 1);
+    const searchExcluded = await callTool(excludedServer, 'memory_search', { query: 'Korean', scope: 'all' });
+    assert.ok(searchExcluded.data.results.length >= 1);
     assert.equal(fs.existsSync(path.join(excludedProj, '.memory')), false);
 
     // 3. Cross-project relay_send targeting excluded project returns TARGET_PROJECT_EXCLUDED & never creates .memory/
-    const mockHcTargetExcl = createHcClient({
-      hcBin: FAKE_HC_BIN,
-      execFileSync(_bin, args) {
-        if (args[0] === 'get' && args[1] === 't-excl') {
-          return JSON.stringify({ address: 't-excl', state: 'live', foreground: { name: 'claude', status: 'idle', cwd: excludedProj } });
-        }
-        return '';
-      },
-    });
-    const xprojServer = createMcpServer({ store: enabledStore, hcClient: mockHcTargetExcl });
-    const targetExclResp = await xprojServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 10,
-      method: 'tools/call',
-      params: { name: 'relay_send', arguments: { to_terminal_id: 't-excl', message: 'Cannot land in excluded project' } },
-    });
-    assert.equal(targetExclResp.result.isError, true);
-    assert.equal(JSON.parse(targetExclResp.result.content[0].text).error, 'TARGET_PROJECT_EXCLUDED');
+    const hcTargetExcl = makeFakeHc({ get: { 't-excl': hcGetAgent({ address: 't-excl', cwd: excludedProj, statusState: 'idle' }) } });
+    const xprojServer = createMcpServer({ store: enabledStore, hcClient: hcTargetExcl });
+    const targetExcl = await callTool(xprojServer, 'relay_send', { to_terminal_id: 't-excl', message: 'Cannot land in excluded project' });
+    assert.equal(targetExcl.isError, true);
+    assert.equal(targetExcl.data.error, 'TARGET_PROJECT_EXCLUDED');
     assert.equal(fs.existsSync(path.join(excludedProj, '.memory')), false);
+    assert.equal(countPendingMessages('t-excl', { globalDir: env.globalDir }), 0);
+    assert.deepEqual(hcTargetExcl.state.sent, []);
 
     // 4. Optional project_dir override works cleanly on memory_save & memory_search
-    const saveOther = await enabledServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 11,
-      method: 'tools/call',
-      params: {
-        name: 'memory_save',
-        arguments: { id: 'other-doc-1', type: 'decision', title: 'Other workspace doc', summary: 'Stored via project_dir', project_dir: otherEnabledProj },
-      },
+    const saveOther = await callTool(enabledServer, 'memory_save', {
+      id: 'other-doc-1', type: 'decision', title: 'Other workspace doc', summary: 'Stored via project_dir', project_dir: otherEnabledProj,
     });
-    assert.ok(!saveOther.result.isError);
+    assert.equal(saveOther.isError, false);
     assert.equal(fs.existsSync(path.join(otherEnabledProj, '.memory', 'docs')), true);
 
-    const readOther = await enabledServer.handleMessage({
-      jsonrpc: '2.0',
-      id: 12,
-      method: 'tools/call',
-      params: { name: 'memory_read', arguments: { id: 'other-doc-1', scope: 'project', project_dir: otherEnabledProj } },
-    });
-    assert.equal(JSON.parse(readOther.result.content[0].text).id, 'other-doc-1');
+    const readOther = await callTool(enabledServer, 'memory_read', { id: 'other-doc-1', scope: 'project', project_dir: otherEnabledProj });
+    assert.equal(readOther.data.id, 'other-doc-1');
 
     // 5. P1-8: Stdio start() sends JSON-RPC -32603 error response if internal handleMessage throws (never hangs client)
     const input = new PassThrough();
@@ -883,6 +1450,7 @@ test('P0-3, P0-11, P1-8, P1-11, P2-5 regression: MCP excludedProjects enforcemen
 
     const crashingServer = createMcpServer({
       store: enabledStore,
+      hcClient: makeFakeHc(),
       input,
       output,
       extraTools: [],

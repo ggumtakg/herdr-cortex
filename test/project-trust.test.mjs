@@ -543,20 +543,51 @@ test('trust / Claude hooks: an unapproved .memory/ is neither injected nor touch
   }
 });
 
-test('trust / Claude hooks: the relay inbox of a project is drained only after approval', () => {
+test('trust / relay inbox: the old per-project inbox is read only for an approved, enabled project (and moved to the global inbox); the global inbox is delivered regardless of approval', () => {
   const env = makeTempEnv('cortex-trust-inbox-');
   try {
-    plantMemory(env.projectDir);
+    const memoryDir = plantMemory(env.projectDir);
+    const before = snapshotTree(memoryDir);
     const hookOpts = { terminalId: 'tab-1', globalDir: env.globalDir };
+    const inboxOpts = { globalDir: env.globalDir, projectDir: env.projectDir };
+    const oldInboxDir = path.join(memoryDir, 'state', 'inbox', 'tab-1');
+    const promptContext = () => handleClaudeUserPrompt({ cwd: env.projectDir }, hookOpts).hookSpecificOutput?.additionalContext || '';
 
-    assert.deepEqual(handleClaudeUserPrompt({ cwd: env.projectDir }, hookOpts), {});
+    // --- not approved: a "message from another tab" shipped inside the repository is never read ---
+    assert.equal(promptContext(), '');
     assert.doesNotMatch(claudeStart(env, env.projectDir), PLANTED);
-    assert.equal(peekInbox(env.projectDir, 'tab-1').count, 1, 'the message is still waiting');
+    assert.equal(peekInbox('tab-1', inboxOpts).count, 0);
+    assert.deepEqual(snapshotTree(memoryDir), before, 'the old inbox of an unapproved folder is neither read nor moved');
 
+    // ... while a real relay message (global inbox) reaches the tab although the folder is not approved
+    enqueueMessage('tab-1', { from_terminal_id: 'tab-5', message: 'GENUINE-RELAY-MESSAGE' }, { globalDir: env.globalDir });
+    const genuine = promptContext();
+    assert.match(genuine, /GENUINE-RELAY-MESSAGE/);
+    assert.doesNotMatch(genuine, PLANTED);
+    assert.equal(promptContext(), '', 'delivered once');
+    enqueueMessage('tab-1', { from_terminal_id: 'tab-5', message: 'GENUINE-AT-SESSION-START' }, { globalDir: env.globalDir });
+    const startCtx = claudeStart(env, env.projectDir);
+    assert.match(startCtx, /GENUINE-AT-SESSION-START/);
+    assert.doesNotMatch(startCtx, PLANTED);
+    assert.deepEqual(snapshotTree(memoryDir), before);
+
+    // --- approved but excluded by the configuration: still not read, and nothing is delivered there ---
     approveProject(env.projectDir, { globalDir: env.globalDir });
-    const out = handleClaudeUserPrompt({ cwd: env.projectDir }, hookOpts);
-    assert.match(out.hookSpecificOutput.additionalContext, /PLANTED-RELAY-MESSAGE/);
-    assert.equal(peekInbox(env.projectDir, 'tab-1').count, 0);
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { excludedProjects: [env.projectDir] });
+    enqueueMessage('tab-1', { from_terminal_id: 'tab-5', message: 'WAITS-WHILE-EXCLUDED' }, { globalDir: env.globalDir });
+    assert.equal(promptContext(), '');
+    assert.equal(peekInbox('tab-1', inboxOpts).count, 1, 'only the global message; the old location is not looked at');
+    assert.deepEqual(snapshotTree(memoryDir), before);
+
+    // --- approved and enabled: the old messages move to the global inbox and are delivered like any other ---
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), {});
+    const delivered = promptContext();
+    assert.match(delivered, /PLANTED-RELAY-MESSAGE/);
+    assert.match(delivered, /WAITS-WHILE-EXCLUDED/);
+    assert.equal(fs.existsSync(oldInboxDir), false, 'the emptied old directory is removed');
+    assert.equal(fs.existsSync(path.dirname(oldInboxDir)), false);
+    assert.equal(peekInbox('tab-1', inboxOpts).count, 0);
+    assert.equal(promptContext(), '');
   } finally {
     env.cleanup();
   }
@@ -1090,11 +1121,12 @@ test('.memory/.gitignore: created by the first write, never overwritten, never c
     legacyStore.close();
   }
 
-  // A relay message queued for a project creates the folder too: it gets the same .gitignore
+  // A relay message is stored in the global inbox: nothing is created in any project folder
   const relayTarget = path.join(env.root, 'relay-target');
   fs.mkdirSync(relayTarget, { recursive: true });
-  enqueueMessage(relayTarget, 'tab-7', { from_terminal_id: 'tab-1', message: 'hello' });
-  assert.equal(fs.readFileSync(path.join(relayTarget, '.memory', '.gitignore'), 'utf8'), '*\n');
+  const queued = enqueueMessage('tab-7', { from_terminal_id: 'tab-1', message: 'hello' }, { globalDir: env.globalDir });
+  assert.equal(path.dirname(queued.filePath), path.join(env.globalDir, 'state', 'inbox', 'tab-7'));
+  assert.deepEqual(fs.readdirSync(relayTarget), []);
 
   env.cleanup();
 });

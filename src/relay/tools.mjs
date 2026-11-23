@@ -1,13 +1,30 @@
 import path from 'node:path';
-import { isProjectEnabled, loadConfig } from '../core/config.mjs';
-import { createHcClient, sanitizeSingleLineTrigger } from './hc.mjs';
-import { ackMessage, drainInbox, enqueueMessage, peekInbox } from './inbox.mjs';
+import { isProjectEnabled, loadConfig, projectPathKey } from '../core/config.mjs';
+import { createHcClient, parseTerminalAddress, sanitizeSingleLineTrigger } from './hc.mjs';
+import { ackMessage, countPendingMessages, drainInbox, enqueueMessage, peekInbox } from './inbox.mjs';
 import { isValidTerminalId, listSavedSessions, readSavedSession, validateTerminalId } from '../revive/tracker.mjs';
 import { isSubagentCaller } from '../mcp/tools.mjs';
 
-function normalizePathKey(p) {
+// How long an explicit relay_inbox(action="ack") waits for a hook that is delivering the same terminal's
+// messages at that moment (hooks themselves never wait for the lock).
+const ACK_LOCK_WAIT_MS = 500;
+
+// Why a wake trigger is never typed into a tab, whatever the wake policy: keyed by `activity`.
+const NEVER_WAKE_REASONS = Object.freeze({
+  not_live: 'target_not_live',
+  shell: 'target_is_bare_shell',
+  error: 'target_error',
+});
+
+// Comparison key of a folder: its real path (junctions and symlinks resolved, lower-cased on Windows),
+// so a tab that reached the same folder through a junction is the same project.
+function pathKey(p) {
   if (typeof p !== 'string' || !p.trim()) return '';
-  return path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+  try {
+    return projectPathKey(p.trim());
+  } catch {
+    return '';
+  }
 }
 
 function resolveProjectSessions(store, projectEnabled) {
@@ -30,8 +47,26 @@ function buildWakeTrigger({ messageId, fromTerminalId, contextDocs }) {
   );
 }
 
+function remoteTerminalError(toolName, rawAddress, machine) {
+  return {
+    isError: true,
+    errorCode: 'REMOTE_TERMINAL_UNSUPPORTED',
+    data: {
+      error: 'REMOTE_TERMINAL_UNSUPPORTED',
+      tool: toolName,
+      terminal_id: rawAddress,
+      machine,
+      message: `Terminal "${rawAddress}" is on another machine ("${machine}"). Relay works only between tabs on the `
+        + 'same machine: the inbox is a local file on this machine and is not read by tabs elsewhere.',
+    },
+  };
+}
+
 /**
  * Create the 3 Herdr relay MCP tools: relay_tabs, relay_send, relay_inbox.
+ * All three refuse to work (`PROJECT_EXCLUDED`) when the session's current project is excluded by the
+ * herdr-cortex configuration. The inbox lives in the global store (`<globalDir>/state/inbox/<terminalId>/`),
+ * so nothing is created inside any project folder and project approval is not involved.
  */
 export function createRelayTools({
   projectDir = process.cwd(),
@@ -44,7 +79,7 @@ export function createRelayTools({
 } = {}) {
   const hc = hcClient || createHcClient();
   const resolvedProjectDir = path.resolve(projectDir);
-  const projectPathKey = normalizePathKey(resolvedProjectDir);
+  const currentProjectKey = pathKey(resolvedProjectDir);
 
   const isCurrentProjectEnabled = () => {
     if (typeof projectEnabled === 'boolean') return projectEnabled;
@@ -52,9 +87,23 @@ export function createRelayTools({
     return isProjectEnabled(resolvedProjectDir, cfg);
   };
 
+  const projectExcludedError = (toolName) => ({
+    isError: true,
+    errorCode: 'PROJECT_EXCLUDED',
+    data: {
+      error: 'PROJECT_EXCLUDED',
+      tool: toolName,
+      project_dir: resolvedProjectDir,
+      message: `Project "${resolvedProjectDir}" is excluded by herdr-cortex configuration; ${toolName} is disabled.`,
+    },
+  });
+
+  const isSameProject = (cwd) => Boolean(cwd) && Boolean(currentProjectKey) && pathKey(cwd) === currentProjectKey;
+
   const relayTabsTool = {
     name: 'relay_tabs',
-    description: 'List live Herdr terminals combined with saved revive sessions and project memory session mapping.',
+    description: 'List live Herdr terminals combined with saved revive sessions and project memory session mapping. '
+      + 'activity is idle | working | blocked | error | unknown | shell | not_live; tabs on another machine are listed with remote: true and cannot receive relay messages.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -62,10 +111,14 @@ export function createRelayTools({
       },
     },
     async handler(args) {
+      if (!isCurrentProjectEnabled()) {
+        return projectExcludedError('relay_tabs');
+      }
+
       const currentTerminalId = getCurrentTerminalId();
       const savedList = listSavedSessions({ globalDir, legacyHome });
       const savedById = new Map(savedList.map((s) => [s.terminalId, s]));
-      const projectSessions = resolveProjectSessions(store, isCurrentProjectEnabled());
+      const projectSessions = resolveProjectSessions(store, true);
 
       const lsRes = hc.listTerminals();
       const tabs = [];
@@ -73,16 +126,20 @@ export function createRelayTools({
       if (lsRes.ok) {
         for (const t of lsRes.terminals) {
           const tid = t.terminalId;
-          const saved = tid ? savedById.get(tid) || null : null;
+          // A tab on another machine ("pc2/t3") is shown, but it has no inbox here and its folder is a
+          // path on that machine, so it is never "the same project" and never relay-capable.
+          const remote = Boolean(t.remote);
+          const relayCapable = !remote && isValidTerminalId(tid);
+          const saved = relayCapable ? savedById.get(tid) || null : null;
           const tabCwd = t.cwd || saved?.cwd || '';
-          const sameProject = Boolean(tabCwd) && normalizePathKey(tabCwd) === projectPathKey;
+          const sameProject = !remote && isSameProject(tabCwd);
 
           if (args.only_same_project && !sameProject) continue;
 
           let pendingInboxCount = 0;
-          if (tid && isValidTerminalId(tid)) {
+          if (relayCapable) {
             try {
-              pendingInboxCount = peekInbox(tabCwd || resolvedProjectDir, tid).count;
+              pendingInboxCount = countPendingMessages(tid, { globalDir });
             } catch {
               pendingInboxCount = 0;
             }
@@ -91,10 +148,15 @@ export function createRelayTools({
           tabs.push({
             terminalId: tid,
             isCurrent: Boolean(currentTerminalId) && tid === currentTerminalId,
+            remote,
+            ...(remote ? { machine: t.machine } : {}),
+            relayCapable,
             live: t.live,
             state: t.state,
+            activity: t.activity,
             idle: t.idle,
             busy: t.busy,
+            statusUnknown: Boolean(t.unknown),
             agent: t.agentName || saved?.agent || '',
             isBareShell: t.isBareShell,
             where: t.where,
@@ -126,7 +188,7 @@ export function createRelayTools({
           sessionId: s.sessionId,
           previousSessionId: s.previousSessionId || null,
           cwd: s.cwd || '',
-          sameProject: Boolean(s.cwd) && normalizePathKey(s.cwd) === projectPathKey,
+          sameProject: isSameProject(s.cwd),
           updatedAt: s.updatedAt || '',
           source: s.source || 'cortex',
         })),
@@ -137,13 +199,13 @@ export function createRelayTools({
 
   const relaySendTool = {
     name: 'relay_send',
-    description: 'Send a message (with optional context_docs IDs) to another Herdr terminal via atomic file inbox, optionally sending a short single-line wake trigger via hc send.',
+    description: 'Send a message (with optional context_docs IDs) to another Herdr terminal on this machine via atomic file inbox, optionally sending a short single-line wake trigger via hc send.',
     writeProtected: true,
     inputSchema: {
       type: 'object',
       required: ['to_terminal_id', 'message'],
       properties: {
-        to_terminal_id: { type: 'string', description: 'Target Herdr HC_TERMINAL_ID' },
+        to_terminal_id: { type: 'string', description: 'Target Herdr HC_TERMINAL_ID (a tab on this machine)' },
         message: { type: 'string', description: 'Full message body (stored safely in file inbox)' },
         context_docs: {
           type: 'array',
@@ -154,22 +216,19 @@ export function createRelayTools({
           type: 'string',
           enum: ['auto', 'always', 'never'],
           default: 'auto',
-          description: 'Wake policy via hc send: auto (only when target is live & idle), always, or never',
+          description: 'Wake policy via hc send: auto (only when the target agent is idle), always (also while it is working; never into a bare shell, a tab that is not live, or one in an error state), or never',
         },
         from_terminal_id: { type: 'string', description: 'Optional sender terminal ID override' },
       },
     },
     async handler(args) {
       if (!isCurrentProjectEnabled()) {
-        return {
-          isError: true,
-          errorCode: 'PROJECT_EXCLUDED',
-          data: {
-            error: 'PROJECT_EXCLUDED',
-            project_dir: resolvedProjectDir,
-            message: `Project "${resolvedProjectDir}" is excluded by herdr-cortex configuration; relay_send is disabled.`,
-          },
-        };
+        return projectExcludedError('relay_send');
+      }
+
+      const targetAddress = parseTerminalAddress(args.to_terminal_id);
+      if (targetAddress.remote) {
+        return remoteTerminalError('relay_send', String(args.to_terminal_id).trim(), targetAddress.machine);
       }
 
       const toTerminalId = validateTerminalId(args.to_terminal_id);
@@ -197,7 +256,8 @@ export function createRelayTools({
         ? [...new Set(args.context_docs.map((d) => String(d).trim()).filter(Boolean))]
         : [];
 
-      // Resolve target terminal's project directory from hc get -> saved revive session -> current projectDir
+      // The target tab's project (hc get -> saved revive session -> current project) decides one thing only:
+      // a tab working in an excluded project gets no relay messages. Nothing is written into that folder.
       const getRes = hc.getTerminal(toTerminalId);
       const savedTarget = readSavedSession(toTerminalId, { globalDir, legacyHome });
       const rawTargetDir =
@@ -206,7 +266,6 @@ export function createRelayTools({
         || resolvedProjectDir;
       const targetProjectDir = path.resolve(rawTargetDir);
 
-      // Never write inbox files or create .memory/ inside an excluded target project
       const targetConfig = loadConfig({ projectDir: targetProjectDir, globalDir });
       if (!isProjectEnabled(targetProjectDir, targetConfig)) {
         return {
@@ -221,11 +280,15 @@ export function createRelayTools({
         };
       }
 
-      const enqueued = enqueueMessage(targetProjectDir, toTerminalId, {
-        from_terminal_id: fromTerminalId,
-        message,
-        context_docs: contextDocs,
-      });
+      const enqueued = enqueueMessage(
+        toTerminalId,
+        {
+          from_terminal_id: fromTerminalId,
+          message,
+          context_docs: contextDocs,
+        },
+        { globalDir },
+      );
 
       const trigger = buildWakeTrigger({
         messageId: enqueued.id,
@@ -238,40 +301,38 @@ export function createRelayTools({
       let wakeError = null;
       let triggerSent = null;
 
-      if (wake === 'always') {
-        const sendRes = hc.sendTrigger(toTerminalId, trigger);
+      const sendTrigger = (options, sentReason) => {
+        const sendRes = hc.sendTrigger(toTerminalId, trigger, options);
         if (sendRes.ok) {
           woke = true;
-          wakeReason = 'sent_always';
+          wakeReason = sentReason;
           triggerSent = sendRes.sent;
         } else {
           wakeReason = 'hc_send_failed';
           wakeError = sendRes.error;
         }
-      } else if (wake === 'auto') {
-        if (!getRes.ok) {
+      };
+
+      if (wake !== 'never') {
+        const target = getRes.ok ? getRes.status : null;
+        if (!target) {
+          // Without the tab's state nothing can rule out a bare shell: do not type.
           wakeReason = 'hc_unavailable';
           wakeError = getRes.error;
-        } else if (!getRes.status.live) {
-          wakeReason = 'target_not_live';
-        } else if (getRes.status.isBareShell === true) {
-          wakeReason = 'target_is_bare_shell';
-        } else if (getRes.status.blocked) {
+        } else if (NEVER_WAKE_REASONS[target.activity]) {
+          wakeReason = NEVER_WAKE_REASONS[target.activity];
+        } else if (wake === 'always') {
+          // Also while the agent is working: the trigger is queued behind its current turn.
+          sendTrigger({}, 'sent_always');
+        } else if (target.blocked) {
           wakeReason = 'target_blocked';
-        } else if (getRes.status.error) {
-          wakeReason = 'target_error';
-        } else if (getRes.status.busy || !getRes.status.idle) {
+        } else if (target.busy) {
           wakeReason = 'target_busy';
+        } else if (!target.idle) {
+          // The status could not be interpreted: unknown is neither busy nor idle.
+          wakeReason = 'target_status_unknown';
         } else {
-          const sendRes = hc.sendTrigger(toTerminalId, trigger, { ifIdle: true });
-          if (sendRes.ok) {
-            woke = true;
-            wakeReason = 'sent_auto_idle';
-            triggerSent = sendRes.sent;
-          } else {
-            wakeReason = 'hc_send_failed';
-            wakeError = sendRes.error;
-          }
+          sendTrigger({ ifIdle: true }, 'sent_auto_idle');
         }
       }
 
@@ -293,7 +354,7 @@ export function createRelayTools({
 
   const relayInboxTool = {
     name: 'relay_inbox',
-    description: 'Inspect (peek) or acknowledge (ack) incoming Herdr relay messages for the current HC_TERMINAL_ID.',
+    description: 'Inspect (peek: full message bodies, announced flag) or acknowledge (ack) incoming Herdr relay messages for the current HC_TERMINAL_ID.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -315,6 +376,10 @@ export function createRelayTools({
           },
         };
       }
+      if (!isCurrentProjectEnabled()) {
+        return projectExcludedError('relay_inbox');
+      }
+
       const rawTerminalId = typeof args.terminal_id === 'string' && args.terminal_id.trim()
         ? args.terminal_id.trim()
         : getCurrentTerminalId();
@@ -329,10 +394,17 @@ export function createRelayTools({
         };
       }
 
+      const address = parseTerminalAddress(rawTerminalId);
+      if (address.remote) {
+        return remoteTerminalError('relay_inbox', rawTerminalId, address.machine);
+      }
       const terminalId = validateTerminalId(rawTerminalId);
+      // `projectDir` only lets the inbox move what this (approved, enabled) project still keeps in the old
+      // per-project location; the messages themselves are in the global store.
+      const inboxOptions = { globalDir, projectDir: resolvedProjectDir };
 
       if (action === 'peek') {
-        return peekInbox(resolvedProjectDir, terminalId);
+        return peekInbox(terminalId, inboxOptions);
       }
 
       if (action === 'ack') {
@@ -346,8 +418,9 @@ export function createRelayTools({
             },
           };
         }
+        const busyMessage = 'Another process is delivering this terminal\'s messages right now; nothing was acknowledged. Call again.';
         if (msgId === 'all') {
-          const drained = drainInbox(resolvedProjectDir, terminalId);
+          const drained = drainInbox(terminalId, { ...inboxOptions, lockWaitMs: ACK_LOCK_WAIT_MS });
           const ackRes = drained.ack();
           return {
             acked: ackRes.acked > 0,
@@ -355,9 +428,11 @@ export function createRelayTools({
             terminalId,
             messageIds: drained.messages.map((m) => m.id),
             notices: drained.notices,
+            ...(drained.busy ? { busy: true, message: busyMessage } : {}),
           };
         }
-        return ackMessage(resolvedProjectDir, terminalId, msgId);
+        const ackRes = ackMessage(terminalId, msgId, { ...inboxOptions, lockWaitMs: ACK_LOCK_WAIT_MS });
+        return ackRes.busy ? { ...ackRes, message: busyMessage } : ackRes;
       }
 
       return {

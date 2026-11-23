@@ -1,16 +1,28 @@
 import { chunkMarkdown, splitLongText } from '../core/frontmatter.mjs';
 import { ensureVectorTable, readIndexMeta, syncFromDisk, withTransaction } from '../core/db.mjs';
 import { classifyEmbeddingError } from './breaker.mjs';
-import { MAX_EMBED_ATTEMPTS } from './failed.mjs';
-import { resolveEmbeddingProvider } from './resolve.mjs';
+import { MAX_EMBED_ATTEMPTS, MAX_EMBED_SERVICE_FAILURES } from './failed.mjs';
+import { resolveEmbeddingProvider, resolveTierEmbeddingProviders } from './resolve.mjs';
 
 export {
   classifyEmbeddingError,
   createEmbeddingBreaker,
   getSharedEmbeddingBreaker,
 } from './breaker.mjs';
-export { MAX_EMBED_ATTEMPTS, listFailedEmbeddings, retryFailedEmbeddings } from './failed.mjs';
-export { describeEmbeddingStatus, formatEmbeddingStatus, resolveEmbeddingProvider } from './resolve.mjs';
+export {
+  GIVEN_UP_REASONS,
+  MAX_EMBED_ATTEMPTS,
+  MAX_EMBED_SERVICE_FAILURES,
+  listFailedEmbeddings,
+  retryFailedEmbeddings,
+} from './failed.mjs';
+export {
+  describeEmbeddingStatus,
+  embeddingSelectionKey,
+  formatEmbeddingStatus,
+  resolveEmbeddingProvider,
+  resolveTierEmbeddingProviders,
+} from './resolve.mjs';
 
 function makeChunkPrefix(title, heading, safeMax) {
   const t = String(title || '').trim();
@@ -108,14 +120,24 @@ function idleResult(reason, extra = {}) {
   };
 }
 
+const isUsableProvider = (candidate) => Boolean(candidate) && typeof candidate.embed === 'function';
+
 /**
  * Process pending (or model-mismatched) embeddings for one or both tiers.
  * Handles automatic doc_chunks_vec rebuild when embedding model or dimensions change.
  *
+ * Each tier is embedded by its own provider: the project tier by the one `store.config` selects, the global
+ * tier by the one `store.globalConfig` selects (see `resolveTierEmbeddingProviders`). `providers`
+ * ({ project, global }) supplies them ready-made; `provider` is a single provider used for every tier.
+ * A tier without a provider is skipped; the result names the provider of the first tier that had one and
+ * lists each tier under `tiers`.
+ *
  * Failures are handled by kind (see `classifyEmbeddingError`):
  *   - document: counted in the document's `embed_attempts`; after MAX_EMBED_ATTEMPTS it is no longer retried.
- *   - service (timeout, network, HTTP 408/429/5xx): not counted against any document. The run stops,
- *     `breaker` (when given) is opened, and the result has `reason: 'service_unavailable'`.
+ *   - service (timeout, network, HTTP 408/429/5xx): not counted in `embed_attempts`. The run stops,
+ *     `breaker` (when given) is opened, and the result has `reason: 'service_unavailable'`. The document that
+ *     was being embedded gets one more `embed_service_failures`; when the same document has caused
+ *     MAX_EMBED_SERVICE_FAILURES of them it is no longer retried either (it is then the likely cause).
  *   - auth (HTTP 401/403): not counted against any document. The run stops with `reason: 'auth_failed'`.
  * While `breaker` is open nothing is attempted at all (`reason: 'circuit_open'`).
  * `circuitBroken` is true whenever the run was stopped or skipped for one of these reasons.
@@ -126,6 +148,7 @@ export async function processPendingEmbeddings(
   {
     scope = 'all',
     provider = null,
+    providers = null,
     maxDocs = 100,
     chunkMaxChars,
     chunkOverlap,
@@ -136,16 +159,30 @@ export async function processPendingEmbeddings(
     return idleResult('circuit_open', { circuitBroken: true });
   }
 
-  const activeProvider = provider || (await resolveEmbeddingProvider(store.config));
-  if (!activeProvider || typeof activeProvider.embed !== 'function') {
+  const scopes = scope === 'all' ? ['project', 'global'] : [scope];
+
+  let tierProviders;
+  if (provider) {
+    tierProviders = { project: provider, global: provider };
+  } else if (providers && typeof providers === 'object') {
+    tierProviders = { project: providers.project || null, global: providers.global || null };
+  } else {
+    tierProviders = await resolveTierEmbeddingProviders(store, { scopes });
+  }
+  if (!scopes.some((s) => isUsableProvider(tierProviders[s]))) {
     return idleResult('no_provider');
   }
 
-  const resolvedMaxChars = chunkMaxChars ?? store.config?.embedding?.chunkMaxChars ?? 800;
-  const resolvedOverlap = chunkOverlap ?? store.config?.embedding?.chunkOverlap ?? 100;
-  const maxChars = Math.max(64, Number(resolvedMaxChars) || 800);
-  const overlap = Number.isFinite(Number(resolvedOverlap)) ? Math.max(0, Number(resolvedOverlap)) : 100;
-  const scopes = scope === 'all' ? ['project', 'global'] : [scope];
+  // Chunk sizes follow the tier's own settings as well (the global tier never takes a project's overlay).
+  const chunkSettingsFor = (s) => {
+    const embedding = (s === 'global' ? store.globalConfig?.embedding : null) || store.config?.embedding;
+    const resolvedMaxChars = chunkMaxChars ?? embedding?.chunkMaxChars ?? 800;
+    const resolvedOverlap = chunkOverlap ?? embedding?.chunkOverlap ?? 100;
+    return {
+      maxChars: Math.max(64, Number(resolvedMaxChars) || 800),
+      overlap: Number.isFinite(Number(resolvedOverlap)) ? Math.max(0, Number(resolvedOverlap)) : 100,
+    };
+  };
   const batchLimit = Math.max(1, Number(maxDocs) || 100);
 
   let totalProcessed = 0;
@@ -154,15 +191,32 @@ export async function processPendingEmbeddings(
   let stopReason = '';
   let more = false;
   const rebuiltTiers = [];
-  let knownDims = Number(activeProvider.dimensions) || 0;
+  const tierResults = {};
+  const dimsByProvider = new Map(); // dimensions learned from a provider's first answer, reused for its next tier
+  let firstProvider = null;
 
   for (const s of scopes) {
     if (stopReason) break;
+
+    const activeProvider = tierProviders[s];
+    if (!isUsableProvider(activeProvider)) continue;
+    if (!firstProvider) firstProvider = activeProvider;
+
+    let knownDims = dimsByProvider.get(activeProvider) ?? (Number(activeProvider.dimensions) || 0);
+    const tierResult = {
+      provider: activeProvider.name,
+      model: activeProvider.model,
+      dimensions: knownDims,
+      processed: 0,
+      chunksIndexed: 0,
+      errors: 0,
+    };
 
     const tier = typeof store.getTierIfExists === 'function'
       ? store.getTierIfExists(s)
       : store.getTier(s);
     if (!tier) continue;
+    tierResults[s] = tierResult;
 
     syncFromDisk(tier.db, tier.dir);
 
@@ -184,6 +238,7 @@ export async function processPendingEmbeddings(
       if (res.rebuilt) rebuiltTiers.push(s);
     } else if (meta.dimensions > 0 && meta.embedModel === activeProvider.model) {
       knownDims = meta.dimensions;
+      dimsByProvider.set(activeProvider, knownDims);
       const res = ensureVectorTable(tier.db, {
         provider: activeProvider.name,
         model: activeProvider.model,
@@ -195,23 +250,27 @@ export async function processPendingEmbeddings(
     }
 
     // Documents that have not failed yet go first, so one document that keeps failing cannot hold up the rest.
+    // Among the failed ones, those the service failed on least often go first, so a long outage is not
+    // charged to a single document.
     const pendingRows = tier.db
       .prepare(`
         SELECT id, type, status, title, summary, content, hash
         FROM docs
         WHERE status NOT IN ('superseded', 'archived')
           AND embed_attempts < ?
+          AND embed_service_failures < ?
           AND (
             embed_status = 'pending'
             OR embed_status = 'error'
             OR (embed_status = 'ready' AND embed_model != ?)
           )
-        ORDER BY CASE WHEN embed_status = 'error' THEN 1 ELSE 0 END, updated_at DESC
+        ORDER BY CASE WHEN embed_status = 'error' THEN 1 ELSE 0 END, embed_service_failures ASC, updated_at DESC
         LIMIT ?
       `)
-      .all(MAX_EMBED_ATTEMPTS, activeProvider.model, batchLimit);
+      .all(MAX_EMBED_ATTEMPTS, MAX_EMBED_SERVICE_FAILURES, activeProvider.model, batchLimit);
 
     const tierHasFullBatch = pendingRows.length >= batchLimit;
+    const chunkSettings = chunkSettingsFor(s);
 
     // A failure specific to the document counts toward its attempt cap ...
     const recordDocFailureStmt = tier.db.prepare(`
@@ -221,8 +280,17 @@ export async function processPendingEmbeddings(
           embed_error = ?
       WHERE id = ?
     `);
-    // ... a failure of the service (or of the credentials) is only noted; the document stays eligible.
-    const recordOutageStmt = tier.db.prepare(`
+    // ... a failure of the service is counted apart (the document is given up on only when the service keeps
+    // failing on this very document) ...
+    const recordServiceFailureStmt = tier.db.prepare(`
+      UPDATE docs
+      SET embed_status = 'error',
+          embed_service_failures = embed_service_failures + 1,
+          embed_error = ?
+      WHERE id = ?
+    `);
+    // ... and a failure of the credentials is only noted; the document stays eligible.
+    const recordAuthFailureStmt = tier.db.prepare(`
       UPDATE docs
       SET embed_status = 'error',
           embed_error = ?
@@ -230,10 +298,10 @@ export async function processPendingEmbeddings(
     `);
 
     for (const doc of pendingRows) {
-      const chunks = buildDocChunks(doc, { maxChars, overlap });
+      const chunks = buildDocChunks(doc, chunkSettings);
       if (chunks.length === 0) {
         tier.db
-          .prepare("UPDATE docs SET embed_status = 'skipped', embed_model = ?, embed_attempts = 0, embed_error = '' WHERE id = ?")
+          .prepare("UPDATE docs SET embed_status = 'skipped', embed_model = ?, embed_attempts = 0, embed_service_failures = 0, embed_error = '' WHERE id = ?")
           .run(activeProvider.model, doc.id);
         continue;
       }
@@ -246,10 +314,16 @@ export async function processPendingEmbeddings(
         );
       } catch (err) {
         totalErrors++;
+        tierResult.errors++;
         const kind = classifyEmbeddingError(err);
         const errMsg = String(err?.message || err || 'Embedding provider failed').slice(0, 200);
+        const recordStmt = kind === 'document'
+          ? recordDocFailureStmt
+          : kind === 'service'
+            ? recordServiceFailureStmt
+            : recordAuthFailureStmt;
         try {
-          (kind === 'document' ? recordDocFailureStmt : recordOutageStmt).run(errMsg, doc.id);
+          recordStmt.run(errMsg, doc.id);
         } catch {
           // ignore if DB closed mid-shutdown
         }
@@ -274,6 +348,7 @@ export async function processPendingEmbeddings(
 
       if (!allValid) {
         totalErrors++;
+        tierResult.errors++;
         try {
           recordDocFailureStmt.run('Invalid or mismatched vector dimensions returned by provider', doc.id);
         } catch {
@@ -287,6 +362,8 @@ export async function processPendingEmbeddings(
 
       if (!tableReady || detectedDims !== knownDims) {
         knownDims = detectedDims;
+        dimsByProvider.set(activeProvider, knownDims);
+        tierResult.dimensions = knownDims;
         const res = ensureVectorTable(tier.db, {
           provider: activeProvider.name,
           model: activeProvider.model,
@@ -331,7 +408,7 @@ export async function processPendingEmbeddings(
           }
 
           tier.db
-            .prepare("UPDATE docs SET embed_status = 'ready', embed_model = ?, embed_attempts = 0, embed_error = '' WHERE id = ? AND hash = ?")
+            .prepare("UPDATE docs SET embed_status = 'ready', embed_model = ?, embed_attempts = 0, embed_service_failures = 0, embed_error = '' WHERE id = ? AND hash = ?")
             .run(activeProvider.model, doc.id, doc.hash);
           return true;
         });
@@ -339,9 +416,12 @@ export async function processPendingEmbeddings(
         if (committed) {
           totalProcessed++;
           totalChunks += chunks.length;
+          tierResult.processed++;
+          tierResult.chunksIndexed += chunks.length;
         }
       } catch (err) {
         totalErrors++;
+        tierResult.errors++;
         const errMsg = String(err?.message || err || 'Vector commit failed').slice(0, 200);
         try {
           recordDocFailureStmt.run(errMsg, doc.id);
@@ -351,13 +431,15 @@ export async function processPendingEmbeddings(
       }
     }
 
+    tierResult.dimensions = knownDims;
     if (tierHasFullBatch && !stopReason) more = true;
   }
 
   return {
-    provider: activeProvider.name,
-    model: activeProvider.model,
-    dimensions: knownDims,
+    provider: firstProvider.name,
+    model: firstProvider.model,
+    dimensions: dimsByProvider.get(firstProvider) ?? (Number(firstProvider.dimensions) || 0),
+    tiers: tierResults,
     processed: totalProcessed,
     chunksIndexed: totalChunks,
     rebuiltTiers,
@@ -387,12 +469,17 @@ function samePath(a, b) {
  *
  * `schedule('project', { projectDir })` queues another project's store (a save made with `project_dir`).
  * That store is opened through `openProjectStore(projectDir)` for the run only and closed right after.
+ *
+ * Providers: `provider` / `getProvider()` give one provider for every tier; `getProviders()` gives
+ * { project, global } so the global tier can follow the global settings while the project tier follows its
+ * own. With none of them each run resolves the providers from the store's configuration.
  */
 export function createEmbeddingQueue(
   store,
   {
     provider = null,
     getProvider = null,
+    getProviders = null,
     debounceMs = 150,
     breaker = null,
     maxDocs = 100,
@@ -447,7 +534,14 @@ export function createEmbeddingQueue(
           try {
             const scope = scopes.length > 1 || scopes[0] === 'all' ? 'all' : scopes[0];
             const activeProvider = provider || (typeof getProvider === 'function' ? await getProvider() : null);
-            res = await processPendingEmbeddings(store, { scope, provider: activeProvider, breaker, maxDocs });
+            const tierProviders = !activeProvider && typeof getProviders === 'function' ? await getProviders() : null;
+            res = await processPendingEmbeddings(store, {
+              scope,
+              provider: activeProvider,
+              providers: tierProviders,
+              breaker,
+              maxDocs,
+            });
           } catch {
             // swallow background errors; docs remain pending/error for next run
           }

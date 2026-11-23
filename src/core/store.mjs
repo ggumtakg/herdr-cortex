@@ -134,6 +134,7 @@ export class CortexStore {
     projectDir = process.cwd(),
     globalDir,
     config,
+    globalConfig,
     disableVec = false,
     onWrite = null,
   } = {}) {
@@ -141,9 +142,22 @@ export class CortexStore {
     this.projectDir = getProjectMemoryDir(this.projectRoot);
     this.globalDir = getGlobalDir(globalDir);
     this.config = config || loadConfig({ projectDir: this.projectRoot, globalDir: this.globalDir });
+    this._globalConfig = globalConfig || null;
     this.disableVec = disableVec;
     this.onWrite = typeof onWrite === 'function' ? onWrite : null;
     this._tiers = new Map();
+  }
+
+  /**
+   * The global configuration without any per-project overlay (no `projects["<path>"]` entry, no project
+   * file). The global tier is shared by every project, so its embedding always follows these settings;
+   * `config` (which includes this project's overlay) applies to the project tier only. Loaded on first use.
+   */
+  get globalConfig() {
+    if (!this._globalConfig) {
+      this._globalConfig = loadConfig({ globalDir: this.globalDir });
+    }
+    return this._globalConfig;
   }
 
   isProjectEnabled() {

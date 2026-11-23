@@ -4,6 +4,7 @@ import { CortexStore } from '../core/store.mjs';
 import { REPO_ROOT, isMainModule, isProjectEnabled, loadConfig } from '../core/config.mjs';
 import {
   createEmbeddingQueue,
+  embeddingSelectionKey,
   getSharedEmbeddingBreaker,
   resolveEmbeddingProvider,
 } from '../embeddings/index.mjs';
@@ -24,7 +25,7 @@ export const SERVER_INSTRUCTIONS = `herdr-cortex MCP 도구 안내:
 - Herdr 탭 협업: relay_tabs(탭 조회), relay_send(context_docs 첨부, HEAD 전용), relay_inbox(action: peek|ack).
 - 프롬프트 로드: cortex_prompt로 start-job, product-planning, delegate, independent-review, plan-run(kind: "skill"), DEVELOPMENT_STANDARD(kind: "standard"), coder/developer/reviewer(kind: "agent") 로드.`;
 
-export const EXCLUDED_SERVER_INSTRUCTIONS = `herdr-cortex MCP 안내: 현재 프로젝트는 herdr-cortex 설정(excludedProjects/opt-in)에 의해 제외되어 있습니다. 프로젝트 기억 쓰기·relay_send 및 .memory/ 생성이 차단되며, scope: "global" 조회와 cortex_prompt만 사용할 수 있습니다.`;
+export const EXCLUDED_SERVER_INSTRUCTIONS = `herdr-cortex MCP 안내: 현재 프로젝트는 herdr-cortex 설정(excludedProjects/opt-in)에 의해 제외되어 있습니다. 프로젝트 기억 쓰기·relay_tabs/relay_send/relay_inbox 및 .memory/ 생성이 차단되며, scope: "global" 조회와 cortex_prompt만 사용할 수 있습니다.`;
 
 function makeJsonRpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
@@ -43,6 +44,7 @@ export function createMcpServer({
   store,
   promptsDir = path.join(REPO_ROOT, 'prompts'),
   getEmbeddingProvider = null,
+  getEmbeddingProviders = null,
   embeddingQueue = null,
   embeddingBreaker = null,
   hcClient = null,
@@ -74,6 +76,7 @@ export function createMcpServer({
   const registry = createToolRegistry(store, {
     promptsDir,
     getEmbeddingProvider,
+    getEmbeddingProviders,
     embeddingQueue,
     embeddingBreaker,
     projectEnabled: effectiveProjectEnabled,
@@ -251,17 +254,22 @@ function parseCliOptions(argv) {
 }
 
 /**
- * Assemble what the stdio entry point runs with: merged config, store, embedding provider, the circuit breaker
+ * Assemble what the stdio entry point runs with: merged config, store, embedding providers, the circuit breaker
  * shared by search and the document queue, the queue itself, and the MCP server.
+ * A process can hold two providers: the project tier is embedded and searched with the provider this
+ * project's settings select, the global tier (shared by every project) with the one the global settings
+ * select; when both select the same one, a single instance serves both.
  * Documents that are still waiting for an embedding are scheduled right away, so work left over from an earlier
  * session or an outage does not wait for the next save.
- * `embeddingProvider`, `embeddingBreaker`, `input` and `output` are injectable for tests.
+ * `embeddingProvider` (one provider for every tier), `embeddingProviders` ({ project, global }),
+ * `embeddingBreaker`, `input` and `output` are injectable for tests.
  */
 export function createServerRuntime({
   projectDir = process.cwd(),
   globalDir,
   promptsDir = path.join(REPO_ROOT, 'prompts'),
   embeddingProvider = null,
+  embeddingProviders = null,
   embeddingBreaker = null,
   hcClient = null,
   queueDebounceMs = 200,
@@ -275,33 +283,50 @@ export function createServerRuntime({
   const breaker = embeddingBreaker
     || getSharedEmbeddingBreaker({ cooldownMs: config.embedding?.circuitBreakMs });
 
-  let cachedProviderPromise = null;
-  const getEmbeddingProvider = () => {
-    if (embeddingProvider) return Promise.resolve(embeddingProvider);
-    if (!cachedProviderPromise) {
-      cachedProviderPromise = resolveEmbeddingProvider(config).catch(() => {
-        cachedProviderPromise = null;
+  // One provider instance per distinct selection (provider + its settings), created on first use.
+  const providerCache = new Map();
+  const providerForConfig = (cfg) => {
+    const key = embeddingSelectionKey(cfg);
+    // Nothing selected: still ask once, so a configuration problem is reported on stderr.
+    if (!key) return resolveEmbeddingProvider(cfg).catch(() => null);
+    if (!providerCache.has(key)) {
+      providerCache.set(key, resolveEmbeddingProvider(cfg).catch(() => {
+        providerCache.delete(key);
         return null;
-      });
+      }));
     }
-    return cachedProviderPromise;
+    return providerCache.get(key);
   };
 
+  // { project, global } for a store (this server's, or one opened for a `project_dir` call): its own settings
+  // for the project tier, the global settings (no project overlay) for the global tier.
+  const getEmbeddingProviders = async (targetStore = store) => {
+    if (embeddingProvider) return { project: embeddingProvider, global: embeddingProvider };
+    if (embeddingProviders) {
+      return { project: embeddingProviders.project || null, global: embeddingProviders.global || null };
+    }
+    const [projectProvider, globalProvider] = await Promise.all([
+      providerForConfig(targetStore.config),
+      providerForConfig(targetStore.globalConfig),
+    ]);
+    return { project: projectProvider, global: globalProvider };
+  };
+  // The project tier's provider (kept for callers that deal with one tier).
+  const getEmbeddingProvider = async () => (await getEmbeddingProviders(store)).project;
+
   const embeddingQueue = createEmbeddingQueue(store, {
-    getProvider: getEmbeddingProvider,
+    getProviders: () => getEmbeddingProviders(store),
     debounceMs: queueDebounceMs,
     breaker,
     // A save made with `project_dir` is embedded with that project's own settings, in a store opened for the run.
     openProjectStore: (otherProjectDir) => new CortexStore({ projectDir: otherProjectDir, globalDir: store.globalDir }),
-    getProviderFor: (otherStore) => (
-      embeddingProvider ? Promise.resolve(embeddingProvider) : resolveEmbeddingProvider(otherStore.config)
-    ),
+    getProviderFor: async (otherStore) => (await getEmbeddingProviders(otherStore)).project,
   });
 
   const server = createMcpServer({
     store,
     promptsDir,
-    getEmbeddingProvider,
+    getEmbeddingProviders,
     embeddingQueue,
     embeddingBreaker: breaker,
     hcClient,
@@ -324,7 +349,16 @@ export function createServerRuntime({
     store.close();
   };
 
-  return { config, store, server, embeddingQueue, embeddingBreaker: breaker, getEmbeddingProvider, shutdown };
+  return {
+    config,
+    store,
+    server,
+    embeddingQueue,
+    embeddingBreaker: breaker,
+    getEmbeddingProvider,
+    getEmbeddingProviders,
+    shutdown,
+  };
 }
 
 if (isMainModule(import.meta.url)) {

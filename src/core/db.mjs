@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS docs (
   embed_model    TEXT NOT NULL DEFAULT '',
   embed_attempts INTEGER NOT NULL DEFAULT 0,
   embed_error    TEXT NOT NULL DEFAULT '',
+  embed_service_failures INTEGER NOT NULL DEFAULT 0,
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL
 );
@@ -288,7 +289,7 @@ export function ensureVectorTable(db, tierDirOrOpts = {}, maybeOpts) {
     withTransaction(db, () => {
       db.exec('DROP TABLE IF EXISTS doc_chunks_vec;');
       db.exec(createVecTableSql(safeDims));
-      db.exec("UPDATE docs SET embed_status = 'pending', embed_model = '', embed_attempts = 0, embed_error = '';");
+      db.exec("UPDATE docs SET embed_status = 'pending', embed_model = '', embed_attempts = 0, embed_service_failures = 0, embed_error = '';");
       writeIndexMeta(db, {
         schemaVersion: SCHEMA_VERSION,
         embedProvider: provider || meta.embedProvider,
@@ -359,6 +360,11 @@ function migrateSchemaIfNeeded(db, tierDir, vecAvailable) {
   if (!cols.has('embed_error')) {
     db.exec("ALTER TABLE docs ADD COLUMN embed_error TEXT NOT NULL DEFAULT '';");
   }
+  // Failures of the embedding service while this document was being embedded (timeout, network, 5xx, 429).
+  // Counted apart from embed_attempts, reset when the content changes or the document is embedded.
+  if (!cols.has('embed_service_failures')) {
+    db.exec('ALTER TABLE docs ADD COLUMN embed_service_failures INTEGER NOT NULL DEFAULT 0;');
+  }
 
   if (needsContentHashBackfill) {
     const rows = db.prepare("SELECT id, title, summary, content FROM docs WHERE content_hash = ''").all();
@@ -412,7 +418,7 @@ function migrateSchemaIfNeeded(db, tierDir, vecAvailable) {
     } else if (outdatedVec) {
       withTransaction(db, () => {
         db.exec('DROP TABLE IF EXISTS doc_chunks_vec;');
-        db.exec("UPDATE docs SET embed_status = 'pending', embed_model = '', embed_attempts = 0, embed_error = '';");
+        db.exec("UPDATE docs SET embed_status = 'pending', embed_model = '', embed_attempts = 0, embed_service_failures = 0, embed_error = '';");
         writeIndexMeta(db, {
           schemaVersion: SCHEMA_VERSION,
           embedProvider: dbMeta?.embedProvider || '',
@@ -667,12 +673,12 @@ function upsertDocStatements(db) {
       INSERT INTO docs (
         id, path, type, status, session, branch, title, summary, tags, due,
         content, mtime_ms, size, hash, content_hash,
-        embed_status, embed_model, embed_attempts, embed_error,
+        embed_status, embed_model, embed_attempts, embed_error, embed_service_failures,
         created_at, updated_at
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
         ?, ?
       )
       ON CONFLICT(id) DO UPDATE SET
@@ -694,6 +700,7 @@ function upsertDocStatements(db) {
         embed_model = excluded.embed_model,
         embed_attempts = excluded.embed_attempts,
         embed_error = excluded.embed_error,
+        embed_service_failures = excluded.embed_service_failures,
         created_at = excluded.created_at,
         updated_at = excluded.updated_at
     `),
@@ -723,6 +730,7 @@ function writeDocAndEdges(stmts, record, prevDoc = null) {
   const embedModel = preserveVectors ? (prevDoc.embed_model || '') : '';
   const embedAttempts = preserveVectors ? (Number(prevDoc.embed_attempts) || 0) : 0;
   const embedError = preserveVectors ? (prevDoc.embed_error || '') : '';
+  const embedServiceFailures = preserveVectors ? (Number(prevDoc.embed_service_failures) || 0) : 0;
 
   stmts.upsertDoc.run(
     doc.id,
@@ -744,6 +752,7 @@ function writeDocAndEdges(stmts, record, prevDoc = null) {
     embedModel,
     embedAttempts,
     embedError,
+    embedServiceFailures,
     doc.created_at,
     doc.updated_at,
   );
@@ -845,10 +854,10 @@ export function indexSingleFile(db, tierDir, absFilePath) {
   }
 
   const prevByPath = db
-    .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error FROM docs WHERE path = ?')
+    .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error, embed_service_failures FROM docs WHERE path = ?')
     .get(record.doc.path);
   const prevById = db
-    .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error FROM docs WHERE id = ?')
+    .prepare('SELECT id, path, session, content_hash, embed_status, embed_model, embed_attempts, embed_error, embed_service_failures FROM docs WHERE id = ?')
     .get(record.doc.id);
 
   const affectedSessions = new Set();
@@ -977,7 +986,7 @@ export function syncFromDisk(db, tierDir) {
     const rereadAll = decoderRow?.value !== TEXT_DECODER_VERSION;
 
     const existingRows = db
-      .prepare('SELECT id, path, mtime_ms, size, hash, content_hash, session, embed_status, embed_model, embed_attempts, embed_error FROM docs')
+      .prepare('SELECT id, path, mtime_ms, size, hash, content_hash, session, embed_status, embed_model, embed_attempts, embed_error, embed_service_failures FROM docs')
       .all();
 
     const byPath = new Map();

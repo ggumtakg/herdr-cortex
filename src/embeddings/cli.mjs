@@ -14,7 +14,7 @@ import {
   formatEmbeddingStatus,
   listFailedEmbeddings,
   processPendingEmbeddings,
-  resolveEmbeddingProvider,
+  resolveTierEmbeddingProviders,
   retryFailedEmbeddings,
 } from './index.mjs';
 
@@ -47,7 +47,12 @@ function parseArgs(argv) {
  * Flags: --project <dir>, --global <dir>, --scope project|global|all, --max-docs <n>,
  *   --provider <none|auto|gemini|openai|ollama|onnx>  use this provider for the run (embedding.provider)
  *   --model <name>      model for the provider in use (embedding.<provider>.model)
- *   --retry-failed      first reset the documents that reached the attempt cap, so they are tried again
+ *   --retry-failed      first reset the documents the queue gave up on (either reason), so they are tried again
+ *
+ * The project tier is embedded with this project's settings (global config plus its `projects["<path>"]`
+ * entry), the global tier with the global settings alone; --provider / --model are given by the user for
+ * this run and apply to both. When the two tiers end up with different providers the status lines and the
+ * summary (`tiers`) show both.
  *
  * Before any work it prints on stderr which provider is in effect, where documents would be sent and any
  * configuration problem. A project that is excluded by the configuration, or that the user has not approved,
@@ -69,6 +74,8 @@ export async function runEmbedCli(
   const baseOverrides = opts.provider ? { embedding: { provider: opts.provider } } : undefined;
 
   let config = loadConfig({ projectDir: opts.projectDir, globalDir: opts.globalDir, overrides: baseOverrides });
+  // The global tier's settings: the global config without this project's overlay.
+  let globalConfig = loadConfig({ globalDir: opts.globalDir, overrides: baseOverrides });
   let usageError = '';
 
   if (opts.model) {
@@ -78,32 +85,36 @@ export async function runEmbedCli(
       ? named
       : describeEmbeddingStatus(config, { env, breaker }).provider;
     if (target) {
-      config = loadConfig({
-        projectDir: opts.projectDir,
-        globalDir: opts.globalDir,
-        overrides: {
-          embedding: {
-            ...(opts.provider ? { provider: opts.provider } : {}),
-            [target]: { model: opts.model },
-          },
+      const overrides = {
+        embedding: {
+          ...(opts.provider ? { provider: opts.provider } : {}),
+          [target]: { model: opts.model },
         },
-      });
+      };
+      config = loadConfig({ projectDir: opts.projectDir, globalDir: opts.globalDir, overrides });
+      globalConfig = loadConfig({ globalDir: opts.globalDir, overrides });
     } else if (!injectedProvider) {
       usageError = '--model was given but no embedding provider is in effect; '
         + `add --provider <${EMBEDDING_PROVIDER_NAMES.join('|')}> or set embedding.provider in config.json.`;
     }
   }
 
-  const status = describeEmbeddingStatus(config, { env, breaker });
+  const status = describeEmbeddingStatus(config, { env, breaker, globalConfig });
   for (const line of formatEmbeddingStatus(status)) {
     stderr.write(`[herdr-cortex] ${line}\n`);
   }
   if (usageError) stderr.write(`[herdr-cortex] ${usageError}\n`);
 
-  const configProblems = status.problems.map((problem) => problem.message);
-  const blocking = injectedProvider
-    ? null
-    : status.problems.find((problem) => problem.code === 'unknown_provider' || problem.code === 'missing_api_key');
+  // What each tier is embedded with (`status.globalTier` is present only when the two differ).
+  const tierStatus = {
+    project: status,
+    global: status.globalTier ? describeEmbeddingStatus(globalConfig, { env, breaker }) : status,
+  };
+  const configProblems = [
+    ...status.problems.map((problem) => problem.message),
+    ...(status.globalTier?.problems || []).map((problem) => `global memory: ${problem.message}`),
+  ];
+  const isBlocking = (problem) => problem.code === 'unknown_provider' || problem.code === 'missing_api_key';
 
   const emit = (summary) => {
     stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
@@ -139,7 +150,13 @@ export async function runEmbedCli(
     }
   }
 
-  const store = new CortexStore({ projectDir: opts.projectDir, globalDir: opts.globalDir, config });
+  const scopesInRun = effectiveScope === 'all' ? ['project', 'global'] : [effectiveScope];
+  // A provider that is named but cannot be used stops the run, for whichever tier of this run it concerns.
+  const blocking = injectedProvider
+    ? null
+    : scopesInRun.flatMap((s) => tierStatus[s].problems).find(isBlocking) || null;
+
+  const store = new CortexStore({ projectDir: opts.projectDir, globalDir: opts.globalDir, config, globalConfig });
   try {
     const retryReset = opts.retryFailed ? retryFailedEmbeddings(store, { scope: effectiveScope }) : null;
 
@@ -153,6 +170,7 @@ export async function runEmbedCli(
     let reason = undefined;
     let error = '';
     const rebuiltSet = new Set();
+    const tierSummaries = {}; // per tier: provider, model, dimensions and counts, summed over the batches
 
     if (usageError) {
       reason = 'invalid_arguments';
@@ -161,19 +179,34 @@ export async function runEmbedCli(
       reason = blocking.code === 'unknown_provider' ? 'invalid_provider' : 'no_provider';
       error = blocking.message;
     } else {
-      const provider = injectedProvider || (await resolveEmbeddingProvider(config, { env }));
-      providerName = provider?.name || null;
-      modelName = provider?.model || '';
-      if (!provider) reason = 'no_provider';
+      const providers = injectedProvider
+        ? { project: injectedProvider, global: injectedProvider }
+        : await resolveTierEmbeddingProviders(store, { env, scopes: scopesInRun });
+      const firstProvider = scopesInRun.map((s) => providers[s]).find(Boolean) || null;
+      providerName = firstProvider?.name || null;
+      modelName = firstProvider?.model || '';
+      if (!firstProvider) reason = 'no_provider';
 
-      const maxIterations = provider ? 1000 : 0;
+      const maxIterations = firstProvider ? 1000 : 0;
       for (let iter = 0; iter < maxIterations; iter++) {
         const batchRes = await processPendingEmbeddings(store, {
           scope: effectiveScope,
-          provider,
+          providers,
           maxDocs: opts.maxDocs,
           breaker,
         });
+
+        for (const [tierScope, tierRes] of Object.entries(batchRes.tiers || {})) {
+          const seen = tierSummaries[tierScope] || { provider: null, model: '', dimensions: 0, processed: 0, chunksIndexed: 0, errors: 0 };
+          tierSummaries[tierScope] = {
+            provider: tierRes.provider || seen.provider,
+            model: tierRes.model || seen.model,
+            dimensions: tierRes.dimensions || seen.dimensions,
+            processed: seen.processed + (tierRes.processed || 0),
+            chunksIndexed: seen.chunksIndexed + (tierRes.chunksIndexed || 0),
+            errors: seen.errors + (tierRes.errors || 0),
+          };
+        }
 
         if (batchRes.provider) providerName = batchRes.provider;
         if (batchRes.model) modelName = batchRes.model;
@@ -199,10 +232,21 @@ export async function runEmbedCli(
       }
     }
 
+    // Host of the tier whose provider is named at the top of the summary.
+    const primaryScope = scopesInRun.find((s) => tierSummaries[s]?.provider) || scopesInRun[0];
+    const primaryHost = tierStatus[primaryScope]?.host || null;
+    for (const [tierScope, tierSummary] of Object.entries(tierSummaries)) {
+      const host = tierStatus[tierScope]?.host;
+      if (tierSummary.provider && host && !injectedProvider) tierSummary.sendsTo = host;
+    }
+    const tiersDiffer = Boolean(status.globalTier) && !injectedProvider;
+
     const summary = {
       provider: providerName,
       ...(modelName ? { model: modelName } : {}),
-      ...(providerName && status.host ? { sendsTo: status.host } : {}),
+      ...(providerName && primaryHost ? { sendsTo: primaryHost } : {}),
+      // Present when the project tier and the global tier are embedded with different settings.
+      ...(tiersDiffer ? { tiers: tierSummaries } : {}),
       dimensions,
       processed: totalProcessed,
       chunksIndexed: totalChunks,
@@ -213,7 +257,8 @@ export async function runEmbedCli(
       ...(skippedProject && projectNotApproved ? { projectNotApproved: true } : {}),
       ...(reason ? { reason } : {}),
       ...(error ? { error } : {}),
-      // Documents the queue stopped retrying (attempt cap); `--retry-failed` gives them a fresh start.
+      // Documents the queue stopped retrying, each with the reason (`document_errors`: the document itself
+      // failed 3 times; `service_failures`: the service failed 10 times on it); `--retry-failed` resets both.
       failedDocuments: listFailedEmbeddings(store, { scope: effectiveScope }),
       ...(retryReset ? { retryReset } : {}),
       ...(configProblems.length > 0 ? { configProblems } : {}),

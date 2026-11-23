@@ -30,7 +30,7 @@ import {
   recordSession,
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
-import { drainInbox, formatInboxForHookDetailed } from '../relay/inbox.mjs';
+import { deliverInboxForHook } from '../relay/inbox.mjs';
 import { extractClaudeRecentTurns } from './recent-turns.mjs';
 
 export const CLAUDE_HOOK_MAX_CHARS = 9000;
@@ -297,23 +297,25 @@ export function handleClaudeSessionStart(
 
   const sepCost = (n) => (sections.length + n > 0 ? 2 : 0);
 
-  // 2. Budget-first relay inbox drain + partial ACK (only ack fully delivered non-truncated messages)
-  if (projectTrusted && isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
+  // 2. Budget-first relay inbox delivery. The inbox belongs to the terminal and lives in the global store,
+  // so it is delivered whether or not the current project is approved (an excluded project returned above).
+  // Only messages injected in full are acknowledged; one that is too long for any hook block is announced once.
+  if (isValidTerminalId(terminalId)) {
     const remaining = maxChars - used - sepCost(0);
     if (remaining >= 120) {
       try {
-        const drainedInbox = drainInbox(projectDir, terminalId);
-        if (drainedInbox && drainedInbox.messages.length > 0) {
-          const inboxBudget = (overview || wantsRecentTurns)
-            ? Math.min(2000, Math.max(300, Math.floor(remaining * 0.35)))
-            : remaining;
-          const detailed = formatInboxForHookDetailed(drainedInbox.messages, {
-            maxChars: Math.min(inboxBudget, remaining),
-          });
-          if (detailed.text) {
-            pushSection(detailed.text);
-          }
-          drainedInbox.ack(detailed.includedIds);
+        const inboxBudget = (overview || wantsRecentTurns)
+          ? Math.min(2000, Math.max(300, Math.floor(remaining * 0.35)))
+          : remaining;
+        const delivered = deliverInboxForHook(terminalId, {
+          globalDir: effectiveGlobalDir,
+          projectDir,
+          maxChars: Math.min(inboxBudget, remaining),
+          // UserPromptSubmit gives the inbox the whole hook budget: what fits there waits for it.
+          fullBlockChars: maxChars,
+        });
+        if (delivered.text) {
+          pushSection(delivered.text);
         }
       } catch {
         // ignore inbox errors in hook
@@ -464,7 +466,9 @@ export function handleClaudePreCompact(payload = {}, { globalDir } = {}) {
 }
 
 /**
- * Claude Code UserPromptSubmit handler: drain relay inbox for HC_TERMINAL_ID.
+ * Claude Code UserPromptSubmit handler: deliver the relay inbox of HC_TERMINAL_ID.
+ * The inbox is the terminal's (global store), so delivery does not depend on the current project having a
+ * `.memory/` or being approved; a project excluded by the configuration gets nothing.
  */
 export function handleClaudeUserPrompt(
   payload = {},
@@ -481,34 +485,26 @@ export function handleClaudeUserPrompt(
   }
 
   const projectDir = extractCwd(payload, process.cwd());
-  if (!fs.existsSync(getProjectMemoryDir(projectDir))) {
-    return {};
-  }
-
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   if (!isProjectEnabled(projectDir, config)) {
     return {};
   }
-  // The inbox is part of the project's .memory/: an unapproved folder's inbox is neither read nor changed.
-  if (!isProjectTrusted(projectDir, { globalDir: effectiveGlobalDir })) {
-    return {};
-  }
   const maxChars = Math.max(256, Math.min(Number(config.hookBudget) || CLAUDE_HOOK_MAX_CHARS, CLAUDE_HOOK_MAX_CHARS));
 
-  const drained = drainInbox(projectDir, terminalId);
-  if (drained.messages.length === 0) {
-    return {};
-  }
+  // One consumer at a time: when another process is delivering this terminal's messages right now,
+  // nothing is injected and the messages stay for the next prompt.
+  const delivered = deliverInboxForHook(terminalId, {
+    globalDir: effectiveGlobalDir,
+    projectDir,
+    maxChars,
+  });
 
-  const detailed = formatInboxForHookDetailed(drained.messages, { maxChars });
-  drained.ack(detailed.includedIds);
-
-  if (!detailed.text) return {};
+  if (!delivered.text) return {};
   return {
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
-      additionalContext: detailed.text,
+      additionalContext: delivered.text,
     },
   };
 }

@@ -1,6 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { REPO_ROOT, assertInsideDir, isProjectEnabled, isProjectTrusted, loadConfig } from '../core/config.mjs';
+import {
+  REPO_ROOT,
+  assertInsideDir,
+  isProjectEnabled,
+  isProjectTrusted,
+  loadConfig,
+  projectPathKey,
+} from '../core/config.mjs';
 import { PROJECT_NOT_APPROVED_CODE, formatProjectNotApprovedMessage } from '../core/trust.mjs';
 import { CortexStore } from '../core/store.mjs';
 import { searchMemory } from '../core/search.mjs';
@@ -42,6 +49,15 @@ export function isSubagentCaller(args = {}, meta = {}) {
   }
 
   return false;
+}
+
+function isSameFolder(a, b) {
+  if (!a || !b) return false;
+  try {
+    return projectPathKey(a) === projectPathKey(b);
+  } catch {
+    return false;
+  }
 }
 
 function makeSubagentDeniedError(toolName) {
@@ -246,6 +262,7 @@ export function createToolRegistry(
   {
     promptsDir = path.join(REPO_ROOT, 'prompts'),
     getEmbeddingProvider = null,
+    getEmbeddingProviders = null,
     embeddingQueue = null,
     embeddingBreaker = null,
     projectEnabled = null,
@@ -286,7 +303,9 @@ export function createToolRegistry(
       : '';
     const defaultRoot = store?.projectRoot ? path.resolve(store.projectRoot) : '';
 
-    if (!requestedDir || requestedDir.toLowerCase() === defaultRoot.toLowerCase()) {
+    // Same folder by real path: a `project_dir` that reaches the default project through a junction or a
+    // symlink uses the default store instead of opening a second one on the same files.
+    if (!requestedDir || isSameFolder(requestedDir, defaultRoot)) {
       return fn(store, {
         projectDir: defaultRoot,
         enabled: isDefaultProjectEnabled(),
@@ -360,7 +379,10 @@ export function createToolRegistry(
           };
         }
         const effectiveScope = block ? 'global' : requestedScope;
-        const provider = typeof getEmbeddingProvider === 'function' ? await getEmbeddingProvider() : null;
+        // Each tier has its own provider (the global tier follows the global settings); `getEmbeddingProvider`
+        // is the older single-provider form.
+        const providers = typeof getEmbeddingProviders === 'function' ? await getEmbeddingProviders(targetStore) : null;
+        const provider = !providers && typeof getEmbeddingProvider === 'function' ? await getEmbeddingProvider() : null;
         const found = await searchMemory(targetStore, {
           query: args.query || '',
           scope: effectiveScope,
@@ -371,6 +393,7 @@ export function createToolRegistry(
           include_superseded: Boolean(args.include_superseded),
           limit: args.limit ?? 10,
           embeddingProvider: provider,
+          embeddingProviders: providers,
           embeddingBreaker,
         });
         // Results that lack the project tier because the folder is unapproved say so (a search that asked
