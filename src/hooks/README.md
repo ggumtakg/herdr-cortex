@@ -442,7 +442,7 @@ Antigravity 쪽 파일은 감지 여부와 무관하게 있으면 정리합니�
 
 * **`checkClaudeHooks`**: 표시가 있는 항목만 세어 이벤트마다 `state`를 돌려줍니다. `ok`가 아니면 첫 문제의 코드입니다: `missing`(등록 없음), `duplicate`(두 번 이상), `node_on_path`(Node를 이름으로만 실행), `node_missing`(기록된 Node 경로가 없음), `script_missing`(훅 스크립트가 없음), `other_repo`(다른 폴더의 스크립트를 가리킴), `other_event`(다른 하위 명령을 실행), `matcher`(`PreToolUse`의 매처가 다름).
 * **`checkClaudeMcpRegistration`**: `~/.claude.json`을 읽어 `registered`, `ours`, `thisRepo`, `upToDate`, `nodePath`, `nodeExists`, `scriptPath`, `scriptExists`, `legacyRegistered`(옛 이름 `cortex`로 herdr-cortex의 항목이 남아 있음)를 돌려줍니다.
-* **`checkAntigravity`**: `~/.gemini`가 없으면 `present: false`만 돌려줍니다. 있으면 두 이벤트의 `state`(위와 같은 코드)와 `mcp.state`(`ok`, `missing`, `not_ours`, `node_on_path`, `node_missing`, `script_missing`, `unreadable`)를 돌려줍니다.
+* **`checkAntigravity`**: Antigravity가 있는지를 설치기와 같은 `detectAntigravity`로 판정하고(옵션 `env`, `findCommand`도 그대로 넘깁니다), 찾은 근거를 `detectedBy`에 담습니다. `config-dir`(`~/.gemini` 폴더가 있음), `path`(PATH에 `agy`가 있음), 빈 문자열(둘 다 없음) 중 하나이며, 둘 다 있으면 `config-dir`입니다. 근거가 없으면 `present: false`와 빈 `detectedBy`만 돌려줍니다. 있으면 두 이벤트의 `state`(위와 같은 코드)와 `mcp.state`(`ok`, `missing`, `not_ours`, `node_on_path`, `node_missing`, `script_missing`, `unreadable`)를 돌려줍니다. PATH의 `agy`만으로 감지된 경우에는 설정 파일이 아직 없으므로 두 이벤트와 MCP가 모두 `missing`으로 나옵니다(설치기를 실행하면 등록되는 상태).
 * **`readInstallRecord`**: 설치 기록을 읽습니다. Node 설치 위치가 바뀌면 훅과 MCP 항목에 적힌 절대 경로가 맞지 않게 되므로 다시 설치해야 하며, 위 점검이 `node_missing`으로 알려 줍니다.
 * **`describeInstalledEmbedding`**, **`describeGlobalConfigProblems`**: 전역 설정을 기준으로 임베딩 상태 줄과 설정 문제 목록을 만듭니다. 네트워크 요청은 하지 않습니다.
 

@@ -104,10 +104,11 @@ export const CLEAR_RECORD_STALE_MS = 10 * 60 * 1000;
 // A record written "in the future" by this much is still accepted (clock steps between two processes).
 const CLEAR_RECORD_FUTURE_SLACK_MS = 5 * 1000;
 /**
- * After /clear it is not known whether Claude Code lets the SessionEnd hook (which writes the clear record)
- * finish before it starts the SessionStart hook. When SessionStart(clear) finds neither a previous session
- * in the tab record nor a clear record, it looks again every CLEAR_RECORD_POLL_MS for up to
- * CLEAR_RECORD_WAIT_MS before it gives up. No other path waits.
+ * On /clear the old session's SessionEnd hook (which writes the clear record) runs to completion before the
+ * new session's SessionStart hook is launched: measured on Claude Code 2.1.330, in one run. The wait remains
+ * as a safety margin for other versions and for a SessionEnd hook that exceeds its time limit: when
+ * SessionStart(clear) finds neither a previous session in the tab record nor a clear record, it looks again
+ * every CLEAR_RECORD_POLL_MS for up to CLEAR_RECORD_WAIT_MS before it gives up. No other path waits.
  */
 export const CLEAR_RECORD_WAIT_MS = 2000;
 export const CLEAR_RECORD_POLL_MS = 100;

@@ -363,7 +363,7 @@ npm run embed -- [--project <폴더>] [--global <폴더>] [--scope all|project|g
                  [--provider <이름>] [--model <이름>] [--max-docs <개수>] [--retry-failed]
 ```
 
-`--max-docs`는 계층마다 한 번에 처리하는 문서 수이며(전체 상한이 아님) 기본값은 200입니다. 시작할 때 어느 프로바이더로 어디에 보내는지를 표준 오류에 출력하고, 결과 요약을 JSON으로 표준 출력에 냅니다. 제외되었거나 승인되지 않은 프로젝트는 건너뜁니다. 모르는 프로바이더 이름, API 키가 없는 프로바이더, 적용할 프로바이더가 없는 `--model`, 임베딩 오류는 종료 코드 1로 끝납니다.
+`--max-docs`는 계층마다 한 번에 처리하는 문서 수이며(전체 상한이 아님) 기본값은 200입니다. 시작할 때 어느 프로바이더로 어디에 보내는지를 표준 오류에 출력하고, 결과 요약을 JSON으로 표준 출력에 냅니다. 제외되었거나 승인되지 않은 프로젝트는 건너뜁니다. 모르는 프로바이더 이름, API 키가 없는 프로바이더, 적용할 프로바이더가 없는 `--model`, 임베딩 오류는 종료 코드 1로 끝납니다. `--scope`에 `all`·`project`·`global` 밖의 값을 주거나, `--max-docs`에 양의 정수가 아닌 값을 주거나, 값이 필요한 스위치를 값 없이 쓰면 아무것도 읽지 않고 요약에 `reason: "invalid_arguments"`와 허용 값을 적은 `error`를 담아 종료 코드 1로 끝납니다.
 
 ### 서비스에 장애가 났을 때
 
@@ -547,7 +547,7 @@ Herdr는 재부팅하거나 다시 시작하면 에이전트가 돌던 탭을 �
 | `memory_save` | HEAD만 | `type`\*, `title`\*, `summary`\*, `id`, `scope`: `project`·`global` (`project`), `status` (`active`), `content`, `session`, `branch`, `tags`, `files`, `supersedes`, `derived_from`, `due`, `category`: `preferences`·`knowledge`, `project_dir` | 저장한 문서의 정보 |
 | `memory_update` | HEAD만 | `id`\*, `scope` (`all`), `type`, `status`, `title`, `summary`, `content`, `append_content`, `session`, `branch`, `tags`, `files`, `supersedes`, `derived_from`, `due`, `project_dir` | 갱신한 문서의 정보 |
 | `memory_graph` | | `target`\*(문서 ID 또는 `file:<상대 경로>`), `scope` (`project`), `depth`: 1~10 (2), `direction`: `in`·`out`·`both` (`both`), `limit`: 1~500 (60), `project_dir` | `nodes`, `edges` |
-| `memory_overview` | | `session`, `include_global` (`true`), `budget`: 256~50,000 (9,000), `format`: `both`·`json`·`markdown` (`both`), `project_dir` | 세션 시작 때 들어가는 것과 같은 기억 요약 |
+| `memory_overview` | | `session`, `include_global` (`true`), `budget`: 256~50,000 (설정의 `hookBudget`. 범위는 `MEMORY_OVERVIEW_BUDGET_MIN`~`MEMORY_OVERVIEW_BUDGET_MAX`이고, 벗어난 값은 범위 끝으로 맞추며 숫자가 아닌 값은 생략한 것으로 봄), `format`: `both`·`json`·`markdown` (`both`), `project_dir` | 세션 시작 때 들어가는 것과 같은 기억 요약 |
 | `cortex_prompt` | | `kind`\*: `skill`·`agent`·`standard`·`core`, `name` | `kind`, `name`, `path`, `content` |
 
 - `type`은 `decision`, `worklog`, `knowledge`, `todo`, `baseline` 중 하나, `status`는 `active`, `done`, `superseded`, `archived` 중 하나입니다.
@@ -580,7 +580,7 @@ Herdr는 재부팅하거나 다시 시작하면 에이전트가 돌던 탭을 �
 | `vectorSkipped` | 검색어를 임베딩하지 못해 벡터 없이 답했을 때의 이유: `embedding_timeout`, `embedding_error`, `circuit_open` |
 | `indexing: { pending, documents }` | 이 호출이 색인을 미룬 문서의 수와 이름(최대 5개). 그 문서들은 결과에 없을 수 있음 |
 | `projectNotApproved: true`, `projectNotApprovedMessage` | 프로젝트 폴더가 승인되지 않아 전역 계층만으로 답함 |
-| `projectExcluded: true` | 프로젝트가 설정으로 제외되어 프로젝트 계층을 보지 않음 |
+| `projectExcluded: true` | 프로젝트가 설정으로 제외되어 프로젝트 계층을 보지 않음. 제외와 미승인이 겹치면 이 표시만 붙음 |
 
 프로젝트 계층을 쓸 수 없을 때(제외되었거나 승인되지 않았을 때) 도구는 이렇게 답합니다.
 
@@ -589,9 +589,10 @@ Herdr는 재부팅하거나 다시 시작하면 에이전트가 돌던 탭을 �
 | `memory_save`, `memory_update` (`scope`가 `global`이 아님) | 오류 `PROJECT_EXCLUDED` 또는 `PROJECT_NOT_APPROVED` |
 | `memory_read` (`scope: "project"`) | 같은 오류 |
 | `memory_search`, `memory_graph` (`scope: "project"`) | 오류가 아니라 **빈 결과**와 함께 `projectExcluded` 또는 `projectNotApproved` |
-| `memory_search`, `memory_read`, `memory_graph` (`scope`가 `all`) | 전역 계층만으로 답함. 승인되지 않은 경우에는 `projectNotApproved`를 붙이고, 제외된 경우에는 표시 없이 전역 결과만 돌려줌 |
+| `memory_search`, `memory_graph` (`scope`가 `all`. `memory_search`는 `scope`를 생략해도 `all`) | 전역 계층만으로 답하고 `projectExcluded` 또는 `projectNotApproved`를 붙임 |
+| `memory_read` (`scope`가 `all`) | 전역 계층에서만 찾음. 찾지 못했을 때의 `NOT_FOUND`에는 승인되지 않은 경우에만 `projectNotApproved`가 붙음 |
 | `memory_overview` | 전역 선호만 담은 요약과 표시(`format: "markdown"`에서는 승인되지 않은 경우에만 표시가 붙음) |
-| `scope: "global"`인 모든 호출 | 평소대로 동작. `memory_update`의 `scope` 기본값은 `all`이므로, 이런 프로젝트에서 전역 문서를 갱신하려면 `scope: "global"`을 직접 적어야 함 |
+| `scope: "global"`인 모든 호출 | 평소대로 동작(프로젝트 계층을 요청하지 않았으므로 표시도 붙지 않음). `memory_update`의 `scope` 기본값은 `all`이므로, 이런 프로젝트에서 전역 문서를 갱신하려면 `scope: "global"`을 직접 적어야 함 |
 
 ### 오류 코드
 
@@ -683,7 +684,7 @@ Herdr는 재부팅하거나 다시 시작하면 에이전트가 돌던 탭을 �
 
 설정을 바꾼 뒤에는 에이전트 탭을 다시 시작하세요. MCP 서버는 자기 프로젝트가 제외되었는지를 시작할 때 한 번만 판단합니다(승인 여부는 호출할 때마다 다시 읽습니다).
 
-제외된 프로젝트에서는 훅이 아무것도 넣지 않고, 프로젝트 계층을 읽거나 쓰는 도구 호출과 릴레이 도구가 거부되며(`PROJECT_EXCLUDED`), `.memory\`를 만들지 않고, `npm run embed`도 그 프로젝트를 건너뜁니다. 전역 기억(`scope: "global"`)과 `cortex_prompt`, 탭의 세션 기록(탭 복구용)은 그대로 동작합니다.
+제외된 프로젝트에서는 훅이 아무것도 넣지 않고, 프로젝트 계층을 읽거나 쓰는 도구 호출과 릴레이 도구가 거부되며(`PROJECT_EXCLUDED`), `.memory\`를 만들지 않고, `npm run embed`도 그 프로젝트를 건너뜁니다. 전역 기억(`scope: "global"`의 조회·저장·갱신)과 `cortex_prompt`, 탭의 세션 기록(탭 복구용)은 그대로 동작합니다. 이런 프로젝트에서 시작한 MCP 서버는 무엇이 막히고 무엇이 되는지를 시작 안내문으로 에이전트에게 알리고, 프로젝트 계층을 빼고 답한 검색·그래프 결과에는 `projectExcluded: true`를 붙입니다([결과에 붙는 표시](#결과에-붙는-표시)).
 
 판정 순서는 ① `enabled: false`이면 끔, ② `excludedProjects`에 맞으면 끔, ③ `mode`가 `opt-in`이면 `enabledProjects`에 맞을 때만 켬, ④ 그 밖에는 켬입니다. 경로 규칙은 적힌 그대로와 실제 경로(정션·심볼릭 링크를 푼 경로) 양쪽으로 비교하므로, 제외한 폴더를 정션을 거쳐 열어도 제외됩니다.
 
@@ -1146,7 +1147,7 @@ flowchart TB
 ## 16. 테스트
 
 ```powershell
-npm test               # 자동 테스트 전체 (18개 파일, 175개)
+npm test               # 자동 테스트 전체 (18개 파일, 181개)
 npm run embed          # 임베딩을 기다리는 문서를 한꺼번에 처리
 npm run mcp            # MCP 서버를 직접 실행
 npm run trust -- list  # cortex-trust와 같은 명령 (프로필 없이)

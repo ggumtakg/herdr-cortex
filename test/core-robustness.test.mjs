@@ -27,8 +27,13 @@ import { decodeCp949Strict, decodeDocBytes } from '../src/core/encoding.mjs';
 import { getDuplicateDocIds, syncFromDisk } from '../src/core/db.mjs';
 import { CortexStore } from '../src/core/store.mjs';
 import { searchMemory } from '../src/core/search.mjs';
-import { createMcpServer } from '../src/mcp/server.mjs';
-import { createToolRegistry } from '../src/mcp/tools.mjs';
+import { SERVER_INFO, createMcpServer } from '../src/mcp/server.mjs';
+import {
+  MEMORY_OVERVIEW_BUDGET_MAX,
+  MEMORY_OVERVIEW_BUDGET_MIN,
+  createToolRegistry,
+  resolveOverviewBudget,
+} from '../src/mcp/tools.mjs';
 import { createRelayTools } from '../src/relay/tools.mjs';
 import { approveAsUser } from './support/approve.mjs';
 import { COMPACT_POINTER_INSTRUCTION } from '../src/hooks/claude.mjs';
@@ -1104,4 +1109,128 @@ test('memory_update on tool-written documents changes only the requested fields 
     store.close();
     env.cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// 9. memory_overview budget range, and the project's version
+// ---------------------------------------------------------------------------------------------
+
+test('memory_overview: budget is kept within MEMORY_OVERVIEW_BUDGET_MIN..MAX, a value that is not a number counts as omitted, and schema and READMEs state the same range', async () => {
+  const env = makeTempEnv('cortex-overview-budget-');
+  const MIN = MEMORY_OVERVIEW_BUDGET_MIN;
+  const MAX = MEMORY_OVERVIEW_BUDGET_MAX;
+  try {
+    assert.deepEqual([MIN, MAX], [256, 50000]);
+
+    // The rule itself: (budget argument, configured hookBudget) -> characters
+    const cases = [
+      [[undefined, 7000], 7000],
+      [[null, 7000], 7000],
+      [[undefined, undefined], 9000],
+      [[400, 7000], 400],
+      [['400', 7000], 400],
+      [[400.9, 7000], 400],
+      [[MIN, 7000], MIN],
+      [[MAX, 7000], MAX],
+      // out of range: moved to the nearest end
+      [[MIN - 1, 7000], MIN],
+      [[1, 7000], MIN],
+      [[0, 7000], MIN],
+      [[-5, 7000], MIN],
+      [[-Infinity, 7000], MIN],
+      [[MAX + 1, 7000], MAX],
+      [[1e9, 7000], MAX],
+      [[Infinity, 7000], MAX],
+      [['999999', 7000], MAX],
+      // not a number: as if omitted
+      [['abc', 7000], 7000],
+      [['', 7000], 7000],
+      [[NaN, 7000], 7000],
+      [[true, 7000], 7000],
+      [[{}, 7000], 7000],
+      [[[300], 7000], 7000],
+      // the configured default goes through the same range
+      [[undefined, 100], MIN],
+      [['abc', 1_000_000], MAX],
+      [[undefined, 'not a number'], 9000],
+    ];
+    for (const [input, expected] of cases) {
+      assert.equal(resolveOverviewBudget(...input), expected, JSON.stringify(input.map(String)));
+    }
+
+    // Through the tool. Enough documents that the overview is far longer than the smallest budget.
+    atomicWriteText(path.join(env.globalDir, 'config.json'), JSON.stringify({ hookBudget: 700 }));
+    const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+    try {
+      for (let i = 0; i < 8; i++) {
+        store.saveDoc({
+          id: `budget-decision-${i}`,
+          type: 'decision',
+          session: 'budget-session',
+          title: `Decision ${i} about the storage layout of the index`,
+          summary: `Summary ${i}: ${'the index keeps one row per document. '.repeat(4)}`,
+        });
+        store.saveDoc({ id: `budget-todo-${i}`, type: 'todo', session: 'budget-session', title: `Todo ${i} for the next step`, summary: `Do step ${i}.` });
+      }
+      const registry = createToolRegistry(store, { promptsDir: path.join(REPO_ROOT, 'prompts') });
+      const lengthFor = async (budget) => {
+        const args = budget === undefined ? { format: 'markdown' } : { format: 'markdown', budget };
+        const res = await registry.callTool('memory_overview', args);
+        assert.equal(res.isError, false, JSON.stringify(res.data));
+        assert.equal(res.data.charCount, res.data.markdown.length);
+        return res.data.charCount;
+      };
+
+      const unlimited = await lengthFor(MAX);
+      assert.ok(unlimited > 700, `the full overview is longer than the configured hookBudget (${unlimited})`);
+      const atMin = await lengthFor(MIN);
+      assert.ok(atMin > 0 && atMin <= MIN, `an overview fits the smallest budget (${atMin})`);
+      const atDefault = await lengthFor(undefined);
+      assert.ok(atDefault > MIN && atDefault <= 700, `the default is the configured hookBudget (${atDefault})`);
+
+      // Below the range: the smallest budget, not an empty overview
+      for (const tooSmall of [0, 1, -40, MIN - 1]) assert.equal(await lengthFor(tooSmall), atMin, String(tooSmall));
+      // Above the range: the largest budget
+      for (const tooLarge of [MAX + 1, 10_000_000]) assert.equal(await lengthFor(tooLarge), unlimited, String(tooLarge));
+      // Not a number: the configured hookBudget, not the built-in 9,000
+      for (const notNumber of ['abc', '', true, {}, null]) assert.equal(await lengthFor(notNumber), atDefault, JSON.stringify(notNumber));
+      // In range: used as given (a numeric string too)
+      const at400 = await lengthFor(400);
+      assert.ok(at400 > atMin && at400 <= 400, String(at400));
+      assert.equal(await lengthFor('400'), at400);
+
+      // The other formats take the same budget
+      const both = await registry.callTool('memory_overview', { budget: 1 });
+      assert.equal(both.data.formatted.length, atMin);
+
+      // Schema: the same constants
+      const schema = registry.listTools().find((tool) => tool.name === 'memory_overview').inputSchema.properties.budget;
+      assert.deepEqual([schema.type, schema.minimum, schema.maximum], ['integer', MIN, MAX]);
+      assert.ok(schema.description.includes(`${MIN}-${MAX}`), schema.description);
+      assert.match(schema.description, /configured hookBudget/);
+    } finally {
+      store.close();
+    }
+
+    // READMEs: the constants by name, with their values
+    const range = `${MIN.toLocaleString('en-US')}~${MAX.toLocaleString('en-US')}`;
+    for (const rel of ['README.md', path.join('src', 'mcp', 'README.md')]) {
+      const readme = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+      assert.ok(readme.includes(range), `${rel} states ${range}`);
+      assert.ok(readme.includes('MEMORY_OVERVIEW_BUDGET_MIN') && readme.includes('MEMORY_OVERVIEW_BUDGET_MAX'), `${rel} names the constants`);
+    }
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('version: package.json, both root entries of package-lock.json, SERVER_INFO and the MCP README state 1.1.0', () => {
+  const readJson = (name) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, name), 'utf8'));
+  const pkg = readJson('package.json');
+  const lock = readJson('package-lock.json');
+  assert.equal(pkg.version, '1.1.0');
+  assert.deepEqual([lock.version, lock.packages[''].version, SERVER_INFO.version], [pkg.version, pkg.version, pkg.version]);
+  assert.deepEqual([lock.name, lock.packages[''].name, SERVER_INFO.name], [pkg.name, pkg.name, pkg.name]);
+  const mcpReadme = fs.readFileSync(path.join(REPO_ROOT, 'src', 'mcp', 'README.md'), 'utf8');
+  assert.ok(mcpReadme.includes(`\`version: "${pkg.version}"\``), 'src/mcp/README.md states the version of SERVER_INFO');
 });

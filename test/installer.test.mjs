@@ -851,7 +851,16 @@ test('installer: the Antigravity configuration is touched only when Antigravity 
     assert.equal(fs.existsSync(path.join(env.homeDir, '.gemini')), false);
     assert.deepEqual([absent.antigravityHooks.action, ...absent.antigravityMcp.map((m) => m.action)], ['skipped', 'skipped', 'skipped']);
     assert.match(formatInstallSummary(absent).join('\n'), /\[SKIP\] Antigravity: no "agy" on PATH and no ~\/\.gemini folder; its configuration was not touched\./);
-    assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT }).present, false);
+    // The status check goes by the same two signs as the installer, with the same PATH
+    const absentState = checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: env.root } });
+    assert.deepEqual([absentState.present, absentState.detectedBy, absentState.events], [false, '', {}]);
+    assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, findCommand: noAgy }).present, false);
+    const onPathState = checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: binDir } });
+    assert.deepEqual(
+      [onPathState.present, onPathState.detectedBy, onPathState.ok, onPathState.events.SessionStart.state, onPathState.events.PreInvocation.state, onPathState.mcp.state],
+      [true, 'path', false, 'missing', 'missing', 'missing'],
+    );
+    assert.equal(fs.existsSync(path.join(env.homeDir, '.gemini')), false, 'checking creates nothing');
     assert.equal(readJson(env.settingsPath).hooks.SessionStart.length, 1, 'Claude Code is set up all the same');
 
     // agy on PATH: its files are created
@@ -865,8 +874,11 @@ test('installer: the Antigravity configuration is touched only when Antigravity 
     // An existing ~/.gemini is enough, without agy on PATH
     const viaDir = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
     assert.deepEqual([viaDir.antigravityPresent, viaDir.antigravityDetectedBy], [true, 'config-dir']);
-    const agyState = checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT });
+    const agyState = checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: env.root } });
     assert.deepEqual([agyState.present, agyState.ok, agyState.events.SessionStart.state, agyState.events.PreInvocation.state, agyState.mcp.state], [true, true, 'ok', 'ok', 'ok']);
+    // the folder is the sign that is reported, also when agy is on PATH as well
+    assert.equal(agyState.detectedBy, 'config-dir');
+    assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: binDir } }).detectedBy, 'config-dir');
 
     // Uninstall cleans the Antigravity files whenever they exist
     uninstallCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });

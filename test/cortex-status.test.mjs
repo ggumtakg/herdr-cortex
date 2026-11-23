@@ -25,14 +25,16 @@ process.env.HERDR_CORTEX_HOME = path.join(FALLBACK_HOME, '.herdr-cortex');
 const REAL_HOME_STAND_IN = path.join(FALLBACK_HOME, 'real-home-stand-in');
 fs.mkdirSync(REAL_HOME_STAND_IN, { recursive: true });
 
-// Environment of a child process that works on the test home of `env`.
+// Environment of a child process that works on the test home of `env`. Its PATH holds one empty folder:
+// whether this machine has `agy` on PATH must not change what the child reports about Antigravity.
 function childEnvFor(env, extra = {}) {
   const out = { ...process.env };
   for (const key of Object.keys(out)) {
-    if (/^(userprofile|HC_TERMINAL_ID|HERDR_CORTEX_HOME)$/i.test(key)) delete out[key];
+    if (/^(userprofile|HC_TERMINAL_ID|HERDR_CORTEX_HOME|path)$/i.test(key)) delete out[key];
   }
   out.USERPROFILE = REAL_HOME_STAND_IN;
   out.HERDR_CORTEX_TEST_HOME = env.homeDir;
+  out.PATH = REAL_HOME_STAND_IN;
   return { ...out, ...extra };
 }
 
@@ -122,7 +124,7 @@ test('cortex-status: a fresh install reports every check as in order, without an
     assert.deepEqual(lineOf(lines, '  recorded'), ['same path (exists)']);
     assert.deepEqual(lineOf(lines, 'Claude hooks'), ['SessionStart=ok SessionEnd=ok PreCompact=ok UserPromptSubmit=ok PreToolUse=ok']);
     assert.deepEqual(lineOf(lines, 'Claude MCP'), ['"herdr-cortex" registered (node ok, server.mjs ok)']);
-    assert.deepEqual(lineOf(lines, 'Antigravity'), ['not set up (no ~/.gemini folder)']);
+    assert.deepEqual(lineOf(lines, 'Antigravity'), ['not found (no "agy" on PATH and no ~/.gemini folder)']);
     assert.deepEqual(lineOf(lines, 'This folder'), [env.projectDir]);
     assert.deepEqual(lineOf(lines, '  approved'), ['no (approve with: cortex-trust approve)']);
     assert.deepEqual(lineOf(lines, '  enabled'), ['yes (mode=all) | headCore=on | hookBudget=9000']);
@@ -178,7 +180,7 @@ test('cortex-status: missing Node path, broken or missing registrations, an unap
     assert.deepEqual(lineOf(goneLines, '  recorded'), [`${vanishedNode} (MISSING)`]);
     assert.deepEqual(lineOf(goneLines, 'Claude hooks'), ['SessionStart=node_missing SessionEnd=node_missing PreCompact=node_missing UserPromptSubmit=node_missing PreToolUse=node_missing']);
     assert.deepEqual(lineOf(goneLines, 'Claude MCP'), ['"herdr-cortex" registered (node MISSING, server.mjs ok)']);
-    assert.deepEqual(lineOf(goneLines, 'Antigravity'), ['SessionStart=node_missing PreInvocation=node_missing | MCP=node_missing']);
+    assert.deepEqual(lineOf(goneLines, 'Antigravity'), ['SessionStart=node_missing PreInvocation=node_missing | MCP=node_missing | found by: ~/.gemini folder']);
 
     // Re-installed, then partly undone by hand and by a Claude Code that rewrote its file
     fs.rmSync(path.join(env.homeDir, '.gemini'), { recursive: true });
@@ -215,6 +217,51 @@ test('cortex-status: missing Node path, broken or missing registrations, an unap
     atomicWriteText(path.join(env.globalDir, 'config.json'), '{ "mode": ');
     const badConfig = await collectStatus({ repoRoot: REPO_ROOT, cwd: env.projectDir, homeDir: env.homeDir, env: {} });
     assert.match(badConfig.warnings.join('\n'), /Configuration: .*config\.json is ignored: /);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('cortex-status: Antigravity counts as present on the signs the installer goes by (agy on PATH or ~/.gemini), and the line names the sign that was found', async () => {
+  const env = makeTempEnv('herdr-cortex-status-agy-');
+  try {
+    const binDir = path.join(env.root, 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(binDir, process.platform === 'win32' ? 'agy.cmd' : 'agy'), '');
+    const withAgy = { PATH: binDir };
+    const withoutAgy = { PATH: env.root };
+    const geminiDir = path.join(env.homeDir, '.gemini');
+    const statusWith = (envVars) => collectStatus({ repoRoot: REPO_ROOT, cwd: env.projectDir, homeDir: env.homeDir, env: envVars });
+    const agyWarnings = (status) => status.warnings.filter((line) => line.startsWith('Antigravity'));
+
+    // Neither sign: the installer leaves Antigravity alone and the status says it was not found
+    const skipped = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: withoutAgy });
+    assert.deepEqual([skipped.antigravityPresent, fs.existsSync(geminiDir)], [false, false]);
+    const absent = await statusWith(withoutAgy);
+    assert.deepEqual([absent.antigravity.present, absent.antigravity.detectedBy], [false, '']);
+    assert.deepEqual(lineOf(formatStatus(absent), 'Antigravity'), ['not found (no "agy" on PATH and no ~/.gemini folder)']);
+    assert.deepEqual(agyWarnings(absent), []);
+
+    // agy on PATH, nothing registered yet: the installer would set it up, so the status says what is missing
+    const onPath = await statusWith(withAgy);
+    assert.deepEqual([onPath.antigravity.present, onPath.antigravity.detectedBy, onPath.antigravity.ok], [true, 'path', false]);
+    assert.deepEqual(lineOf(formatStatus(onPath), 'Antigravity'), ['SessionStart=missing PreInvocation=missing | MCP=missing | found by: "agy" on PATH']);
+    assert.deepEqual(agyWarnings(onPath), [
+      'Antigravity hook SessionStart: not registered (run install.ps1 again).',
+      'Antigravity hook PreInvocation: not registered (run install.ps1 again).',
+      `Antigravity MCP: missing in ${path.join(geminiDir, 'antigravity-cli', 'mcp_config.json')} (run install.ps1 again).`,
+    ]);
+    assert.equal(fs.existsSync(geminiDir), false, 'the check creates nothing');
+
+    // The installer goes by the same sign; from then on the folder exists and is the sign that is named
+    const viaPath = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: withAgy });
+    assert.deepEqual([viaPath.antigravityPresent, viaPath.antigravityDetectedBy], [true, 'path']);
+    for (const envVars of [withAgy, withoutAgy]) {
+      const installed = await statusWith(envVars);
+      assert.deepEqual([installed.antigravity.present, installed.antigravity.detectedBy, installed.antigravity.ok], [true, 'config-dir', true]);
+      assert.deepEqual(lineOf(formatStatus(installed), 'Antigravity'), ['SessionStart=ok PreInvocation=ok | MCP=ok | found by: ~/.gemini folder']);
+      assert.deepEqual(installed.warnings, []);
+    }
   } finally {
     env.cleanup();
   }

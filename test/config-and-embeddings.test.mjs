@@ -38,7 +38,7 @@ import {
 import { createGeminiProvider } from '../src/embeddings/gemini.mjs';
 import { createOpenAIProvider } from '../src/embeddings/openai.mjs';
 import { createOllamaProvider } from '../src/embeddings/ollama.mjs';
-import { runEmbedCli } from '../src/embeddings/cli.mjs';
+import { EMBED_CLI_SCOPES, runEmbedCli } from '../src/embeddings/cli.mjs';
 import { installCortex } from '../src/hooks/installer.mjs';
 import { SERVER_INSTRUCTIONS, createMcpServer, createServerRuntime } from '../src/mcp/server.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
@@ -898,6 +898,104 @@ test('default config written by the installer and the embed CLI flags use the ne
   } finally {
     process.exitCode = prevExitCode;
     await stub.close();
+    env.cleanup();
+  }
+});
+
+test('npm run embed: an unknown --scope, a --max-docs that is not a positive whole number, or an option without its value ends with reason "invalid_arguments" and exit code 1, before anything is read or changed', async () => {
+  const env = makeTempEnv('cortex-emb-args-');
+  const prevExitCode = process.exitCode;
+  try {
+    assert.deepEqual([...EMBED_CLI_SCOPES], ['project', 'global', 'all']);
+    const seed = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+    saveNote(seed, 'args-p1');
+    saveNote(seed, 'args-p2');
+    saveNote(seed, 'args-g1', { scope: 'global' });
+    seed.close();
+    const pendingRows = () => {
+      const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
+      try {
+        return ['args-p1', 'args-p2'].map((id) => embedRow(store, 'project', id).embed_status);
+      } finally {
+        store.close();
+      }
+    };
+
+    const provider = makeProvider();
+    const base = ['--project', env.projectDir, '--global', env.globalDir];
+    const cases = [
+      [['--scope', 'bogus'], '--scope must be one of project, global, all (got "bogus").'],
+      [['--scope', 'Project'], '--scope must be one of project, global, all (got "Project").'],
+      [['--scope', '--retry-failed'], '--scope must be one of project, global, all (got "--retry-failed").'],
+      [['--scope', ''], '--scope needs a value (project, global, all).'],
+      [['--scope'], '--scope needs a value (project, global, all).'],
+      [['--max-docs', 'abc'], '--max-docs must be a positive whole number (got "abc").'],
+      [['--max-docs', '0'], '--max-docs must be a positive whole number (got "0").'],
+      [['--max-docs', '-3'], '--max-docs must be a positive whole number (got "-3").'],
+      [['--max-docs', '2.5'], '--max-docs must be a positive whole number (got "2.5").'],
+      [['--max-docs', '1e3'], '--max-docs must be a positive whole number (got "1e3").'],
+      [['--max-docs'], '--max-docs needs a value (a positive whole number).'],
+      [['--provider'], '--provider needs a value (none, auto, gemini, openai, ollama, onnx).'],
+      [['--model'], '--model needs a value (a model name).'],
+      [['--retry-failed', '--scope', 'everything'], '--scope must be one of project, global, all (got "everything").'],
+      // every problem is named, in the order of the command line
+      [['--max-docs', 'many', '--scope', 'both'], '--max-docs must be a positive whole number (got "many"). --scope must be one of project, global, all (got "both").'],
+    ];
+    for (const [extra, error] of cases) {
+      const stdout = makeSink();
+      const stderr = makeSink();
+      process.exitCode = 0;
+      const summary = await runEmbedCli([...base, ...extra], { provider, env: {}, stdout, stderr });
+      const label = JSON.stringify(extra);
+      assert.deepEqual(summary, {
+        provider: null,
+        dimensions: 0,
+        processed: 0,
+        chunksIndexed: 0,
+        rebuiltTiers: [],
+        errors: 0,
+        circuitBroken: false,
+        reason: 'invalid_arguments',
+        error,
+      }, label);
+      assert.equal(process.exitCode, 1, label);
+      assert.deepEqual(JSON.parse(stdout.text), summary, label);
+      assert.equal(stderr.text, `[herdr-cortex] ${error}\n`, label);
+    }
+    // The folder options, given last without a value
+    for (const option of ['--project', '--global']) {
+      process.exitCode = 0;
+      const summary = await runEmbedCli([...base, option], { provider, env: {}, stdout: makeSink(), stderr: makeSink() });
+      assert.deepEqual([summary.reason, summary.error, process.exitCode], ['invalid_arguments', `${option} needs a value (a folder).`, 1]);
+    }
+    // Nothing was embedded and nothing changed
+    assert.equal(provider.state.calls, 0);
+    assert.deepEqual(pendingRows(), ['pending', 'pending']);
+
+    // The real command: a summary and exit code 1, not an exception
+    const cli = path.join(REPO_ROOT, 'src', 'embeddings', 'cli.mjs');
+    const child = spawnSync(process.execPath, ['--no-warnings', cli, ...base, '--scope', 'bogus'], { env: childEnv(env), encoding: 'utf8' });
+    assert.equal(child.status, 1, child.stderr);
+    assert.deepEqual(
+      [JSON.parse(child.stdout).reason, JSON.parse(child.stdout).error],
+      ['invalid_arguments', '--scope must be one of project, global, all (got "bogus").'],
+    );
+    assert.equal(child.stderr, '[herdr-cortex] --scope must be one of project, global, all (got "bogus").\n');
+
+    // Values that can be used still work: every scope, and a batch size of one document
+    process.exitCode = 0;
+    const oneByOne = await runEmbedCli([...base, '--scope', 'project', '--max-docs', '1'], { provider, env: {}, stdout: makeSink(), stderr: makeSink() });
+    assert.deepEqual([oneByOne.processed, oneByOne.errors, oneByOne.reason], [2, 0, undefined]);
+    assert.deepEqual(pendingRows(), ['ready', 'ready']);
+    const globalOnly = await runEmbedCli([...base, '--scope', 'global'], { provider, env: {}, stdout: makeSink(), stderr: makeSink() });
+    assert.deepEqual([globalOnly.processed, globalOnly.errors], [1, 0]);
+    const everything = await runEmbedCli([...base, '--scope', 'all', '--max-docs', '007'], { provider, env: {}, stdout: makeSink(), stderr: makeSink() });
+    assert.deepEqual([everything.processed, everything.errors, everything.reason], [0, 0, undefined]);
+    assert.equal(process.exitCode, 0);
+
+    assert.deepEqual(blockedFetches, []);
+  } finally {
+    process.exitCode = prevExitCode;
     env.cleanup();
   }
 });

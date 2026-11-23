@@ -11,7 +11,7 @@ import {
 import { PROJECT_NOT_APPROVED_CODE, formatProjectNotApprovedMessage } from '../core/trust.mjs';
 import { CortexStore } from '../core/store.mjs';
 import { searchMemory } from '../core/search.mjs';
-import { fitOverviewToBudget } from '../core/budget.mjs';
+import { HOOK_MAX_CHARS, fitOverviewToBudget } from '../core/budget.mjs';
 
 /**
  * Canon Protection check: detect whether the caller is a subagent.
@@ -53,6 +53,25 @@ export function isSubagentCaller(args = {}, meta = {}) {
 
 /** Most document names the `indexing` note of a tool result lists. */
 export const INDEXING_NOTE_MAX_DOCUMENTS = 5;
+
+/** The range of `memory_overview`'s `budget` argument (characters of the formatted overview). */
+export const MEMORY_OVERVIEW_BUDGET_MIN = 256;
+export const MEMORY_OVERVIEW_BUDGET_MAX = 50000;
+
+/**
+ * The character budget `memory_overview` formats with: the `budget` argument when it is a number (or a
+ * numeric string), else `configured` (the store's `hookBudget`), else HOOK_MAX_CHARS. Fractions are dropped
+ * and the result is kept between MEMORY_OVERVIEW_BUDGET_MIN and MEMORY_OVERVIEW_BUDGET_MAX.
+ */
+export function resolveOverviewBudget(requested, configured) {
+  const toNumber = (value) => {
+    if (typeof value === 'number') return value;
+    return typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+  };
+  const chosen = [toNumber(requested), toNumber(configured), HOOK_MAX_CHARS].find((value) => !Number.isNaN(value));
+  // Math.trunc keeps the infinities; the range then cuts them down like any other value outside it.
+  return Math.max(MEMORY_OVERVIEW_BUDGET_MIN, Math.min(Math.trunc(chosen), MEMORY_OVERVIEW_BUDGET_MAX));
+}
 
 /**
  * The `indexing` field of a tool result: present when the index sync of this call left documents to the
@@ -454,9 +473,9 @@ export function createToolRegistry(
           embeddingProviders: providers,
           embeddingBreaker,
         });
-        // Results that lack the project tier because the folder is unapproved say so (a search that asked
-        // for the global tier only lacks nothing); an excluded project keeps its existing shape.
-        return block === 'not_approved' && requestedScope !== 'global'
+        // Results that lack the project tier because the project is excluded or the folder is unapproved
+        // say so (a search that asked for the global tier only lacks nothing).
+        return block && requestedScope !== 'global'
           ? { ...found, ...projectBlockFlags(block, projectDir) }
           : found;
       });
@@ -621,7 +640,8 @@ export function createToolRegistry(
           direction: args.direction || 'both',
           limit: args.limit ?? 60,
         });
-        return block === 'not_approved' && requestedScope !== 'global'
+        // Marked like a search: the project tier was asked for (through "all") and left out.
+        return block && requestedScope !== 'global'
           ? { ...graph, ...projectBlockFlags(block, projectDir) }
           : graph;
       });
@@ -636,7 +656,15 @@ export function createToolRegistry(
       properties: {
         session: { type: 'string' },
         include_global: { type: 'boolean', default: true },
-        budget: { type: 'integer', minimum: 256, maximum: 50000, default: 9000 },
+        budget: {
+          type: 'integer',
+          minimum: MEMORY_OVERVIEW_BUDGET_MIN,
+          maximum: MEMORY_OVERVIEW_BUDGET_MAX,
+          default: 9000,
+          description: `Character limit of the formatted overview, ${MEMORY_OVERVIEW_BUDGET_MIN}-${MEMORY_OVERVIEW_BUDGET_MAX}. `
+            + 'A value outside the range is moved to the nearest end of it; a value that is not a number counts as '
+            + 'omitted. Default: the configured hookBudget.',
+        },
         format: { type: 'string', enum: ['both', 'json', 'markdown'], default: 'both' },
         project_dir: { type: 'string', description: 'Optional project directory override' },
       },
@@ -661,7 +689,7 @@ export function createToolRegistry(
                   recentWork: [],
                   globalPreferences: [],
                 });
-        const fitted = fitOverviewToBudget(overview, args.budget ?? targetStore.config?.hookBudget ?? 9000);
+        const fitted = fitOverviewToBudget(overview, resolveOverviewBudget(args.budget, targetStore.config?.hookBudget));
         if (args.format === 'markdown') {
           return {
             markdown: fitted.text,

@@ -15,7 +15,7 @@ import { createToolRegistry } from './tools.mjs';
 
 export const SERVER_INFO = Object.freeze({
   name: 'herdr-cortex',
-  version: '1.0.0',
+  version: '1.1.0',
 });
 
 export const DEFAULT_PROTOCOL_VERSION = '2024-11-05';
@@ -225,7 +225,17 @@ export const SERVER_INSTRUCTIONS = `herdr-cortex MCP 도구 안내 (서버 이�
 - Herdr 탭 협업: relay_tabs(탭 조회), relay_send(context_docs 첨부, HEAD 전용), relay_inbox(action: peek|ack; 훅이 이미 주입한 메시지는 ${describeRetentionKorean()} 보관되며 include_delivered: true로 다시 조회).
 - 프롬프트 로드: cortex_prompt로 start-job, product-planning, delegate, independent-review, plan-run(kind: "skill"), DEVELOPMENT_STANDARD(kind: "standard"), coder/developer/reviewer(kind: "agent") 로드.`;
 
-export const EXCLUDED_SERVER_INSTRUCTIONS = `herdr-cortex MCP 안내: 현재 프로젝트는 herdr-cortex 설정(excludedProjects/opt-in)에 의해 제외되어 있습니다. 프로젝트 기억 쓰기·relay_tabs/relay_send/relay_inbox 및 .memory/ 생성이 차단되며, scope: "global" 조회와 cortex_prompt만 사용할 수 있습니다.`;
+/**
+ * The instructions of a server whose project is excluded. Every statement follows the tool handlers
+ * (`tools.mjs`, `../relay/tools.mjs`); a test calls each tool the text names and compares.
+ */
+export const EXCLUDED_SERVER_INSTRUCTIONS = `herdr-cortex MCP 안내: 현재 프로젝트는 herdr-cortex 설정(excludedProjects/opt-in)에 의해 제외되어 있습니다. 이 프로젝트의 기억은 읽지도 쓰지도 않고 .memory/도 만들지 않습니다. 이 프로젝트에 대해 막히는 것과 되는 것은 다음과 같습니다.
+- 차단(오류 PROJECT_EXCLUDED): scope: "global"을 명시하지 않은 memory_save·memory_update(기본값이 각각 project, all이라 생략해도 차단), scope: "project"인 memory_read, 그리고 relay_tabs/relay_send/relay_inbox 전부.
+- 전역 기억 조회: memory_search·memory_read·memory_graph는 scope가 "global" 또는 "all"이면 전역 기억만으로 답하고(memory_graph는 기본값이 project이므로 scope를 적어야 함), memory_overview는 전역 선호만 담음.
+- 전역 기억 저장(메인 HEAD 전용): memory_save·memory_update에 scope: "global"을 명시하면 동작.
+- 표시: memory_search·memory_graph가 프로젝트 기억을 빼고 답하면 결과에 projectExcluded: true가 붙음(scope: "project"이면 오류 없이 빈 결과, "all"이면 전역 결과만). scope: "global"만 요청한 호출에는 붙지 않음.
+- cortex_prompt는 평소대로 동작.
+- project_dir로 다른 프로젝트를 지정한 memory_* 호출은 그 프로젝트의 제외·승인 여부로 판정(위 제한은 현재 프로젝트에만 해당).`;
 
 function makeJsonRpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };

@@ -1065,16 +1065,21 @@ export function checkClaudeHooks({ homeDir, repoRoot = REPO_ROOT } = {}) {
 }
 
 /**
- * Check the Antigravity registration: { present, hooksPath, readable, error, ok, events: { SessionStart,
- * PreInvocation }, mcp: { path, state } } with `events` as in `checkClaudeHooks` and mcp.state one of
- * ok | missing | not_ours | node_on_path | node_missing | script_missing | unreadable. `present` is false when there is no
- * `~/.gemini` folder (nothing else is filled in then).
+ * Check the Antigravity registration: { present, detectedBy, hooksPath, readable, error, ok, events: {
+ * SessionStart, PreInvocation }, mcp: { path, state } } with `events` as in `checkClaudeHooks` and mcp.state
+ * one of ok | missing | not_ours | node_on_path | node_missing | script_missing | unreadable.
+ * Antigravity is looked for the way the installer does (`detectAntigravity`, with the same `env` and
+ * `findCommand`): `detectedBy` is 'config-dir' (the `~/.gemini` folder exists), 'path' (`agy` is on PATH) or
+ * ''. `present` is false when neither was found (nothing else is filled in then); with 'path' alone the
+ * files do not exist yet, so the events and the MCP entry read as missing.
  */
-export function checkAntigravity({ homeDir, repoRoot = REPO_ROOT } = {}) {
+export function checkAntigravity({ homeDir, repoRoot = REPO_ROOT, env = process.env, findCommand = findOnPath } = {}) {
   const resolvedHome = resolveHomeDir(homeDir);
   const agyPaths = antigravityPaths(resolvedHome);
+  const detectedBy = detectAntigravity({ homeDir: resolvedHome, env, findCommand });
   const result = {
-    present: fs.existsSync(path.join(resolvedHome, '.gemini')),
+    present: Boolean(detectedBy),
+    detectedBy,
     hooksPath: agyPaths.hooks,
     readable: true,
     error: '',

@@ -18,6 +18,24 @@ import {
   retryFailedEmbeddings,
 } from './index.mjs';
 
+/** The tiers `--scope` accepts (what `processPendingEmbeddings` understands). */
+export const EMBED_CLI_SCOPES = Object.freeze(['project', 'global', 'all']);
+
+// The options that take a value, each with what the value is (named when the value is missing).
+const VALUE_OPTIONS = Object.freeze({
+  '--project': 'a folder',
+  '--global': 'a folder',
+  '--scope': EMBED_CLI_SCOPES.join(', '),
+  '--provider': `none, auto, ${EMBEDDING_PROVIDER_NAMES.join(', ')}`,
+  '--model': 'a model name',
+  '--max-docs': 'a positive whole number',
+});
+
+/**
+ * The options of the command line. `problems` lists every value that cannot be used: an option without its
+ * value (nothing, or an empty string, follows it), a `--scope` outside EMBED_CLI_SCOPES, a `--max-docs` that
+ * is not a positive whole number. A provider name is checked later, together with the one in the config.
+ */
 function parseArgs(argv) {
   const args = {
     projectDir: process.cwd(),
@@ -27,16 +45,32 @@ function parseArgs(argv) {
     model: '',
     maxDocs: 200,
     retryFailed: false,
+    problems: [],
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--project' && argv[i + 1]) args.projectDir = path.resolve(argv[++i]);
-    else if (a === '--global' && argv[i + 1]) args.globalDir = path.resolve(argv[++i]);
-    else if (a === '--scope' && argv[i + 1]) args.scope = argv[++i];
-    else if (a === '--provider' && argv[i + 1]) args.provider = argv[++i];
-    else if (a === '--model' && argv[i + 1]) args.model = argv[++i];
-    else if (a === '--max-docs' && argv[i + 1]) args.maxDocs = Number(argv[++i]) || 200;
-    else if (a === '--retry-failed') args.retryFailed = true;
+    if (a === '--retry-failed') {
+      args.retryFailed = true;
+      continue;
+    }
+    if (!Object.hasOwn(VALUE_OPTIONS, a)) continue;
+    const value = argv[i + 1];
+    if (value === undefined || value === '') {
+      args.problems.push(`${a} needs a value (${VALUE_OPTIONS[a]}).`);
+      continue;
+    }
+    i++;
+    if (a === '--project') args.projectDir = path.resolve(value);
+    else if (a === '--global') args.globalDir = path.resolve(value);
+    else if (a === '--provider') args.provider = value;
+    else if (a === '--model') args.model = value;
+    else if (a === '--scope') {
+      if (EMBED_CLI_SCOPES.includes(value)) args.scope = value;
+      else args.problems.push(`--scope must be one of ${EMBED_CLI_SCOPES.join(', ')} (got "${value}").`);
+    } else if (a === '--max-docs') {
+      if (/^\d+$/.test(value) && Number(value) >= 1 && Number.isSafeInteger(Number(value))) args.maxDocs = Number(value);
+      else args.problems.push(`--max-docs must be a positive whole number (got "${value}").`);
+    }
   }
   return args;
 }
@@ -59,6 +93,10 @@ function parseArgs(argv) {
  * is skipped (`reason: "project_disabled"` / `"project_not_approved"`, or `skippedProject` with --scope all);
  * nothing in its .memory/ is read. An unknown provider name, a provider without its API key, or --model without a
  * provider to apply it to ends the run with exit code 1; so does any embedding error.
+ *
+ * An option value that cannot be used (see `parseArgs`: an unknown --scope, a --max-docs that is not a positive
+ * whole number, an option without its value) ends the run before anything is read or changed: one line on
+ * stderr, the summary with `reason: "invalid_arguments"` and `error` naming the allowed values, exit code 1.
  */
 export async function runEmbedCli(
   argv = process.argv.slice(2),
@@ -70,6 +108,24 @@ export async function runEmbedCli(
   } = {},
 ) {
   const opts = parseArgs(argv);
+  if (opts.problems.length > 0) {
+    // A command line that cannot be understood: no config is loaded, no store is opened, nothing is reset.
+    const summary = {
+      provider: null,
+      dimensions: 0,
+      processed: 0,
+      chunksIndexed: 0,
+      rebuiltTiers: [],
+      errors: 0,
+      circuitBroken: false,
+      reason: 'invalid_arguments',
+      error: opts.problems.join(' '),
+    };
+    stderr.write(`[herdr-cortex] ${summary.error}\n`);
+    process.exitCode = 1;
+    stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    return summary;
+  }
   const breaker = createEmbeddingBreaker();
   const baseOverrides = opts.provider ? { embedding: { provider: opts.provider } } : undefined;
 

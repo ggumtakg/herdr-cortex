@@ -155,7 +155,8 @@ function inspectAllInboxes(globalDir) {
 
 /**
  * Gather everything `cortex-status` shows. Options: `repoRoot`, `cwd` (the folder to report on), `homeDir`,
- * `globalDir`, `env` (API keys are looked up by name only; `HC_TERMINAL_ID` selects the tab's inbox).
+ * `globalDir`, `env` (API keys are looked up by name only; `HC_TERMINAL_ID` selects the tab's inbox; its PATH
+ * is searched for `agy`, as the installer does).
  * Returns a plain object (see `formatStatus` for how it is displayed); `warnings` lists what needs attention.
  */
 export async function collectStatus({
@@ -228,7 +229,7 @@ export async function collectStatus({
     }
   }
 
-  const antigravity = checkAntigravity({ homeDir: resolvedHome, repoRoot: resolvedRoot });
+  const antigravity = checkAntigravity({ homeDir: resolvedHome, repoRoot: resolvedRoot, env });
   if (antigravity.present) {
     if (!antigravity.readable) warnings.push(`Antigravity hooks: ${antigravity.hooksPath} ${antigravity.error}.`);
     for (const [event, info] of Object.entries(antigravity.events)) {
@@ -390,10 +391,12 @@ export function formatStatus(status) {
   }
   lines.push(`${label('Claude MCP')}${mcpText}`);
 
+  // Present or not is decided the way the installer decides it; the line names the sign that was found.
   const agy = status.antigravity;
+  const agySign = agy.detectedBy === 'path' ? '"agy" on PATH' : '~/.gemini folder';
   lines.push(`${label('Antigravity')}${agy.present
-    ? `${agy.readable ? formatEvents(agy.events) : 'hooks.json unreadable'} | MCP=${agy.mcp.state}`
-    : 'not set up (no ~/.gemini folder)'}`);
+    ? `${agy.readable ? formatEvents(agy.events) : 'hooks.json unreadable'} | MCP=${agy.mcp.state} | found by: ${agySign}`
+    : 'not found (no "agy" on PATH and no ~/.gemini folder)'}`);
 
   const project = status.project;
   lines.push(`${label('This folder')}${project.path}`);

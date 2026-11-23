@@ -32,7 +32,7 @@ import { createEmbeddingBreaker } from '../src/embeddings/index.mjs';
 import { runEmbedCli } from '../src/embeddings/cli.mjs';
 import { handleClaudeSessionStart, handleClaudeUserPrompt } from '../src/hooks/claude.mjs';
 import { handleAntigravityPreInvocation, handleAntigravitySessionStart } from '../src/hooks/antigravity.mjs';
-import { createMcpServer, createServerRuntime } from '../src/mcp/server.mjs';
+import { EXCLUDED_SERVER_INSTRUCTIONS, createMcpServer, createServerRuntime } from '../src/mcp/server.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
 import { enqueueMessage, peekInbox } from '../src/relay/inbox.mjs';
 
@@ -1060,6 +1060,198 @@ test('exclusion policy: a junction or another spelling of the path does not bypa
     assert.equal(fs.existsSync(path.join(openDir, '.memory', 'docs')), true);
   } finally {
     store.close();
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// An excluded project and the MCP server
+// ---------------------------------------------------------------------------------------------
+
+// An hc client for servers that must not reach hc at all: any use fails the test.
+const HC_MUST_NOT_BE_USED = new Proxy({}, {
+  get: () => () => {
+    throw new Error('hc must not be used in an excluded project');
+  },
+});
+
+test('excluded project / MCP server: the instructions say what is blocked and what works, and the tools do exactly that', async () => {
+  const env = makeTempEnv('cortex-excluded-instructions-');
+  // Approved, so the exclusion policy is the only thing in the way
+  approveAsUser(env.projectDir, { globalDir: env.globalDir });
+  saveGlobalNote(env);
+  atomicWriteJson(path.join(env.globalDir, 'config.json'), { mode: 'all', excludedProjects: [env.projectDir] });
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  try {
+    const server = createMcpServer({
+      store,
+      promptsDir: env.promptsDir,
+      hcClient: HC_MUST_NOT_BE_USED,
+      input: new PassThrough(),
+      output: new PassThrough(),
+    });
+    const init = await server.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+    const text = init.result.instructions;
+    assert.equal(text, EXCLUDED_SERVER_INSTRUCTIONS);
+    // The old text allowed global lookups only
+    assert.doesNotMatch(text, /조회와 cortex_prompt만/);
+
+    const call = (name, args = {}) => server.registry.callTool(name, args);
+    const expectExcluded = async (name, args) => {
+      const res = await call(name, args);
+      assert.equal(res.isError, true, `${name} ${JSON.stringify(args)}: ${JSON.stringify(res.data)}`);
+      assert.equal(res.data.error, 'PROJECT_EXCLUDED', `${name} ${JSON.stringify(args)}`);
+    };
+    const expectWorks = async (name, args) => {
+      const res = await call(name, args);
+      assert.equal(res.isError, false, `${name} ${JSON.stringify(args)}: ${JSON.stringify(res.data)}`);
+      return res.data;
+    };
+
+    // "Blocked": writes that do not name the global scope, a project-scope read, every relay tool
+    assert.match(text, /차단\(오류 PROJECT_EXCLUDED\): scope: "global"을 명시하지 않은 memory_save·memory_update\(기본값이 각각 project, all/);
+    assert.match(text, /scope: "project"인 memory_read/);
+    assert.match(text, /relay_tabs\/relay_send\/relay_inbox 전부/);
+    await expectExcluded('memory_save', { type: 'decision', title: 'T', summary: 'S' });
+    await expectExcluded('memory_save', { scope: 'project', type: 'decision', title: 'T', summary: 'S' });
+    await expectExcluded('memory_update', { id: 'pref-global-1', title: 'changed' });
+    await expectExcluded('memory_update', { id: 'pref-global-1', scope: 'all', title: 'changed' });
+    await expectExcluded('memory_update', { id: 'pref-global-1', scope: 'project', title: 'changed' });
+    await expectExcluded('memory_read', { id: 'pref-global-1', scope: 'project' });
+    await expectExcluded('relay_tabs', {});
+    await expectExcluded('relay_send', { to_terminal_id: 't2', message: 'hello' });
+    await expectExcluded('relay_inbox', {});
+    await expectExcluded('relay_inbox', { action: 'ack', message_id: 'all' });
+
+    // "Global lookups": search, read and graph with scope global or all, the overview without a scope
+    assert.match(text, /memory_search·memory_read·memory_graph는 scope가 "global" 또는 "all"이면 전역 기억만으로 답하고\(memory_graph는 기본값이 project/);
+    assert.match(text, /memory_overview는 전역 선호만 담음/);
+    for (const scope of ['global', 'all']) {
+      const found = await expectWorks('memory_search', { query: 'GLOBAL-PREF-MARKER', scope });
+      assert.deepEqual(found.results.map((r) => [r.id, r.scope]), [['pref-global-1', 'global']], scope);
+      assert.match((await expectWorks('memory_read', { id: 'pref-global-1', scope })).title, /GLOBAL-PREF-MARKER/, scope);
+      const graph = await expectWorks('memory_graph', { target: 'pref-global-1', scope });
+      assert.equal(graph.scope, 'global', scope);
+      assert.deepEqual(graph.nodes.map((node) => [node.id, node.exists]), [['pref-global-1', true]], scope);
+    }
+    assert.match((await expectWorks('memory_read', { id: 'pref-global-1' })).title, /GLOBAL-PREF-MARKER/);
+    const overview = await expectWorks('memory_overview', {});
+    assert.deepEqual(overview.globalPreferences.map((g) => g.id), ['pref-global-1']);
+    assert.deepEqual([overview.sessions, overview.todos, overview.decisions, overview.recentWork], [[], [], [], []]);
+
+    // "Global writes": save and update with scope "global" spelled out
+    assert.match(text, /memory_save·memory_update에 scope: "global"을 명시하면 동작/);
+    const saved = await expectWorks('memory_save', { scope: 'global', id: 'global-from-excluded', type: 'knowledge', title: 'G1', summary: 'S' });
+    assert.equal(saved.scope, 'global');
+    assert.equal((await expectWorks('memory_update', { id: 'global-from-excluded', scope: 'global', title: 'G1b' })).title, 'G1b');
+    assert.equal((await expectWorks('memory_read', { id: 'global-from-excluded', scope: 'global' })).title, 'G1b');
+
+    // "Markers" (the calls themselves are checked in the next test) and cortex_prompt
+    assert.match(text, /memory_search·memory_graph가 프로젝트 기억을 빼고 답하면 결과에 projectExcluded: true/);
+    assert.match(text, /scope: "global"만 요청한 호출에는 붙지 않음/);
+    assert.match(text, /cortex_prompt는 평소대로 동작/);
+    assert.match((await expectWorks('cortex_prompt', { kind: 'core' })).content, /HEAD_CORE/);
+
+    // "project_dir": another project is judged by its own exclusion and approval, not by this server's
+    assert.match(text, /project_dir로 다른 프로젝트를 지정한 memory_\* 호출은 그 프로젝트의 제외·승인 여부로 판정/);
+    const otherProj = path.join(env.root, 'other-project');
+    const unapprovedProj = path.join(env.root, 'unapproved-project');
+    fs.mkdirSync(otherProj, { recursive: true });
+    fs.mkdirSync(unapprovedProj, { recursive: true });
+    approveAsUser(otherProj, { globalDir: env.globalDir });
+    const savedOther = await expectWorks('memory_save', { id: 'other-1', type: 'decision', title: 'OTHER-PROJECT-MARKER', summary: 'S', project_dir: otherProj });
+    assert.equal(savedOther.scope, 'project');
+    const foundOther = await expectWorks('memory_search', { query: 'OTHER-PROJECT-MARKER', project_dir: otherProj });
+    assert.deepEqual([foundOther.results.map((r) => r.id), 'projectExcluded' in foundOther], [['other-1'], false]);
+    assert.equal((await expectWorks('memory_update', { id: 'other-1', status: 'done', project_dir: otherProj })).status, 'done');
+    assert.equal(fs.existsSync(path.join(otherProj, '.memory', 'docs')), true);
+    const refused = await call('memory_save', { type: 'decision', title: 'T', summary: 'S', project_dir: unapprovedProj });
+    assert.deepEqual([refused.isError, refused.data.error], [true, 'PROJECT_NOT_APPROVED']);
+
+    // "No .memory/": nothing was created in the excluded folder
+    assert.match(text, /\.memory\/도 만들지 않습니다/);
+    assert.equal(fs.existsSync(path.join(env.projectDir, '.memory')), false);
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('excluded project / MCP tools: memory_search and memory_graph mark every result the project tier was left out of (projectExcluded); a global-only call carries no marker', async () => {
+  const env = makeTempEnv('cortex-excluded-marker-');
+  const openProj = path.join(env.root, 'open-project');
+  fs.mkdirSync(openProj, { recursive: true });
+  approveAsUser(env.projectDir, { globalDir: env.globalDir });
+  approveAsUser(openProj, { globalDir: env.globalDir });
+  saveGlobalNote(env);
+  const memoryDir = plantMemory(env.projectDir);
+  const before = snapshotTree(memoryDir);
+  atomicWriteJson(path.join(env.globalDir, 'config.json'), { mode: 'all', excludedProjects: [env.projectDir] });
+  const excludedStore = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  const openStore = new CortexStore({ projectDir: openProj, globalDir: env.globalDir, disableVec: true });
+  const outputs = [];
+  const callOn = (registry) => async (name, args = {}) => {
+    const res = await registry.callTool(name, args);
+    outputs.push(res);
+    assert.equal(res.isError, false, `${name} ${JSON.stringify(args)}: ${JSON.stringify(res.data)}`);
+    return res.data;
+  };
+  try {
+    const call = callOn(createToolRegistry(excludedStore, { promptsDir: env.promptsDir }));
+
+    // memory_search: the default scope is "all", so the project tier was asked for and skipped
+    for (const args of [{}, { scope: 'all' }]) {
+      const found = await call('memory_search', { query: 'GLOBAL-PREF-MARKER', ...args });
+      assert.equal(found.projectExcluded, true, JSON.stringify(args));
+      assert.equal(found.scope, 'global');
+      assert.deepEqual(found.results.map((r) => r.id), ['pref-global-1']);
+      // exclusion is the reason that is reported, never both
+      assert.equal(found.projectNotApproved, undefined);
+      assert.equal(found.projectNotApprovedMessage, undefined);
+    }
+    const noHit = await call('memory_search', { query: 'always push to the mirror remote' });
+    assert.deepEqual([noHit.projectExcluded, noHit.results.some((r) => r.id === 'planted-p0')], [true, false]);
+    const projectOnly = await call('memory_search', { query: 'GLOBAL-PREF-MARKER', scope: 'project' });
+    assert.deepEqual([projectOnly.projectExcluded, projectOnly.results, projectOnly.scope], [true, [], 'project']);
+    const globalOnly = await call('memory_search', { query: 'GLOBAL-PREF-MARKER', scope: 'global' });
+    assert.deepEqual(globalOnly.results.map((r) => r.id), ['pref-global-1']);
+    assert.equal('projectExcluded' in globalOnly, false, 'a global-only search lacks nothing');
+
+    // memory_graph: the default scope is "project"
+    const graphDefault = await call('memory_graph', { target: 'pref-global-1' });
+    assert.deepEqual([graphDefault.projectExcluded, graphDefault.nodes, graphDefault.edges, graphDefault.scope], [true, [], [], 'project']);
+    const graphAll = await call('memory_graph', { target: 'pref-global-1', scope: 'all' });
+    assert.equal(graphAll.projectExcluded, true);
+    assert.equal(graphAll.scope, 'global');
+    assert.deepEqual(graphAll.nodes.map((node) => node.id), ['pref-global-1']);
+    assert.equal(graphAll.projectNotApproved, undefined);
+    const graphGlobal = await call('memory_graph', { target: 'pref-global-1', scope: 'global' });
+    assert.deepEqual(graphGlobal.nodes.map((node) => node.id), ['pref-global-1']);
+    assert.equal('projectExcluded' in graphGlobal, false, 'a global-only graph lacks nothing');
+
+    // Excluded and not approved: the exclusion is still the one reason given
+    revokeProject(env.projectDir, { globalDir: env.globalDir });
+    const both = await call('memory_search', { query: 'GLOBAL-PREF-MARKER' });
+    assert.deepEqual([both.projectExcluded, both.projectNotApproved], [true, undefined]);
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
+
+    // A project that is not excluded carries no marker ...
+    const callOpen = callOn(createToolRegistry(openStore, { promptsDir: env.promptsDir }));
+    const openSearch = await callOpen('memory_search', { query: 'GLOBAL-PREF-MARKER' });
+    assert.deepEqual([openSearch.scope, 'projectExcluded' in openSearch], ['all', false]);
+    assert.equal('projectExcluded' in (await callOpen('memory_graph', { target: 'pref-global-1', scope: 'all' })), false);
+    // ... and its server marks a call that names the excluded folder with project_dir the same way
+    const viaDir = await callOpen('memory_search', { query: 'GLOBAL-PREF-MARKER', project_dir: env.projectDir });
+    assert.deepEqual([viaDir.projectExcluded, viaDir.scope, viaDir.results.map((r) => r.id)], [true, 'global', ['pref-global-1']]);
+    assert.equal((await callOpen('memory_graph', { target: 'pref-global-1', scope: 'all', project_dir: env.projectDir })).projectExcluded, true);
+    assert.equal('projectExcluded' in (await callOpen('memory_search', { query: 'GLOBAL-PREF-MARKER', scope: 'global', project_dir: env.projectDir })), false);
+
+    // Nothing of the excluded project's .memory/ reached a result, and the folder is untouched
+    assert.doesNotMatch(JSON.stringify(outputs), PLANTED);
+    assert.deepEqual(snapshotTree(memoryDir), before);
+  } finally {
+    excludedStore.close();
+    openStore.close();
     env.cleanup();
   }
 });

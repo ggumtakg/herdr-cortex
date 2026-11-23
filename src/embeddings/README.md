@@ -19,7 +19,7 @@
 | **`ollama.mjs`** | Ollama 서버용 프로바이더 | `OLLAMA_DEFAULT_MODEL`, `OLLAMA_DEFAULT_BASE_URL`, `resolveOllamaBaseUrl`, `createOllamaProvider` |
 | **`onnx.mjs`** | 이 프로세스 안에서 도는 ONNX 모델 프로바이더(네트워크 요청을 코드가 직접 하지 않음) | `ONNX_DEFAULT_MODEL`, `createOnnxProvider` |
 | **`provider-util.mjs`** | 프로바이더들이 함께 쓰는 도우미: API 키 찾기, 호출 한 번의 제한 시간과 재시도 횟수 정하기 | `resolveApiKey`, `resolveCallLimits` |
-| **`cli.mjs`** | `npm run embed`의 진입점. 대기 중인 문서를 남김없이 처리하고 요약을 JSON으로 출력합니다. | `runEmbedCli` |
+| **`cli.mjs`** | `npm run embed`의 진입점. 대기 중인 문서를 남김없이 처리하고 요약을 JSON으로 출력합니다. | `EMBED_CLI_SCOPES`, `runEmbedCli` |
 
 프로바이더 객체는 모두 같은 모양입니다: `{ name, model, dimensions, embed(texts, { taskType, timeoutMs, maxRetries }) }`. `embed`는 글 배열을 받아 같은 개수의 `Float32Array` 배열을 돌려주며, `taskType`은 `"document"`(기본값) 또는 `"query"`입니다.
 
@@ -329,21 +329,37 @@ npm run embed -- --project <프로젝트 폴더> --global <전역 저장소 폴�
 | :--- | :--- | :--- |
 | `--project <폴더>` | 현재 폴더 | 프로젝트 루트 |
 | `--global <폴더>` | 전역 저장소의 기본 위치 | 전역 저장소 폴더 |
-| `--scope <project\|global\|all>` | `all` | 처리할 계층. 값을 검사하지 않으므로 다른 값을 주면 예외로 끝납니다(종료 코드 1). |
+| `--scope <project\|global\|all>` | `all` | 처리할 계층. 허용 값은 `EMBED_CLI_SCOPES`(`project`, `global`, `all`)이고 대소문자를 구분합니다. 다른 값은 인자 오류입니다. |
 | `--provider <이름>` | 설정 값 | 이번 실행에서만 `embedding.provider`를 이 값으로 바꿉니다. 두 계층 모두에 적용됩니다. |
 | `--model <이름>` | 설정 값 | 이번 실행에서만 모델을 바꿉니다. `--provider`로 이름을 준 프로바이더의 묶음에, 없으면 설정이 고른 프로바이더의 묶음에 들어갑니다. 쓰이는 프로바이더가 없으면 인자 오류입니다. |
-| `--max-docs <수>` | `200` | 한 묶음에서 계층당 처리하는 문서 수. 전체 상한이 아니라 묶음의 크기입니다. |
+| `--max-docs <수>` | `200` | 한 묶음에서 계층당 처리하는 문서 수. 전체 상한이 아니라 묶음의 크기입니다. 숫자로만 된 1 이상의 정수여야 하며, 그 밖의 값(`abc`, `0`, `-3`, `2.5`)은 인자 오류입니다. |
 | `--retry-failed` | 꺼짐 | 처리하기 전에 포기한 문서를 되살립니다(처리 대상 계층에 한함). |
 
-값이 필요한 스위치를 값 없이 맨 끝에 쓰면 무시되고, 모르는 스위치도 무시됩니다.
+**인자 오류**: 쓸 수 없는 값은 일을 시작하기 전에 걸러 냅니다. `--scope`의 허용되지 않은 값, `--max-docs`의 양의 정수가 아닌 값, 값이 필요한 스위치(`--project`, `--global`, `--scope`, `--provider`, `--model`, `--max-docs`) 뒤에 값이 없거나 빈 문자열인 경우입니다. 이때는 설정도 저장소도 읽지 않고(`--retry-failed`도 실행되지 않음), 표준 오류에 `[herdr-cortex] <설명>` 한 줄을 쓰고, 표준 출력에 아래 모양의 요약을 낸 뒤 종료 코드 1로 끝납니다. 문제가 여럿이면 명령줄에 나온 순서대로 `error`에 이어 붙입니다.
+
+```json
+{
+  "provider": null,
+  "dimensions": 0,
+  "processed": 0,
+  "chunksIndexed": 0,
+  "rebuiltTiers": [],
+  "errors": 0,
+  "circuitBroken": false,
+  "reason": "invalid_arguments",
+  "error": "--scope must be one of project, global, all (got \"bogus\")."
+}
+```
+
+설명 문구는 `--scope must be one of project, global, all (got "<값>").`, `--max-docs must be a positive whole number (got "<값>").`, `<스위치> needs a value (<받는 값>).`의 세 가지입니다. 프로바이더 이름(`--provider`)은 여기서 검사하지 않고 설정의 이름과 함께 아래 5단계에서 검사합니다(`invalid_provider`). 모르는 스위치는 검사하지 않고 무시합니다.
 
 **실행 순서**
 
-1. 설정을 읽습니다. 프로젝트 계층은 "전역 설정 + `projects[...]` 항목", 전역 계층은 전역 설정만 쓰고, `--provider`와 `--model`은 양쪽에 덮어씁니다.
+1. 명령줄을 해석합니다. 위의 인자 오류가 있으면 요약을 내고 여기서 끝납니다. 없으면 설정을 읽습니다. 프로젝트 계층은 "전역 설정 + `projects[...]` 항목", 전역 계층은 전역 설정만 쓰고, `--provider`와 `--model`은 양쪽에 덮어씁니다.
 2. 표준 오류에 상태 줄을 출력합니다. `formatEmbeddingStatus`의 각 줄 앞에 `[herdr-cortex] `가 붙으며, 어떤 프로바이더가 쓰이고 문서가 어디로 전송되는지와 설정 문제가 일을 시작하기 전에 나옵니다.
 3. 프로젝트가 설정으로 제외되었는지(`excludedProjects`, `opt-in` 모드, `enabled: false`), 사용자가 승인한 폴더인지 확인합니다. 둘 중 하나라도 걸리면 그 프로젝트의 `.memory/`는 읽지 않습니다. 둘 다 해당하면 제외로 보고합니다. `--scope project`이면 `skipped: true`와 `reason: "project_disabled"` 또는 `"project_not_approved"`를 담은 짧은 요약을 출력하고 끝납니다(종료 코드 0, `--retry-failed`도 실행되지 않음). `--scope all`이면 전역 계층만 처리하고 요약에 `skippedProject: true`(미승인이면 `projectNotApproved: true`도)를 넣습니다. 미승인이고 `--scope`가 `global`이 아니면 승인 방법을 알리는 줄이 표준 오류에 나옵니다.
 4. `--retry-failed`가 있으면 포기한 문서를 되살립니다. 다음 단계에서 임베딩을 시작하지 못하게 되는 경우에도 이 단계는 실행됩니다.
-5. 인자 오류가 있거나, 이번 실행의 계층에 알 수 없는 프로바이더 이름이나 키 없는 프로바이더가 있으면 임베딩을 시작하지 않습니다(`reason`은 차례로 `"invalid_arguments"`, `"invalid_provider"`, `"no_provider"`이고 `error`에 설명, 종료 코드 1).
+5. 프로바이더 없이 `--model`을 주었거나, 이번 실행의 계층에 알 수 없는 프로바이더 이름이나 키 없는 프로바이더가 있으면 임베딩을 시작하지 않습니다(`reason`은 차례로 `"invalid_arguments"`, `"invalid_provider"`, `"no_provider"`이고 `error`에 설명, 종료 코드 1).
 6. `processPendingEmbeddings`를 되풀이해 부릅니다. 한 묶음에서 처리한 문서가 0건이거나, 프로바이더가 없거나, 서비스 실패 또는 인증 실패로 실행이 멈추면 끝냅니다. 되풀이는 최대 1,000번입니다. 서비스가 실패하면 기다렸다가 다시 시도하지 않고 바로 끝납니다.
 7. 표준 출력에 요약을 JSON(들여쓰기 2칸)으로 출력합니다.
 
@@ -362,7 +378,7 @@ npm run embed -- --project <프로젝트 폴더> --global <전역 저장소 폴�
 | `skippedProject`, `projectNotApproved` | 프로젝트 계층을 건너뛴 경우 |
 | `reason` | `no_provider`, `invalid_provider`, `invalid_arguments`, `service_unavailable`, `auth_failed`, `circuit_open`. 프로젝트를 건너뛴 짧은 요약에서는 `project_disabled`, `project_not_approved` |
 | `error` | 실행을 시작하지 못한 이유의 설명 |
-| `failedDocuments` | 처리 대상 계층의 포기 문서(`listFailedEmbeddings`의 결과) |
+| `failedDocuments` | 처리 대상 계층의 포기 문서(`listFailedEmbeddings`의 결과). 스위치 값의 인자 오류로 끝난 요약에는 없습니다 |
 | `retryReset` | `--retry-failed`를 썼을 때 계층별로 되살린 문서 수 |
 | `configProblems` | 설정 문제의 설명 목록(전역 쪽 문제에는 `global memory: `가 앞에 붙음) |
 
@@ -396,7 +412,7 @@ npm run embed -- --project <프로젝트 폴더> --global <전역 저장소 폴�
 }
 ```
 
-**종료 코드**: 문서 처리가 한 번이라도 실패했거나(`errors > 0`), 요약에 `error`가 있거나(알 수 없는 프로바이더 이름, 키 없는 프로바이더, 프로바이더 없이 준 `--model`), 예외가 나면(`embed cli error: ...`가 표준 오류에 출력됨) 1입니다. 그 밖에는 0입니다. 프로바이더가 `none`이어서 할 일이 없는 경우, `auto`가 아무것도 고르지 못한 경우, 프로젝트를 건너뛴 경우도 0입니다.
+**종료 코드**: 문서 처리가 한 번이라도 실패했거나(`errors > 0`), 요약에 `error`가 있거나(쓸 수 없는 스위치 값, 알 수 없는 프로바이더 이름, 키 없는 프로바이더, 프로바이더 없이 준 `--model`), 예외가 나면(`embed cli error: ...`가 표준 오류에 출력됨) 1입니다. 그 밖에는 0입니다. 프로바이더가 `none`이어서 할 일이 없는 경우, `auto`가 아무것도 고르지 못한 경우, 프로젝트를 건너뛴 경우도 0입니다.
 
 `--model`을 프로바이더 없이 주었을 때의 문구는 `--model was given but no embedding provider is in effect; add --provider <gemini|openai|ollama|onnx> or set embedding.provider in config.json.`이고 요약의 `reason`은 `invalid_arguments`입니다.
 
@@ -406,7 +422,7 @@ npm run embed -- --project <프로젝트 폴더> --global <전역 저장소 폴�
 
 이 폴더의 모듈을 직접 불러 쓰는 테스트 파일은 다음과 같습니다.
 
-* [`test/config-and-embeddings.test.mjs`](../../test/config-and-embeddings.test.mjs): 기본값 `none`, 알 수 없는 프로바이더 이름, 프로바이더별 묶음과 `auto`, 옛 형식 키 경고, 프로젝트별 설정과 전역 계층, 상태 함수, 검색어 임베딩의 제한 시간, 차단기, 실패를 세는 규칙(3번과 10번), 복구 뒤 따라잡기, 서버 시작 시 처리, 포기한 문서와 `--retry-failed`, `project_dir` 저장의 임베딩 예약
+* [`test/config-and-embeddings.test.mjs`](../../test/config-and-embeddings.test.mjs): 기본값 `none`, 알 수 없는 프로바이더 이름, CLI의 인자 오류(`--scope`, `--max-docs`, 값 없는 스위치), 프로바이더별 묶음과 `auto`, 옛 형식 키 경고, 프로젝트별 설정과 전역 계층, 상태 함수, 검색어 임베딩의 제한 시간, 차단기, 실패를 세는 규칙(3번과 10번), 복구 뒤 따라잡기, 서버 시작 시 처리, 포기한 문서와 `--retry-failed`, `project_dir` 저장의 임베딩 예약
 * [`test/search-rrf.test.mjs`](../../test/search-rrf.test.mjs): 벡터 색인과 모델 변경 시 재구축, 머리말만 바뀐 문서의 벡터 보존, 문서 실패 3번 상한, 401에서 실행 중단, 처리 중 바뀐 문서의 결과 폐기, `drain`, Gemini의 헤더·묶음·재시도, Ollama의 접두어, `buildDocChunks`, 벡터가 없을 때 검색어를 임베딩하지 않는 것, CLI의 제외 프로젝트 처리·되풀이·종료 코드
 * [`test/store-and-db.test.mjs`](../../test/store-and-db.test.mjs): `processPendingEmbeddings`로 채운 `doc_chunks_vec`의 디스크 크기와 `index_meta`
 * [`test/project-trust.test.mjs`](../../test/project-trust.test.mjs): 승인되지 않은 프로젝트를 `npm run embed`와 서버 대기열이 건너뛰는 것

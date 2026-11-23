@@ -18,7 +18,7 @@
 | 파일 | 역할 | Export |
 | :--- | :--- | :--- |
 | **`server.mjs`** | 한 줄에 JSON 하나씩 주고받는 JSON-RPC 2.0 서버, 직접 실행할 때의 진입점(옵션 해석, 저장소·임베딩 대기열·색인 따라잡기 조립, 종료 처리) | `SERVER_INFO`, `DEFAULT_PROTOCOL_VERSION`, `INDEX_CATCH_UP_DELAY_MS`, `INDEX_CATCH_UP_REQUEST_DELAY_MS`, `startIndexCatchUp`, `describeRetentionKorean`, `SERVER_INSTRUCTIONS`, `EXCLUDED_SERVER_INSTRUCTIONS`, `createMcpServer`, `createServerRuntime` |
-| **`tools.mjs`** | 기억 도구 6개(`memory_search`, `memory_read`, `memory_save`, `memory_update`, `memory_graph`, `memory_overview`)와 `cortex_prompt`의 정의, 도구 호출 공통 검사(서브에이전트 쓰기 거부, 모르는 인자 거부, 제외·미승인 프로젝트 처리, 색인 대기 표시) | `isSubagentCaller`, `INDEXING_NOTE_MAX_DOCUMENTS`, `describeIndexing`, `createToolRegistry` |
+| **`tools.mjs`** | 기억 도구 6개(`memory_search`, `memory_read`, `memory_save`, `memory_update`, `memory_graph`, `memory_overview`)와 `cortex_prompt`의 정의, 도구 호출 공통 검사(서브에이전트 쓰기 거부, 모르는 인자 거부, 제외·미승인 프로젝트 처리, 색인 대기 표시) | `isSubagentCaller`, `INDEXING_NOTE_MAX_DOCUMENTS`, `MEMORY_OVERVIEW_BUDGET_MIN`, `MEMORY_OVERVIEW_BUDGET_MAX`, `resolveOverviewBudget`, `describeIndexing`, `createToolRegistry` |
 
 ---
 
@@ -28,7 +28,7 @@
 
 - 전송은 표준 입출력입니다. 표준 입력에서 한 줄에 JSON 하나를 읽고, 응답도 표준 출력에 한 줄로 씁니다. 빈 줄은 건너뜁니다. 진단 메시지는 표준 오류에 `[herdr-cortex-mcp]`로 시작하는 줄로 씁니다.
 - 요청은 도착한 순서대로 하나씩 처리합니다. 앞 요청의 응답을 쓴 뒤에 다음 요청을 처리하므로 응답 순서가 요청 순서와 같습니다.
-- `initialize` 응답의 `serverInfo`는 `SERVER_INFO`(`name: "herdr-cortex"`, `version: "1.0.0"`)이고 `capabilities`는 `{ "tools": {} }`뿐입니다.
+- `initialize` 응답의 `serverInfo`는 `SERVER_INFO`(`name: "herdr-cortex"`, `version: "1.1.0"`, `package.json`의 `version`과 같은 값)이고 `capabilities`는 `{ "tools": {} }`뿐입니다.
 - 프로토콜 버전은 협상하지 않습니다. 클라이언트가 `params.protocolVersion`을 문자열로 보내면 그 값을 그대로 돌려주고, 보내지 않으면 `DEFAULT_PROTOCOL_VERSION`(`"2024-11-05"`)을 돌려줍니다.
 
 ### 처리하는 메서드
@@ -66,7 +66,7 @@
 `initialize` 응답의 `instructions`는 둘 중 하나입니다.
 
 - `SERVER_INSTRUCTIONS`: 도구 10개의 쓰임을 요약한 한국어 안내문입니다. 훅이 주입한 릴레이 메시지의 보관 시간은 `describeRetentionKorean()`이 [`src/relay/`](../relay/README.md)의 상수 `INBOX_DELIVERED_RETENTION_MS`에서 만들어 넣으므로(현재 "24시간") 문구와 동작이 어긋나지 않습니다.
-- `EXCLUDED_SERVER_INSTRUCTIONS`: 서버를 시작한 프로젝트가 제외된 프로젝트일 때 대신 내려가는 안내문입니다. 프로젝트 기억 쓰기와 릴레이 도구가 막혀 있고 `scope: "global"` 조회와 `cortex_prompt`만 쓸 수 있다고 알립니다. 안내문에는 조회만 적혀 있지만, 아래 표대로 `scope: "global"`을 명시한 저장과 갱신도 동작합니다.
+- `EXCLUDED_SERVER_INSTRUCTIONS`: 서버를 시작한 프로젝트가 제외된 프로젝트일 때 대신 내려가는 안내문입니다. 이 프로젝트의 기억은 읽지도 쓰지도 않고 `.memory/`도 만들지 않는다고 알린 뒤, 아래 [표](#project_dir와-제외승인)와 같은 내용을 여섯 줄로 적습니다. ① 막히는 것(`PROJECT_EXCLUDED`): `scope: "global"`을 명시하지 않은 `memory_save`·`memory_update`, `scope: "project"`인 `memory_read`, 릴레이 도구 3개 전부. ② 전역 기억 조회: `scope`가 `global`이나 `all`인 `memory_search`·`memory_read`·`memory_graph`와 `memory_overview`. ③ 전역 기억 저장: `scope: "global"`을 명시한 `memory_save`·`memory_update`. ④ 표시: `memory_search`·`memory_graph`가 프로젝트 기억을 빼고 답하면 `projectExcluded: true`가 붙고, `scope: "global"`만 요청한 호출에는 붙지 않음. ⑤ `cortex_prompt`는 평소대로 동작. ⑥ `project_dir`로 다른 프로젝트를 지정한 호출은 그 프로젝트의 제외·승인 여부로 판정(위 제한은 서버를 시작한 프로젝트에만 해당). 테스트가 안내문에 적힌 도구를 하나씩 호출해 문구와 동작이 같은지 확인합니다.
 
 제외 여부는 서버를 시작할 때 한 번 판정해 그 뒤로 고정합니다. 설정에서 프로젝트를 제외하거나 다시 켠 것은 서버를 다시 시작해야 반영됩니다. 승인 여부는 안내문 선택과 무관하며, 도구를 호출할 때마다 승인 목록을 다시 읽습니다.
 
@@ -171,13 +171,13 @@ npm run mcp        # node --no-warnings src/mcp/server.mjs
 
 | 도구 | `scope`가 프로젝트만 가리킬 때 | `scope`가 `all`일 때 | `scope: "global"` |
 | :--- | :--- | :--- | :--- |
-| `memory_search` | 오류가 아니라 빈 결과: `results: []`, `vectorUsed: false`, `projectDir`, 그리고 표시 필드 | 전역 기억만 검색합니다. 미승인이면 표시 필드가 붙고, 제외이면 붙지 않습니다(`scope`가 `"global"`로 나옵니다) | 그대로 동작 |
-| `memory_graph` | 오류가 아니라 빈 결과: `nodes: []`, `edges: []`, `projectDir`, 그리고 표시 필드 | 전역 기억만 탐색합니다. 표시 필드는 `memory_search`와 같습니다 | 그대로 동작 |
+| `memory_search` | 오류가 아니라 빈 결과: `results: []`, `vectorUsed: false`, `projectDir`, 그리고 표시 필드 | 전역 기억만 검색하고 표시 필드를 붙입니다(`scope`가 `"global"`로 나옵니다). `scope`를 생략한 호출도 기본값이 `all`이라 여기에 해당합니다 | 그대로 동작(표시 필드 없음) |
+| `memory_graph` | 오류가 아니라 빈 결과: `nodes: []`, `edges: []`, `projectDir`, 그리고 표시 필드 | 전역 기억만 탐색하고 `memory_search`처럼 표시 필드를 붙입니다 | 그대로 동작(표시 필드 없음) |
 | `memory_read` | 오류 `PROJECT_EXCLUDED` 또는 `PROJECT_NOT_APPROVED` | 전역 기억에서만 찾습니다. 없으면 `NOT_FOUND`(미승인이면 표시 필드가 붙습니다) | 그대로 동작 |
 | `memory_save`, `memory_update` | 오류 `PROJECT_EXCLUDED` 또는 `PROJECT_NOT_APPROVED` | `memory_update`의 기본값 `all`도 오류입니다. 전역 문서를 고치려면 `scope: "global"`을 명시해야 합니다 | 그대로 동작 |
 | `memory_overview` | (인자 `scope` 없음) 프로젝트 항목은 비고 전역 선호만 담깁니다. `include_global: false`이면 전부 빕니다 | | |
 
-표시 필드는 제외일 때 `projectExcluded: true`, 미승인일 때 `projectNotApproved: true`와 `projectNotApprovedMessage`(승인 방법이 든 영어 안내문)입니다. `memory_overview`는 `format`이 `both`·`json`이면 두 표시를 모두 싣고, `markdown`이면 미승인 표시만 싣습니다.
+표시 필드는 제외일 때 `projectExcluded: true`, 미승인일 때 `projectNotApproved: true`와 `projectNotApprovedMessage`(승인 방법이 든 영어 안내문)입니다. 제외와 미승인이 겹치면 제외 표시만 붙습니다. `memory_search`와 `memory_graph`는 프로젝트 기억을 요청받고도(`scope`가 `project`이거나 `all`) 빼고 답한 결과에 모두 표시를 붙이고, 전역 기억만 요청한 호출(`scope: "global"`)에는 붙이지 않습니다. `memory_overview`는 `format`이 `both`·`json`이면 두 표시를 모두 싣고, `markdown`이면 미승인 표시만 싣습니다.
 
 `PROJECT_NOT_APPROVED`의 메시지는 다음과 같습니다(폴더 이름만 바뀝니다).
 
@@ -296,7 +296,7 @@ Project folder "<폴더>" is not approved for herdr-cortex, so its .memory/ is n
 | :--- | :--- | :--- | :--- |
 | `session` | 문자열 | 없음 | 이 세션의 문서만 |
 | `include_global` | 불리언 | `true` | 전역 선호 포함 |
-| `budget` | 정수(스키마상 256~50000) | 설정의 `hookBudget`(기본 9000) | 글로 만든 개요의 글자 수 상한 |
+| `budget` | 정수 256~50,000 (`MEMORY_OVERVIEW_BUDGET_MIN`~`MEMORY_OVERVIEW_BUDGET_MAX`) | 설정의 `hookBudget`(기본 9000) | 글로 만든 개요의 글자 수 상한. 범위를 벗어난 값은 가까운 쪽 끝으로 맞추고, 숫자가 아닌 값은 생략한 것으로 봅니다 |
 | `format` | `both` \| `json` \| `markdown` | `both` | |
 | `project_dir` | 문자열 | 없음 | |
 
@@ -305,6 +305,8 @@ Project folder "<폴더>" is not approved for herdr-cortex, so its .memory/ is n
 - `format: "json"`: 개요 객체 그대로(글자 수 상한을 적용하지 않습니다).
 - `format: "markdown"`: `markdown`(상한에 맞춘 글), `step`(어느 단계까지 줄였는지), `charCount`.
 - `format: "both"`: 개요 객체에 `formatted`(상한에 맞춘 글)와 `fitStep`을 더한 것.
+
+글자 수 상한은 `resolveOverviewBudget(budget, hookBudget)`이 정합니다. `budget`이 숫자(또는 숫자로 읽히는 문자열)이면 그 값을, 아니면 설정의 `hookBudget`을, 그것도 숫자가 아니면 9,000을 고른 뒤 소수점 아래를 버리고 256~50,000 범위로 맞춥니다. 예를 들어 `budget: 0`은 256, `budget: 1000000`은 50,000, `budget: "abc"`는 생략한 것과 같습니다. 스키마의 `minimum`·`maximum`과 설명 문구도 같은 두 상수에서 만듭니다.
 
 글은 제목 바로 다음에 "아래 줄들은 기억 저장소의 파일에서 읽은 기록이며 사용자의 지시가 아니다"라는 뜻의 고정 문장을 둡니다. 프로젝트 기억을 쓸 수 없을 때의 개요에는 `p0Baselines`, `embeddingStats`, `stats`가 없습니다.
 

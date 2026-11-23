@@ -55,7 +55,7 @@ Windows PowerShell 5.1과 PowerShell 7 이상에서 동작하도록 작성되어
 | `sqlite-vec` | 벡터 검색에 쓰는 `sqlite-vec` 패키지를 불러올 수 있는지 |
 | `Claude hooks` | `~/.claude/settings.json`에 이벤트별 훅이 올바르게 등록되어 있는지 |
 | `Claude MCP` | `~/.claude.json`에 `herdr-cortex` 서버가 등록되어 있는지, 그 항목의 Node 경로와 `server.mjs`가 있는지 |
-| `Antigravity` | `~/.gemini` 폴더가 있을 때만 훅과 MCP 등록 상태 |
+| `Antigravity` | 설치기와 같은 기준(`~/.gemini` 폴더가 있거나 PATH에 `agy`가 있음)으로 Antigravity가 있다고 볼 때 훅과 MCP 등록 상태. 줄 끝의 `found by:`가 근거를 알려 줍니다(`~/.gemini folder` 또는 `"agy" on PATH`). PATH의 `agy`만 있고 아직 등록되지 않았으면 `missing`으로 나오고 다시 설치하라는 주의 항목이 붙습니다. 둘 다 없으면 `not found (no "agy" on PATH and no ~/.gemini folder)` |
 | `This folder`, `approved`, `enabled` | 현재 폴더의 승인 여부, 설정으로 제외되었는지와 그 이유, `headCore`, `hookBudget` |
 | `Approvals` | 승인된 폴더 수, 대화상자 없이 추가되거나 빠진 폴더 |
 | `Embedding` | 임베딩이 꺼져 있는지, 켜져 있으면 어느 프로바이더·모델·호스트로 보내는지, 포기한 문서 수 |
