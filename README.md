@@ -62,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```powershell
 cortex-status
 ```
-Node 버전(`>=22.13`), `sqlite-vec` 로드 상태, 현재 폴더 정책(`enabled`, `excludedProjects`, `hookBudget`, `embed`), 프로젝트/전역 DB 문서·임베딩 분포, Claude/Antigravity 설정 연결 상태가 한 번에 표시됩니다.
+Node 버전(`>=22.13`), `sqlite-vec` 로드 상태, 현재 폴더 정책(`enabled`, `excludedProjects`, `hookBudget`, `embed`), 프로젝트/전역 DB·임베딩 상태 분포, Claude/Antigravity 설정 연결 상태가 한 번에 표시됩니다.
 
 ---
 
@@ -134,21 +134,20 @@ flowchart TB
     REL <-->|"hc CLI"| Hosts
 ```
 
-### 저장소 구조
-```text
-herdr-cortex/
-├── install.ps1 / uninstall.ps1     # Windows 11 멱등 설치/제거기 (Node 버전 검증, UTF-8 BOM 프로필)
-├── src/
-│   ├── core/                       # 정본 마크다운 파서, SQLite WAL 4테이블, RRF 검색, BFS 그래프, FIT_STEPS 예산
-│   ├── embeddings/                 # Gemini / OpenAI / Ollama / ONNX 프로바이더, 비동기 큐, 일괄 임베딩 CLI
-│   ├── mcp/                        # Stdio MCP 서버 및 메모리·프롬프트 도구 7종
-│   ├── hooks/                      # Claude / Antigravity 공식 훅, 대용량 JSONL tail 추출기, 설정 설치기
-│   ├── revive/                     # Herdr 탭 세션 추적기(서브에이전트 가드, /clear 이전 세션 체인)
-│   └── relay/                      # Herdr hc 래퍼, 원자 파일 인박스(부분 ack), 릴레이 MCP 도구 3종
-├── prompts/                        # HEAD_CORE.md, DEVELOPMENT_STANDARD.md, 5대 스킬(plan-run 01~08), 3대 워커
-├── scripts/                        # auto-revive.ps1(cortex-status 포함), revive-agents.ps1, record-session.mjs, merge-hooks.mjs
-└── test/                           # 행동·보안·회귀·purity 자동 테스트 (5개 스위트, 47개 테스트)
-```
+### 저장소 구조 (핵심 폴더별 상세 README)
+| 폴더 | 상세 문서 | 역할 |
+| :--- | :---: | :--- |
+| **`src/core/`** | [README](src/core/README.md) | 정본 마크다운 파서, SQLite WAL 4테이블 + `index_meta`, 한국어 RRF 검색, 1~10홉 BFS 그래프, `FIT_STEPS` 예산, 설정 화이트리스트 |
+| **`src/embeddings/`** | [README](src/embeddings/README.md) | Gemini / OpenAI / Ollama / ONNX 플러거블 프로바이더, 비동기 임베딩 큐, `npm run embed` 일괄 CLI |
+| **`src/mcp/`** | [README](src/mcp/README.md) | 무의존 Stdio JSON-RPC 2.0 MCP 서버(`cortex`), 10개 도구 라우팅, 정본 보호 및 제외 프로젝트 차단 |
+| **`src/hooks/`** | [README](src/hooks/README.md) | Claude Code(4종) & Antigravity CLI(2종) 공식 훅, 16KB 롤 프로브, 2MB tail JSONL 추출, 멱등 설치기 |
+| **`src/revive/`** | [README](src/revive/README.md) | Herdr 탭 세션 추적기(서브에이전트 덮어쓰기 차단, ID 검증, `/clear` 이전 세션 체인, 레거시 폴백) |
+| **`src/relay/`** | [README](src/relay/README.md) | Herdr `hc` 래퍼, 원자 파일 인박스(부분 `ack` + 복원 실패 보호 + `.broken/` 격리), 릴레이 MCP 도구 3종 |
+| **`prompts/`** | [README](prompts/README.md) | `HEAD_CORE.md`(29줄), `DEVELOPMENT_STANDARD.md`, 5대 스킬(`plan-run` 8단계), 3대 워커 코어 |
+| **`scripts/`** | [README](scripts/README.md) | Windows 11 PowerShell 자동 복구(`auto-revive.ps1`, `revive-agents.ps1`), `cortex-status` 진단, 호환 래퍼 |
+| **`test/`** | [README](test/README.md) | Node.js 내장 `node:test` 기반 5개 스위트 · 47개 자동 테스트(행동 · 보안 · 회귀 · purity) |
+
+*(루트 설치/제거 스크립트: [`install.ps1`](install.ps1) · [`uninstall.ps1`](uninstall.ps1))*
 
 ---
 
