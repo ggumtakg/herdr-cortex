@@ -79,6 +79,21 @@ export const FIT_STEPS = Object.freeze([
 ]);
 
 /**
+ * Most characters one hook call injects, for every host (Claude Code and Antigravity). The configured
+ * `hookBudget` can lower this, never raise it.
+ */
+export const HOOK_MAX_CHARS = 9000;
+const HOOK_MIN_CHARS = 256;
+
+/**
+ * Injection budget of one hook call: the configured `hookBudget`, kept between 256 and HOOK_MAX_CHARS.
+ */
+export function resolveHookBudget(config) {
+  const configured = Number(config?.hookBudget) || HOOK_MAX_CHARS;
+  return Math.max(HOOK_MIN_CHARS, Math.min(configured, HOOK_MAX_CHARS));
+}
+
+/**
  * Fixed first line of every block of memory-store content that is injected into an agent's context
  * (memory overview, relay inbox). Formatters count it against their budget and never cut it: a block
  * that cannot hold it is not emitted at all.

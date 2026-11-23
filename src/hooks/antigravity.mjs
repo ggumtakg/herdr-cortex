@@ -13,8 +13,7 @@ import {
   isProjectTrusted,
   loadConfig,
 } from '../core/config.mjs';
-import { CortexStore } from '../core/store.mjs';
-import { fitOverviewToBudget } from '../core/budget.mjs';
+import { fitOverviewToBudget, resolveHookBudget } from '../core/budget.mjs';
 import { formatProjectNotApprovedNotice } from '../core/trust.mjs';
 import {
   extractCwd,
@@ -25,8 +24,14 @@ import {
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
 import { deliverInboxForHook } from '../relay/inbox.mjs';
-import { extractAntigravityState, resolveAntigravityTranscriptPath } from './recent-turns.mjs';
-import { COMPACT_POINTER_INSTRUCTION } from './claude.mjs';
+import { formatUnindexedNotice, loadHookOverview, resolveHookSyncOptions } from './overview.mjs';
+import {
+  DEFAULT_MAX_TAIL_BYTES,
+  extractAntigravityState,
+  formatRecentTurns,
+  resolveAntigravityTranscriptPath,
+} from './recent-turns.mjs';
+import { buildCompactInstruction, restoreFailureNote } from './claude.mjs';
 
 const SAFE_CONV_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
 const ROLE_PROBE_BYTES = 16 * 1024;
@@ -76,80 +81,6 @@ function trimLinesToBudget(text, budget) {
     len += add;
   }
   return out.join('\n').trimEnd();
-}
-
-function hasAnyOverviewItems(ov) {
-  if (!ov) return false;
-  return (
-    (ov.p0Baselines?.length || 0) > 0
-    || (ov.sessions?.length || 0) > 0
-    || (ov.todos?.length || 0) > 0
-    || (ov.decisions?.length || 0) > 0
-    || (ov.recentWork?.length || 0) > 0
-    || (ov.globalPreferences?.length || 0) > 0
-  );
-}
-
-// An unapproved project is treated like a folder without `.memory/`: only the global tier is read.
-function loadOverviewSafely({ projectDir, globalDir, config, projectTrusted }) {
-  const projectMemExists = projectTrusted && fs.existsSync(getProjectMemoryDir(projectDir));
-  const globalDocsExists = fs.existsSync(path.join(globalDir, 'docs'));
-  if (!projectMemExists && !globalDocsExists) {
-    return null;
-  }
-
-  const store = new CortexStore({
-    projectDir,
-    globalDir,
-    config,
-    disableVec: true,
-  });
-
-  try {
-    if (projectMemExists) {
-      const ov = store.getOverview({ includeGlobal: globalDocsExists });
-      return hasAnyOverviewItems(ov) ? ov : null;
-    }
-
-    const globalTier = store.getTier('global');
-    store.sync('global');
-    const globalPrefs = globalTier.db
-      .prepare(`
-        SELECT id, path, type, title, summary, tags, updated_at
-        FROM docs
-        WHERE status = 'active'
-        ORDER BY CASE WHEN path LIKE 'docs/preferences/%' THEN 0 ELSE 1 END, updated_at DESC
-        LIMIT 25
-      `)
-      .all()
-      .map((r) => {
-        let tags = [];
-        try { tags = JSON.parse(r.tags || '[]'); } catch { tags = []; }
-        return {
-          id: r.id,
-          type: r.type,
-          category: r.path.startsWith('docs/preferences/') ? 'preferences' : 'knowledge',
-          title: r.title,
-          summary: r.summary,
-          tags,
-          updated_at: r.updated_at,
-        };
-      });
-
-    if (globalPrefs.length === 0) return null;
-    return {
-      sessionFilter: null,
-      sessions: [],
-      todos: [],
-      decisions: [],
-      recentWork: [],
-      globalPreferences: globalPrefs,
-    };
-  } catch {
-    return null;
-  } finally {
-    store.close();
-  }
 }
 
 // Notice injected with the startup context when the folder has a .memory/ directory that was not loaded.
@@ -297,10 +228,32 @@ function isExplicitRootPayload(payload, convId) {
 }
 
 /**
+ * Push the memory overview of an injection. The index is synced under the hook's limits first; documents
+ * that sync left out are named in a one-line notice of their own, which is counted in the budget like every
+ * other section. `remaining()` is the budget that is left, `reserve` keeps room for text that follows.
+ */
+function pushOverviewSections({ pushSection, remaining, reserve = 0, ...overviewArgs }) {
+  const { overview, unindexed } = loadHookOverview(overviewArgs);
+  if (unindexed.length > 0) {
+    pushSection(formatUnindexedNotice(unindexed, { maxChars: remaining() }));
+  }
+  if (!overview) return;
+  const overviewBudget = remaining() - reserve;
+  if (overviewBudget >= 120) {
+    const fitted = fitOverviewToBudget(overview, overviewBudget);
+    if (fitted.text) {
+      pushSection(fitted.text);
+    }
+  }
+}
+
+/**
  * Antigravity SessionStart handler.
  * Defers startup injection and session recording to PreInvocation when transcript role
  * is 'unknown' and rootConversationId is not explicitly equal to conversationId (real
  * Antigravity CLI behavior where root vs subagent cannot yet be distinguished at SessionStart).
+ * `startedAt` (epoch ms the hook process started) and `indexBudget` set the index sync limits, see
+ * `resolveHookSyncOptions`.
  */
 export function handleAntigravitySessionStart(
   payload = {},
@@ -309,6 +262,8 @@ export function handleAntigravitySessionStart(
     globalDir,
     legacyHome,
     promptsDir = path.join(REPO_ROOT, 'prompts'),
+    startedAt,
+    indexBudget,
   } = {},
 ) {
   if (isSubagentPayload(payload)) {
@@ -331,7 +286,7 @@ export function handleAntigravitySessionStart(
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
-  const budget = Math.max(256, Number(config.hookBudget) || 9000);
+  const budget = resolveHookBudget(config);
 
   recordSession({
     terminalId,
@@ -368,16 +323,15 @@ export function handleAntigravitySessionStart(
   }
   pushSection(notApprovedNotice);
 
-  const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config, projectTrusted });
-  if (overview) {
-    const remaining = budget - used;
-    if (remaining >= 120) {
-      const fitted = fitOverviewToBudget(overview, remaining);
-      if (fitted.text) {
-        pushSection(fitted.text);
-      }
-    }
-  }
+  pushOverviewSections({
+    pushSection,
+    remaining: () => budget - used,
+    projectDir,
+    globalDir: effectiveGlobalDir,
+    config,
+    projectTrusted,
+    syncOptions: resolveHookSyncOptions({ startedAt, indexBudget }),
+  });
 
   // Budget-first relay inbox delivery (see ANTIGRAVITY_INBOX_MAX_CHARS)
   if (isValidTerminalId(terminalId)) {
@@ -418,7 +372,7 @@ export function handleAntigravitySessionStart(
  *  1) Rejects subagents via payload fields OR 16KB transcript role probe (NEVER overwrites parent session!).
  *  2) Records revive session ONLY when confirmed root conversation.
  *  3) On first root PreInvocation (!state.started), injects HEAD_CORE + overview once.
- *  4) If lastUserInput starts with '/compact', injects 1-line compact pointer.
+ *  4) If lastUserInput starts with '/compact', injects the one-paragraph compaction instruction.
  *  5) Fast (mtime, size) check before reading transcript; on new CHECKPOINT (DONE),
  *     re-injects HEAD_CORE + overview + last 5 turns once within combined hookBudget.
  *  6) Budget-first relay inbox drain with partial ACK.
@@ -430,6 +384,9 @@ export function handleAntigravityPreInvocation(
     globalDir,
     legacyHome,
     promptsDir = path.join(REPO_ROOT, 'prompts'),
+    startedAt,
+    indexBudget,
+    turnOptions,
   } = {},
 ) {
   if (isSubagentPayload(payload)) {
@@ -457,7 +414,7 @@ export function handleAntigravityPreInvocation(
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
-  const budget = Math.max(256, Number(config.hookBudget) || 9000);
+  const budget = resolveHookBudget(config);
 
   if (isConfirmedRoot) {
     recordSession({
@@ -500,9 +457,18 @@ export function handleAntigravityPreInvocation(
   };
 
   // 1. Detect /compact command (with or without trailing arguments)
+  // The softened instruction: what is saved in memory need not be restated, what is not saved must be kept.
   if (/^\/compact(?:\s|$)/i.test(lastInput)) {
-    pushSection(COMPACT_POINTER_INSTRUCTION);
+    pushSection(buildCompactInstruction({ hasUserInstructions: /^\/compact\s+\S/i.test(lastInput) }));
   }
+
+  const overviewArgs = {
+    projectDir,
+    globalDir: effectiveGlobalDir,
+    config,
+    projectTrusted,
+    syncOptions: resolveHookSyncOptions({ startedAt, indexBudget }),
+  };
 
   // 2. First root PreInvocation startup injection (deferred from SessionStart)
   let injectedStartupThisTurn = false;
@@ -512,16 +478,7 @@ export function handleAntigravityPreInvocation(
       pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
     }
     pushSection(notApprovedNotice);
-    const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config, projectTrusted });
-    if (overview) {
-      const remaining = budget - used;
-      if (remaining >= 120) {
-        const fitted = fitOverviewToBudget(overview, remaining);
-        if (fitted.text) {
-          pushSection(fitted.text);
-        }
-      }
-    }
+    pushOverviewSections({ pushSection, remaining: () => budget - used, ...overviewArgs });
     cpState.started = true;
     stateDirty = true;
     injectedStartupThisTurn = true;
@@ -551,9 +508,16 @@ export function handleAntigravityPreInvocation(
     );
 
     if (transcriptChanged) {
-      const state = extractAntigravityState(actualTranscript, {
+      const readerOptions = {
+        ...(turnOptions && typeof turnOptions === 'object' ? turnOptions : {}),
         maxTurns: 5,
         maxChars: Math.min(4500, Math.max(300, Math.floor(budget * 0.5))),
+      };
+      // This probe runs on every prompt, so it only looks at the first tail window. The window grows (see
+      // `extractRecentTurns`) only when a new checkpoint means the turns are actually restored.
+      const state = extractAntigravityState(actualTranscript, {
+        ...readerOptions,
+        maxTailBytesCap: readerOptions.maxTailBytes ?? DEFAULT_MAX_TAIL_BYTES,
       });
 
       cpState.transcriptPath = actualTranscript;
@@ -562,6 +526,11 @@ export function handleAntigravityPreInvocation(
       stateDirty = true;
 
       if (state.latestCheckpoint?.key && state.latestCheckpoint.key !== cpState.checkpoint) {
+        const humanTurns = state.candidateTurns.filter((t) => t.user).length;
+        const turns = humanTurns >= readerOptions.maxTurns
+          ? state
+          : extractAntigravityState(actualTranscript, readerOptions);
+
         if (!injectedStartupThisTurn) {
           const headCore = readHeadCore(promptsDir, config);
           if (headCore) {
@@ -569,32 +538,26 @@ export function handleAntigravityPreInvocation(
           }
           pushSection(notApprovedNotice);
 
-          const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config, projectTrusted });
-          if (overview) {
-            const turnsReserve = state.text ? Math.min(state.text.length, Math.floor((budget - used) * 0.5)) : 0;
-            const ovBudget = budget - used - turnsReserve;
-            if (ovBudget >= 120) {
-              const fitted = fitOverviewToBudget(overview, ovBudget);
-              if (fitted.text) {
-                pushSection(fitted.text);
-              }
-            }
-          }
+          pushOverviewSections({
+            pushSection,
+            remaining: () => budget - used,
+            reserve: turns.text ? Math.min(turns.text.length, Math.floor((budget - used) * 0.5)) : 0,
+            ...overviewArgs,
+          });
         }
 
-        if (state.text) {
+        if (turns.text) {
           const remaining = budget - used;
-          if (state.text.length <= remaining) {
-            pushSection(state.text);
+          if (turns.text.length <= remaining) {
+            pushSection(turns.text);
           } else if (remaining >= 160) {
-            const refit = extractAntigravityState(actualTranscript, {
-              maxTurns: 5,
-              maxChars: remaining,
-            });
+            const refit = formatRecentTurns(turns.candidateTurns, { maxChars: remaining });
             if (refit.text) {
               pushSection(refit.text);
             }
           }
+        } else {
+          pushSection(restoreFailureNote(turns.restoreFailure));
         }
 
         cpState.checkpoint = state.latestCheckpoint.key;
@@ -666,7 +629,8 @@ if (isMainModule(import.meta.url)) {
     if (raw && raw.trim()) {
       payload = JSON.parse(raw);
     }
-    output = runAntigravityHook(event, payload);
+    // The index sync budget counts from the start of this process, not from here.
+    output = runAntigravityHook(event, payload, { startedAt: Math.round(performance.timeOrigin) });
   } catch {
     output = {};
   }

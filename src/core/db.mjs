@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
+  atomicWriteJson,
   compareTimestamps,
   ensureTierDirs,
   formatIsoTimestamp,
@@ -28,6 +29,9 @@ const VEC_CLEANUP_KEY = 'vecCleanupPending';
 const orphanSweptDbPaths = new Set(); // index files this process has already swept once
 
 export const SCHEMA_VERSION = 2;
+
+// How long a connection waits for a lock another connection holds before it reports SQLITE_BUSY.
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 
 const CORE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS docs (
@@ -451,7 +455,7 @@ function migrateSchemaIfNeeded(db, tierDir, vecAvailable) {
 function initDatabaseInstance(dbPath, { disableVec = false, tierDir = '' } = {}) {
   const db = new DatabaseSync(dbPath, { allowExtension: true });
   try {
-    db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS};`);
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA synchronous = NORMAL;');
 
@@ -964,44 +968,226 @@ function reconcileOrphanVectors(db, { removedDocs, dbPath }) {
   return removed;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Deferred indexing
+//
+// A sync that runs under a time budget (the session-start hooks) does not index every changed file: a file
+// that is too big for a hook, or that does not fit in the time that is left, is deferred. Deferred files are
+// never excluded: the next sync without a budget (the MCP server, in the background after it starts and on
+// its regular syncs) indexes them. What one sync left undone is written to
+// <tierDir>/state/deferred-index.json and removed again by the first sync that leaves nothing undone.
+// ---------------------------------------------------------------------------------------------
+
+export const DEFERRED_INDEX_FILE = 'deferred-index.json';
+/** Most entries the record lists (`count` always holds the real number). */
+export const DEFERRED_INDEX_MAX_ENTRIES = 200;
+
+export const DEFER_REASON_TOO_LARGE = 'too_large'; // larger than the sync's `maxFileBytes`
+export const DEFER_REASON_TIME_BUDGET = 'time_budget'; // does not fit in the time left before `deadline`
+export const DEFER_REASON_INDEX_BUSY = 'index_busy'; // another process held the index write lock
+export const DEFER_REASON_ERROR = 'error'; // reading or indexing the file failed (`error` holds the message)
+
+export function getDeferredIndexPath(tierDir) {
+  return path.join(getTierPaths(tierDir).stateDir, DEFERRED_INDEX_FILE);
+}
+
+function cleanDeferredEntry(item) {
+  if (!item || typeof item !== 'object' || typeof item.path !== 'string' || !item.path) return null;
+  const entry = {
+    path: item.path,
+    size: Number(item.size) || 0,
+    reason: typeof item.reason === 'string' && item.reason ? item.reason : DEFER_REASON_ERROR,
+  };
+  if (typeof item.error === 'string' && item.error) entry.error = item.error;
+  return entry;
+}
+
 /**
- * Incrementally sync all Markdown files in <tierDir>/docs/ into SQLite.
- * Reads existing state INSIDE a `BEGIN IMMEDIATE` transaction to prevent TOCTOU races.
- * Checks (mtime_ms, size) first, then SHA-256 hash; detects duplicate IDs; removes deleted files.
- * On a vector-enabled connection it also removes vector rows left behind by connections that could not;
- * the result then carries `orphanVectorsRemoved` (the key is absent when nothing was removed).
+ * Documents the last sync of this tier did not index:
+ * { count, files: [{ path, size, reason, error? }], updatedAt } with paths relative to the tier directory.
+ * `count` is 0 and `files` is empty when nothing is waiting (no record file).
  */
-export function syncFromDisk(db, tierDir) {
+export function readDeferredIndex(tierDir) {
+  const empty = { count: 0, files: [], updatedAt: '' };
+  try {
+    const filePath = getDeferredIndexPath(tierDir);
+    if (!fs.existsSync(filePath)) return empty;
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.files)) return empty;
+    const files = parsed.files.map(cleanDeferredEntry).filter(Boolean);
+    return {
+      count: Math.max(files.length, Number(parsed.count) || 0),
+      files,
+      updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : '',
+    };
+  } catch {
+    return empty;
+  }
+}
+
+// Replace the record with what this sync left undone; no entries removes the file.
+function writeDeferredIndex(tierDir, entries) {
+  const filePath = getDeferredIndexPath(tierDir);
+  try {
+    if (entries.length === 0) {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return;
+    }
+    const files = entries.slice(0, DEFERRED_INDEX_MAX_ENTRIES).map(cleanDeferredEntry).filter(Boolean);
+    const previous = readDeferredIndex(tierDir);
+    if (previous.count === entries.length && JSON.stringify(previous.files) === JSON.stringify(files)) return;
+    atomicWriteJson(filePath, {
+      version: 1,
+      updatedAt: formatIsoTimestamp(),
+      count: entries.length,
+      files,
+    });
+  } catch {
+    // The record is advisory: a failed write never fails the sync.
+  }
+}
+
+// Sessions whose session_next chain must be rebuilt. The list is stored with every file that is indexed and
+// cleared when the chains were rebuilt, so a sync that is stopped or killed between files leaves a note for
+// the next one instead of stale chains.
+const SESSION_EDGES_PENDING_KEY = 'sessionEdgesPending';
+
+function readPendingSessions(db) {
+  try {
+    const row = db.prepare('SELECT value FROM index_meta WHERE key = ?').get(SESSION_EDGES_PENDING_KEY);
+    const parsed = row ? JSON.parse(row.value) : [];
+    return Array.isArray(parsed) ? parsed.filter((s) => typeof s === 'string' && s) : [];
+  } catch {
+    return [];
+  }
+}
+
+function isBusyError(err) {
+  if (!err) return false;
+  if (Number.isInteger(err.errcode) && ((err.errcode & 0xff) === 5 || (err.errcode & 0xff) === 6)) return true;
+  const msg = `${err.message || ''} ${err.errstr || ''}`.toLowerCase();
+  return msg.includes('database is locked') || msg.includes('database table is locked') || msg.includes('sqlite_busy');
+}
+
+const DOC_ROW_COLUMNS = 'id, path, mtime_ms, size, hash, content_hash, session, embed_status, embed_model, embed_attempts, embed_error, embed_service_failures';
+
+function syncStatements(db) {
+  return {
+    ...upsertDocStatements(db),
+    selectByPath: db.prepare(`SELECT ${DOC_ROW_COLUMNS} FROM docs WHERE path = ?`),
+    selectById: db.prepare(`SELECT ${DOC_ROW_COLUMNS} FROM docs WHERE id = ?`),
+    setMeta: db.prepare('INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)'),
+    deleteMeta: db.prepare('DELETE FROM index_meta WHERE key = ?'),
+  };
+}
+
+/**
+ * Limits of a budgeted sync, or null when everything is to be indexed:
+ * - `deadline` (epoch ms, read through `now()`): a changed file is only read when its estimated cost
+ *   (`perFileMs + size / bytesPerMs`) fits in the time that is left;
+ * - `maxFileBytes`: a larger file is deferred whatever time is left.
+ */
+function resolveSyncBudget(options) {
+  const deadline = Number(options?.deadline);
+  const maxFileBytes = Number(options?.maxFileBytes);
+  const hasDeadline = options?.deadline !== undefined && options?.deadline !== null && Number.isFinite(deadline);
+  const hasMaxBytes = Number.isFinite(maxFileBytes) && maxFileBytes > 0;
+  if (!hasDeadline && !hasMaxBytes) return null;
+  const bytesPerMs = Number(options?.bytesPerMs);
+  const perFileMs = Number(options?.perFileMs);
+  return {
+    deadline: hasDeadline ? deadline : Infinity,
+    maxFileBytes: hasMaxBytes ? maxFileBytes : Infinity,
+    bytesPerMs: Number.isFinite(bytesPerMs) && bytesPerMs > 0 ? bytesPerMs : Infinity,
+    perFileMs: Number.isFinite(perFileMs) && perFileMs > 0 ? perFileMs : 0,
+    now: typeof options.now === 'function' ? options.now : Date.now,
+  };
+}
+
+function budgetDeferReason(budget, size) {
+  if (size > budget.maxFileBytes) return DEFER_REASON_TOO_LARGE;
+  const remaining = budget.deadline - budget.now();
+  if (remaining <= 0 || budget.perFileMs + size / budget.bytesPerMs > remaining) return DEFER_REASON_TIME_BUDGET;
+  return '';
+}
+
+function errorText(err) {
+  return String(err?.message || err || 'unknown error').replace(/\s+/g, ' ').trim().slice(0, 300);
+}
+
+/**
+ * The sync as a sequence of steps: one step per changed file, each in its own `BEGIN IMMEDIATE`
+ * transaction (the file is read and its row written under the index write lock, like every other writer),
+ * then one closing transaction for deleted files, session chains and vector upkeep. The generator yields
+ * after every file it handled, always outside a transaction, so a caller can stop or pause between files
+ * without losing what was indexed so far.
+ */
+function* syncSteps(db, tierDir, options = {}) {
   const paths = ensureTierDirs(tierDir);
   const diskFiles = collectMarkdownFiles(paths.docsDir);
+  const budget = resolveSyncBudget(options);
+  const onFileIndexed = typeof options.onFileIndexed === 'function' ? options.onFileIndexed : null;
 
   let addedOrUpdated = 0;
   let statUpdated = 0;
   let deleted = 0;
   let orphanVectorsRemoved = 0;
   const duplicates = [];
+  const deferred = []; // [{ path, size, reason }]
+  const failed = []; // [{ path, size, reason: 'error', error }]
+  let deferredWithoutRow = false;
+  let indexBusy = false;
 
-  withTransaction(db, () => {
-    const decoderRow = db.prepare("SELECT value FROM index_meta WHERE key = 'textDecoderVersion'").get();
-    const rereadAll = decoderRow?.value !== TEXT_DECODER_VERSION;
+  // What the index held when this sync started. It only decides which files look unchanged; every write
+  // below reads the row again inside its own transaction.
+  const snapshot = new Map();
+  for (const row of db.prepare('SELECT id, path, mtime_ms, size FROM docs').all()) {
+    snapshot.set(row.path, row);
+  }
 
-    const existingRows = db
-      .prepare('SELECT id, path, mtime_ms, size, hash, content_hash, session, embed_status, embed_model, embed_attempts, embed_error, embed_service_failures FROM docs')
-      .all();
+  // After a decoder change, files whose (mtime, size) did not change are read once more. That pass is left
+  // to a sync without limits: under a budget it would be started again by every run and use up the budget.
+  // An index that holds no rows has nothing to read again, so it is marked current right away.
+  const decoderRow = db.prepare("SELECT value FROM index_meta WHERE key = 'textDecoderVersion'").get();
+  const decoderOutdated = decoderRow?.value !== TEXT_DECODER_VERSION;
+  const rereadAll = decoderOutdated && !budget && snapshot.size > 0;
 
-    const byPath = new Map();
-    const byId = new Map();
-    for (const row of existingRows) {
-      byPath.set(row.path, row);
-      byId.set(row.id, row);
-    }
+  const ctx = {
+    root: paths.root,
+    duplicates,
+    seenIds: new Map(), // id -> winning relPath
+    pendingSessions: new Set(readPendingSessions(db)),
+    removedDocs: false,
+  };
+  const diskPaths = new Set();
 
-    const seenPaths = new Set();
-    const seenIds = new Map(); // id -> winning relPath
-    const toUpsert = [];
-    const toStatOnly = [];
-    const affectedSessions = new Set();
+  let stmts = null;
+  const getStmts = () => {
+    if (!stmts) stmts = syncStatements(db);
+    return stmts;
+  };
 
+  const claimId = (id, relPath) => {
+    if (!ctx.seenIds.has(id)) ctx.seenIds.set(id, relPath);
+  };
+  const defer = (relPath, size, reason, known) => {
+    deferred.push({ path: relPath, size, reason });
+    // A deferred file keeps the row it has (stale, but still the document); one without a row is unknown.
+    if (known) claimId(known.id, relPath);
+    else deferredWithoutRow = true;
+  };
+
+  // A sync with a deadline must not wait past it for a lock another process holds: before each of its
+  // transactions the lock wait is cut down to the time that is left.
+  let busyTimeoutChanged = false;
+  const limitLockWait = () => {
+    if (!budget || !Number.isFinite(budget.deadline)) return;
+    const waitMs = Math.max(50, Math.min(DEFAULT_BUSY_TIMEOUT_MS, Math.floor(budget.deadline - budget.now())));
+    db.exec(`PRAGMA busy_timeout = ${waitMs};`);
+    busyTimeoutChanged = true;
+  };
+
+  try {
     for (const absPath of diskFiles) {
       let stat;
       try {
@@ -1011,125 +1197,250 @@ export function syncFromDisk(db, tierDir) {
       }
 
       const relPath = normalizeRelPath(path.relative(paths.root, absPath));
-      const existing = byPath.get(relPath);
+      diskPaths.add(relPath);
+      const known = snapshot.get(relPath);
 
-      const statUnchanged = Boolean(existing) && existing.mtime_ms === stat.mtimeMs && existing.size === stat.size;
-
-      if (statUnchanged && !rereadAll) {
-        if (seenIds.has(existing.id)) {
-          noteDuplicateDoc(duplicates, paths.root, existing.id, relPath, seenIds.get(existing.id));
-          continue;
+      if (known && !rereadAll && known.mtime_ms === stat.mtimeMs && known.size === stat.size) {
+        if (ctx.seenIds.has(known.id)) {
+          noteDuplicateDoc(duplicates, paths.root, known.id, relPath, ctx.seenIds.get(known.id));
+        } else {
+          ctx.seenIds.set(known.id, relPath);
         }
-        seenPaths.add(relPath);
-        seenIds.set(existing.id, relPath);
         continue;
       }
 
-      // Undecodable bytes come back as lossy text (still indexable); only a failed read skips the file.
-      let rawText;
+      // The file is new or changed: it has to be read. Decide from its size alone whether to do that now.
+      if (indexBusy) {
+        defer(relPath, stat.size, DEFER_REASON_INDEX_BUSY, known);
+        continue;
+      }
+      if (budget) {
+        const reason = budgetDeferReason(budget, stat.size);
+        if (reason) {
+          defer(relPath, stat.size, reason, known);
+          continue;
+        }
+      }
+
+      let result;
       try {
-        rawText = readDocFile(absPath).text;
-      } catch {
-        continue;
-      }
-
-      const fileHash = sha256(rawText);
-      if (existing && existing.hash === fileHash) {
-        if (seenIds.has(existing.id)) {
-          noteDuplicateDoc(duplicates, paths.root, existing.id, relPath, seenIds.get(existing.id));
+        limitLockWait();
+        result = withTransaction(db, () => indexChangedFile(db, getStmts(), ctx, absPath, relPath));
+      } catch (err) {
+        if (isBusyError(err)) {
+          if (!budget) throw err;
+          indexBusy = true;
+          defer(relPath, stat.size, DEFER_REASON_INDEX_BUSY, known);
           continue;
         }
-        seenPaths.add(relPath);
-        seenIds.set(existing.id, relPath);
-        if (!statUnchanged) {
-          toStatOnly.push({ id: existing.id, mtime_ms: stat.mtimeMs, size: stat.size });
-        }
+        failed.push({ path: relPath, size: stat.size, reason: DEFER_REASON_ERROR, error: errorText(err) });
+        if (known) claimId(known.id, relPath);
         continue;
       }
 
-      const record = normalizeDocRecord(absPath, paths.root, rawText, stat);
-      if (!record) continue;
-
-      if (seenIds.has(record.doc.id)) {
-        noteDuplicateDoc(duplicates, paths.root, record.doc.id, relPath, seenIds.get(record.doc.id));
-        continue;
+      if (result.claimId) ctx.seenIds.set(result.claimId, relPath);
+      if (result.outcome === 'indexed') addedOrUpdated += 1;
+      else if (result.outcome === 'stat') statUpdated += 1;
+      else if (result.outcome === 'invalid') {
+        failed.push({ path: relPath, size: stat.size, reason: DEFER_REASON_ERROR, error: 'no valid document id could be derived' });
       }
 
-      seenPaths.add(relPath);
-      seenIds.set(record.doc.id, relPath);
-
-      const prevById = byId.get(record.doc.id) || null;
-      toUpsert.push({ record, prevByPath: existing || null, prevById });
-      if (existing?.session) affectedSessions.add(existing.session);
-      if (prevById?.session) affectedSessions.add(prevById.session);
-      if (record.doc.session) affectedSessions.add(record.doc.session);
+      if (onFileIndexed) onFileIndexed(relPath, result.outcome);
+      yield { path: relPath, outcome: result.outcome };
+      // While the caller paused, other work on this connection may have changed the schema (vector table).
+      if (options.yielding) stmts = null;
     }
 
-    const toDelete = [];
-    for (const row of existingRows) {
-      if (!seenPaths.has(row.path)) {
-        toDelete.push(row);
-        if (row.session) affectedSessions.add(row.session);
+    // Closing work: rows of deleted files, session chains, orphan vectors, decoder version.
+    // Rows that were in the index when the sync started and whose file is gone. (A row written since then
+    // belongs to a file that exists.) A deferred file without a row may be a document that was moved: its
+    // old row is kept until that file is read.
+    const staleRows = deferredWithoutRow
+      ? []
+      : [...snapshot.values()]
+        .filter((row) => !diskPaths.has(row.path) && !fs.existsSync(path.join(paths.root, row.path)));
+    const needsOrphanSweep = vecEnabledDbs.has(db)
+      && hasVectorTable(db)
+      && (
+        !orphanSweptDbPaths.has(paths.dbPath)
+        || db.prepare('SELECT value FROM index_meta WHERE key = ?').get(VEC_CLEANUP_KEY)?.value === '1'
+      );
+    const bumpDecoder = decoderOutdated && (snapshot.size === 0 || rereadAll);
+
+    // When the write lock was just found busy, the closing work waits for the next sync as well.
+    if (!indexBusy && (staleRows.length > 0 || ctx.pendingSessions.size > 0 || needsOrphanSweep || bumpDecoder)) {
+      try {
+        limitLockWait();
+        withTransaction(db, () => {
+          const s = getStmts();
+          for (const stale of staleRows) {
+            const row = s.selectById.get(stale.id);
+            // Checked again under the lock: the row may have moved, the file may have been written meanwhile.
+            if (!row || row.path !== stale.path) continue;
+            if (fs.existsSync(path.join(paths.root, row.path))) continue;
+            removeDocRow(db, s, row, ctx);
+            deleted += 1;
+          }
+          if (ctx.pendingSessions.size > 0) {
+            rebuildSessionNextEdges(db, ctx.pendingSessions);
+            s.deleteMeta.run(SESSION_EDGES_PENDING_KEY);
+          }
+          orphanVectorsRemoved = reconcileOrphanVectors(db, { removedDocs: ctx.removedDocs, dbPath: paths.dbPath });
+          if (bumpDecoder) s.setMeta.run('textDecoderVersion', TEXT_DECODER_VERSION);
+        });
+        ctx.pendingSessions.clear();
+      } catch (err) {
+        // Under a budget the closing work is left to the next sync (the pending-session note stays stored).
+        if (!budget || !isBusyError(err)) throw err;
       }
     }
-
-    if (rereadAll) {
-      db.prepare('INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)').run('textDecoderVersion', TEXT_DECODER_VERSION);
-    }
-
-    if (toUpsert.length === 0 && toStatOnly.length === 0 && toDelete.length === 0) {
-      orphanVectorsRemoved = reconcileOrphanVectors(db, { removedDocs: false, dbPath: paths.dbPath });
-      return;
-    }
-
-    const stmts = upsertDocStatements(db);
-    let removedDocs = false;
-
-    for (const item of toStatOnly) {
-      stmts.updateStatOnly.run(item.mtime_ms, item.size, item.id);
-    }
-
-    for (const row of toDelete) {
-      // If the same doc ID moved to a new path in `toUpsert`, delete old row cleanly without losing vector check via prevById
-      stmts.deleteDocById.run(row.id);
-      stmts.deleteFtsById.run(row.id);
-      if (!seenIds.has(row.id)) {
-        removedDocs = true;
-        if (stmts.deleteVecById) stmts.deleteVecById.run(row.id);
+  } finally {
+    if (busyTimeoutChanged) {
+      try {
+        db.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS};`);
+      } catch {
+        // the connection may already be closed
       }
-      stmts.deleteAllDocEdges.run(row.id, row.id);
     }
-
-    for (const { record, prevByPath, prevById } of toUpsert) {
-      if (prevByPath && prevByPath.id !== record.doc.id) {
-        removedDocs = true;
-        stmts.deleteDocById.run(prevByPath.id);
-        stmts.deleteFtsById.run(prevByPath.id);
-        if (stmts.deleteVecById) stmts.deleteVecById.run(prevByPath.id);
-        stmts.deleteAllDocEdges.run(prevByPath.id, prevByPath.id);
-      }
-      const prevForDoc = prevById || (prevByPath?.id === record.doc.id ? prevByPath : null);
-      if (prevForDoc && prevForDoc.session !== record.doc.session) {
-        stmts.deleteSessionNextForDoc.run(record.doc.id, record.doc.id);
-      }
-      writeDocAndEdges(stmts, record, prevForDoc);
-    }
-
-    rebuildSessionNextEdges(db, affectedSessions);
-
-    orphanVectorsRemoved = reconcileOrphanVectors(db, { removedDocs, dbPath: paths.dbPath });
-
-    addedOrUpdated = toUpsert.length;
-    statUpdated = toStatOnly.length;
-    deleted = toDelete.filter((r) => !seenIds.has(r.id)).length;
-  });
+  }
 
   duplicateDocsByTier.set(paths.root, duplicates);
+  writeDeferredIndex(paths.root, [...deferred, ...failed]);
 
   return {
     addedOrUpdated,
     statUpdated,
     deleted,
     ...(orphanVectorsRemoved > 0 ? { orphanVectorsRemoved } : {}),
+    ...(deferred.length > 0 ? { deferred } : {}),
+    ...(failed.length > 0 ? { failed } : {}),
   };
+}
+
+// Remove one document row with everything that hangs on it. Runs inside the caller's transaction.
+function removeDocRow(db, s, row, ctx) {
+  s.deleteDocById.run(row.id);
+  s.deleteFtsById.run(row.id);
+  if (s.deleteVecById) {
+    s.deleteVecById.run(row.id);
+  } else if (hasVectorTable(db)) {
+    // No vector extension on this connection: leave the cleanup to one that has it.
+    s.setMeta.run(VEC_CLEANUP_KEY, '1');
+  }
+  s.deleteAllDocEdges.run(row.id, row.id);
+  ctx.removedDocs = true;
+  markSessionsPending(s, ctx, [row.session]);
+}
+
+// Note, in the same transaction as the change itself, that these sessions need their chain rebuilt. The
+// list is stored again with every change (not only when it grows): an earlier transaction that added a
+// session may have been rolled back.
+function markSessionsPending(s, ctx, sessions) {
+  let any = false;
+  for (const session of sessions) {
+    if (!session) continue;
+    ctx.pendingSessions.add(session);
+    any = true;
+  }
+  if (any) s.setMeta.run(SESSION_EDGES_PENDING_KEY, JSON.stringify([...ctx.pendingSessions]));
+}
+
+/**
+ * Read one new or changed file and bring its row up to date. Runs inside the caller's `BEGIN IMMEDIATE`
+ * transaction, so the file content and the row it is compared with cannot change underneath.
+ * Returns { outcome, claimId }: outcome is 'indexed' (row written), 'stat' (same content, only mtime/size
+ * stored), 'unchanged', 'duplicate' (another file owns the id) or 'invalid' (no usable id).
+ */
+function indexChangedFile(db, s, ctx, absPath, relPath) {
+  const stat = fs.statSync(absPath);
+  // Undecodable bytes come back as lossy text (still indexable); a failed read is reported by the caller.
+  const rawText = readDocFile(absPath).text;
+  const existing = s.selectByPath.get(relPath) || null;
+
+  if (existing && existing.hash === sha256(rawText)) {
+    if (ctx.seenIds.has(existing.id) && ctx.seenIds.get(existing.id) !== relPath) {
+      noteDuplicateDoc(ctx.duplicates, ctx.root, existing.id, relPath, ctx.seenIds.get(existing.id));
+      return { outcome: 'duplicate', claimId: '' };
+    }
+    if (existing.mtime_ms !== stat.mtimeMs || existing.size !== stat.size) {
+      s.updateStatOnly.run(stat.mtimeMs, stat.size, existing.id);
+      return { outcome: 'stat', claimId: existing.id };
+    }
+    return { outcome: 'unchanged', claimId: existing.id };
+  }
+
+  const record = normalizeDocRecord(absPath, ctx.root, rawText, stat);
+  if (!record) {
+    if (existing) removeDocRow(db, s, existing, ctx);
+    return { outcome: 'invalid', claimId: '' };
+  }
+
+  const docId = record.doc.id;
+  if (ctx.seenIds.has(docId) && ctx.seenIds.get(docId) !== relPath) {
+    noteDuplicateDoc(ctx.duplicates, ctx.root, docId, relPath, ctx.seenIds.get(docId));
+    if (existing && existing.id !== docId) removeDocRow(db, s, existing, ctx);
+    return { outcome: 'duplicate', claimId: '' };
+  }
+
+  const prevById = s.selectById.get(docId) || null;
+  if (existing && existing.id !== docId) removeDocRow(db, s, existing, ctx);
+
+  const prevForDoc = prevById || (existing?.id === docId ? existing : null);
+  if (prevForDoc && prevForDoc.session !== record.doc.session) {
+    s.deleteSessionNextForDoc.run(docId, docId);
+  }
+  writeDocAndEdges(s, record, prevForDoc);
+  markSessionsPending(s, ctx, [existing?.session, prevById?.session, record.doc.session]);
+
+  return { outcome: 'indexed', claimId: docId };
+}
+
+/**
+ * Incrementally sync all Markdown files in <tierDir>/docs/ into SQLite.
+ * Checks (mtime_ms, size) first, then SHA-256 hash; detects duplicate IDs; removes deleted files.
+ * Every changed file is committed in its own `BEGIN IMMEDIATE` transaction (its content is read and its row
+ * written under the index write lock), so a sync that is stopped or killed keeps the files it finished.
+ * On a vector-enabled connection it also removes vector rows left behind by connections that could not;
+ * the result then carries `orphanVectorsRemoved` (the key is absent when nothing was removed).
+ *
+ * Options (all optional; without `deadline` and `maxFileBytes` every changed file is indexed):
+ * - `deadline` (epoch ms), `bytesPerMs`, `perFileMs`, `now`: time budget. Before a changed file is read, its
+ *   size (from `stat`) is turned into an estimated cost (`perFileMs + size / bytesPerMs`); a file that does
+ *   not fit in the time left is deferred. Files whose (mtime, size) did not change are never read under a
+ *   budget.
+ * - `maxFileBytes`: a changed file larger than this is deferred whatever time is left.
+ * - `onFileIndexed(relPath, outcome)`: called after each file's transaction was committed.
+ *
+ * Deferred files are not excluded: they keep the row they have (a deferred file is never taken for a
+ * deleted one) and the next sync without a budget indexes them. The result lists them as
+ * `deferred: [{ path, size, reason }]`, files that could not be read or indexed as
+ * `failed: [{ path, size, reason: 'error', error }]` (both keys are absent when empty), and the same lists
+ * are stored in <tierDir>/state/deferred-index.json until a sync leaves nothing undone.
+ */
+export function syncFromDisk(db, tierDir, options = {}) {
+  const steps = syncSteps(db, tierDir, options);
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+  }
+}
+
+/**
+ * The same sync for a long-lived process: it gives the event loop a turn after every file it indexed, so
+ * requests that arrive meanwhile are answered between two files. `isCancelled()` is asked before each file;
+ * a cancelled run resolves with `{ cancelled: true }` and keeps what it indexed.
+ */
+export async function syncFromDiskYielding(db, tierDir, options = {}) {
+  const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : () => false;
+  const steps = syncSteps(db, tierDir, { ...options, yielding: true });
+  try {
+    for (;;) {
+      if (isCancelled()) return { cancelled: true };
+      const step = steps.next();
+      if (step.done) return step.value;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  } finally {
+    steps.return();
+  }
 }

@@ -31,6 +31,7 @@ import { createMcpServer } from '../src/mcp/server.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
 import { createRelayTools } from '../src/relay/tools.mjs';
 import { approveProject } from '../src/core/trust.mjs';
+import { COMPACT_POINTER_INSTRUCTION } from '../src/hooks/claude.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-robust-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -113,7 +114,8 @@ test('entry points: main-module check follows junction/symlink paths for all fiv
     // hooks/claude.mjs
     const claude = run(path.join('hooks', 'claude.mjs'), ['pre-compact', '--id', 'herdr-cortex'], '{}');
     assert.equal(claude.status, 0, claude.stderr);
-    assert.equal(JSON.parse(claude.stdout.trim()).continue, true);
+    // PreCompact prints its instruction as plain text (Claude Code does not read JSON from this event)
+    assert.equal(claude.stdout, `${COMPACT_POINTER_INSTRUCTION}\n`);
 
     // hooks/antigravity.mjs (an unknown event still prints an empty JSON object)
     const agy = run(path.join('hooks', 'antigravity.mjs'), ['no-such-event'], '{}');

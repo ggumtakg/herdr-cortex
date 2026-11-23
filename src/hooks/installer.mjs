@@ -27,10 +27,15 @@ const CLAUDE_CLEAN_MARKERS = [
 
 const CLAUDE_HOOK_EVENTS = [
   'SessionStart',
+  'SessionEnd',
   'PreCompact',
   'UserPromptSubmit',
   'PreToolUse',
 ];
+
+// Seconds. Claude Code gives a SessionEnd hook 1.5 s unless the registration says otherwise; the handler
+// only writes one small record, the margin is for starting node.
+export const CLAUDE_SESSION_END_TIMEOUT_SECONDS = 5;
 
 function readJsonOrEmpty(filePath) {
   if (!fs.existsSync(filePath)) {
@@ -205,6 +210,19 @@ function updateClaudeSettings(homeDir, repoRoot, isInstall) {
         type: 'command',
         command: `node --no-warnings "${claudeScript}" session-start --id ${CLAUDE_HOOK_MARKER}`,
         timeout: 10,
+      },
+    ],
+  });
+
+  // Records which session a /clear ended, so the next SessionStart restores turns from that session only.
+  // The handler ignores every other end reason.
+  data.hooks.SessionEnd.push({
+    matcher: '',
+    hooks: [
+      {
+        type: 'command',
+        command: `node --no-warnings "${claudeScript}" session-end --id ${CLAUDE_HOOK_MARKER}`,
+        timeout: CLAUDE_SESSION_END_TIMEOUT_SECONDS,
       },
     ],
   });

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import readline from 'node:readline';
 import { CortexStore } from '../core/store.mjs';
+import { readDeferredIndex, syncFromDiskYielding } from '../core/db.mjs';
 import { REPO_ROOT, isMainModule, isProjectEnabled, loadConfig } from '../core/config.mjs';
 import {
   createEmbeddingQueue,
@@ -17,6 +18,81 @@ export const SERVER_INFO = Object.freeze({
 });
 
 export const DEFAULT_PROTOCOL_VERSION = '2024-11-05';
+
+/** How long after the server starts the background index catch-up begins. */
+export const INDEX_CATCH_UP_DELAY_MS = 250;
+
+/**
+ * Index, in the background, the documents the session-start hooks left out (too big or too slow for a hook's
+ * time budget) together with everything else that changed on disk. This process has no hook timeout; the
+ * sync gives the event loop a turn after every file, so tool calls that arrive meanwhile are answered
+ * between two files. A tool call's own sync indexes whatever is still missing, so nothing depends on this
+ * run having finished. `onIndexed(scope, result)` is called for a tier that got new or changed documents.
+ * When a hook had left documents out (the tier's deferred-index record), one line on stderr says what became of them.
+ * Returns { done, cancel }: `done` resolves with the per-tier sync results plus `waitingBefore`, the number of
+ * documents the record listed ({} when cancelled before start).
+ */
+export function startIndexCatchUp(
+  store,
+  {
+    delayMs = INDEX_CATCH_UP_DELAY_MS,
+    onIndexed = null,
+    log = (line) => process.stderr.write(`${line}\n`),
+  } = {},
+) {
+  let cancelled = false;
+  let timer = null;
+  let finish;
+  const done = new Promise((resolve) => {
+    finish = resolve;
+  });
+
+  const run = async () => {
+    const results = {};
+    for (const scope of ['project', 'global']) {
+      if (cancelled) break;
+      try {
+        const tier = store.getTierIfExists(scope);
+        if (!tier) continue;
+        const waitingBefore = readDeferredIndex(tier.dir).count;
+        const result = await syncFromDiskYielding(tier.db, tier.dir, { isCancelled: () => cancelled });
+        results[scope] = { ...result, waitingBefore };
+        if (result.cancelled) continue;
+        if (waitingBefore > 0 && typeof log === 'function') {
+          const stillFailing = result.failed?.length || 0;
+          log(
+            `[cortex-mcp] index catch-up (${scope}): ${waitingBefore} document(s) had been left out by a hook; `
+            + `indexed ${result.addedOrUpdated}${stillFailing > 0 ? `, ${stillFailing} could not be indexed` : ''}`,
+          );
+        }
+        if (result.addedOrUpdated > 0 && typeof onIndexed === 'function') {
+          onIndexed(scope, result);
+        }
+      } catch (err) {
+        results[scope] = { error: String(err?.message || err) };
+      }
+    }
+    finish(results);
+  };
+
+  timer = setTimeout(() => {
+    timer = null;
+    run();
+  }, Math.max(0, Number(delayMs) || 0));
+  if (typeof timer.unref === 'function') timer.unref();
+
+  return {
+    done,
+    cancel() {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+        finish({});
+      }
+    },
+  };
+}
 
 export const SERVER_INSTRUCTIONS = `herdr-cortex MCP 도구 안내:
 - 기억 조회: memory_overview(활성 세션·결정·할 일), memory_search(하이브리드 1단계 요약), memory_read(전문), memory_graph(1~10홉 계보·파일 영향).
@@ -261,6 +337,8 @@ function parseCliOptions(argv) {
  * select; when both select the same one, a single instance serves both.
  * Documents that are still waiting for an embedding are scheduled right away, so work left over from an earlier
  * session or an outage does not wait for the next save.
+ * Shortly after the start (`indexCatchUpDelayMs`, a negative value turns it off) the index catch-up runs in the
+ * background, see `startIndexCatchUp`.
  * `embeddingProvider` (one provider for every tier), `embeddingProviders` ({ project, global }),
  * `embeddingBreaker`, `input` and `output` are injectable for tests.
  */
@@ -273,6 +351,7 @@ export function createServerRuntime({
   embeddingBreaker = null,
   hcClient = null,
   queueDebounceMs = 200,
+  indexCatchUpDelayMs = INDEX_CATCH_UP_DELAY_MS,
   input,
   output,
 } = {}) {
@@ -337,10 +416,24 @@ export function createServerRuntime({
 
   embeddingQueue.schedule('all');
 
+  // Documents a hook deferred are indexed here; what gets indexed is then queued for embedding.
+  const indexCatchUp = Number(indexCatchUpDelayMs) >= 0
+    ? startIndexCatchUp(store, {
+        delayMs: indexCatchUpDelayMs,
+        onIndexed: (scope) => embeddingQueue.schedule(scope),
+      })
+    : { done: Promise.resolve({}), cancel() {} };
+
   let stopped = false;
   const shutdown = async () => {
     if (stopped) return;
     stopped = true;
+    indexCatchUp.cancel();
+    try {
+      await indexCatchUp.done;
+    } catch {
+      // ignore catch-up errors on shutdown
+    }
     try {
       await embeddingQueue.drain(3000);
     } catch {
@@ -354,6 +447,7 @@ export function createServerRuntime({
     store,
     server,
     embeddingQueue,
+    indexCatchUp,
     embeddingBreaker: breaker,
     getEmbeddingProvider,
     getEmbeddingProviders,

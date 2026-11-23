@@ -19,6 +19,8 @@ import {
 } from '../src/hooks/recent-turns.mjs';
 import {
   CLAUDE_HOOK_MAX_CHARS,
+  COMPACT_POINTER_INSTRUCTION,
+  TURNS_NOT_RESTORED_UNIDENTIFIED_NOTE,
   handleClaudePreCompact,
   handleClaudePreToolUse,
   handleClaudeSessionStart,
@@ -401,12 +403,13 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
     assert.doesNotMatch(contextOnly.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
     assert.match(contextOnly.hookSpecificOutput.additionalContext, /Cortex Memory Overview/);
 
-    // 4. PreCompact outputs top-level continue + single-line systemMessage (NO hookSpecificOutput)
+    // 4. PreCompact returns the one-paragraph instruction for the summarizer and no JSON control fields
+    //    (Claude Code discards continue / systemMessage for this event; the CLI prints the text itself)
     const preCompact = handleClaudePreCompact();
-    assert.equal(preCompact.continue, true);
-    assert.equal('hookSpecificOutput' in preCompact, false);
-    assert.equal(preCompact.systemMessage.includes('\n'), false);
-    assert.match(preCompact.systemMessage, /cortex/i);
+    assert.deepEqual(Object.keys(preCompact), ['instructions']);
+    assert.equal(preCompact.instructions, COMPACT_POINTER_INSTRUCTION);
+    assert.equal(preCompact.instructions.includes('\n'), false);
+    assert.match(preCompact.instructions, /^\[herdr-cortex\] /);
 
     // 4b. SessionStart(source="clear") with empty new <newSessionId>.jsonl falls back to sibling <previousSessionId>.jsonl
     const transcriptDir = path.join(env.root, 'claude-sessions');
@@ -522,7 +525,8 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
     assert.doesNotMatch(resumeOut.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
     assert.match(resumeOut.hookSpecificOutput.additionalContext, /Cortex Memory Overview/);
 
-    // (h) Non-Herdr /clear fallback (no HC_TERMINAL_ID) scans sibling *.jsonl by mtime
+    // (h) Without a tab record (no HC_TERMINAL_ID) and without a clear record, another transcript in the
+    //     same directory is never guessed to be the previous session: nothing is restored, a note says so
     const nonHerdrDir = path.join(env.root, 'non-herdr-claude');
     const olderSibling = path.join(nonHerdrDir, 'prev-non-herdr.jsonl');
     const newBlankClear = path.join(nonHerdrDir, 'brand-new-clear.jsonl');
@@ -535,20 +539,17 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
       { session_id: 'brand-new-clear', source: 'clear', transcript_path: newBlankClear, cwd: env.projectDir },
       { terminalId: '', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
     );
-    assert.match(nonHerdrClear.hookSpecificOutput.additionalContext, /Non-Herdr pre-clear goal/);
-    assert.match(nonHerdrClear.hookSpecificOutput.additionalContext, /Non-Herdr pre-clear reply/);
+    assert.doesNotMatch(nonHerdrClear.hookSpecificOutput.additionalContext, /Non-Herdr pre-clear/);
+    assert.ok(nonHerdrClear.hookSpecificOutput.additionalContext.includes(TURNS_NOT_RESTORED_UNIDENTIFIED_NOTE));
 
-    // 7. CLI child-process smoke test for pre-compact (including UTF-8 BOM stripping)
+    // 7. CLI child-process smoke test for pre-compact (including UTF-8 BOM stripping): plain text, not JSON
     const cliRes = spawnSync(
       process.execPath,
       ['--no-warnings', path.join(REPO_ROOT, 'src', 'hooks', 'claude.mjs'), 'pre-compact', '--id', 'herdr-cortex'],
-      { input: '\uFEFF{}', encoding: 'utf8' },
+      { input: '\uFEFF{}', encoding: 'utf8', env: { ...process.env, HERDR_CORTEX_HOME: env.globalDir } },
     );
     assert.equal(cliRes.status, 0);
-    const parsedCli = JSON.parse(cliRes.stdout.trim());
-    assert.equal(parsedCli.continue, true);
-    assert.equal('hookSpecificOutput' in parsedCli, false);
-    assert.match(parsedCli.systemMessage, /Compaction pointer/i);
+    assert.equal(cliRes.stdout, `${COMPACT_POINTER_INSTRUCTION}\n`);
   } finally {
     store.close();
     env.cleanup();
@@ -598,7 +599,7 @@ test('hooks/antigravity: SessionStart subagent skip, PreInvocation /compact poin
       { terminalId: 'tab-a1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
     );
     assert.equal(compactOut.injectSteps.length, 1);
-    assert.match(compactOut.injectSteps[0].systemMessage.systemMessage, /Compaction pointer/i);
+    assert.ok(compactOut.injectSteps[0].systemMessage.systemMessage.startsWith(COMPACT_POINTER_INSTRUCTION));
 
     // 4. PreInvocation detects new CHECKPOINT (DONE) -> restores once as separate injectSteps -> persists JSON state -> does NOT duplicate next turn
     const transcriptFull = path.join(env.root, 'transcript_full.jsonl');
@@ -747,6 +748,9 @@ test('hooks/installer: idempotent install/uninstall round-trip preserves existin
     assert.equal(cortexStartEntry.hooks.length, 1);
     assert.match(cortexStartEntry.hooks[0].command, /session-start --id herdr-cortex/);
     assert.equal(claudeSettings.hooks.PreCompact.length, 1);
+    assert.equal(claudeSettings.hooks.SessionEnd.length, 1);
+    assert.match(claudeSettings.hooks.SessionEnd[0].hooks[0].command, /session-end --id herdr-cortex/);
+    assert.ok(claudeSettings.hooks.SessionEnd[0].hooks[0].timeout >= 3, 'SessionEnd gets an explicit timeout above its 1.5 s default');
     assert.equal(claudeSettings.hooks.UserPromptSubmit.length, 1);
     assert.equal(claudeSettings.hooks.PreToolUse.length, 1);
     assert.equal(
@@ -782,6 +786,7 @@ test('hooks/installer: idempotent install/uninstall round-trip preserves existin
     assert.equal(claudeSettingsAfter.hooks.SessionStart.length, 1);
     assert.equal(claudeSettingsAfter.hooks.SessionStart[0].hooks[0].command, 'echo keep-me');
     assert.equal('PreCompact' in claudeSettingsAfter.hooks, false);
+    assert.equal('SessionEnd' in claudeSettingsAfter.hooks, false);
     assert.equal('UserPromptSubmit' in claudeSettingsAfter.hooks, false);
     assert.equal('PreToolUse' in claudeSettingsAfter.hooks, false);
 
@@ -846,7 +851,7 @@ test('project scoping: excludedProjects and opt-in mode suppress hook injections
     assert.match(clStartAllowed.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
 
     const clCompactAllowed = handleClaudePreCompact({ cwd: allowedProj }, { globalDir: env.globalDir });
-    assert.equal(clCompactAllowed.continue, true);
+    assert.equal(clCompactAllowed.instructions, COMPACT_POINTER_INSTRUCTION);
 
     // Switch to opt-in mode -> only listed enabledProjects activate
     fs.writeFileSync(
@@ -855,7 +860,7 @@ test('project scoping: excludedProjects and opt-in mode suppress hook injections
       'utf8',
     );
     assert.deepEqual(handleClaudePreCompact({ cwd: excludedProj }, { globalDir: env.globalDir }), {});
-    assert.equal(handleClaudePreCompact({ cwd: allowedProj }, { globalDir: env.globalDir }).continue, true);
+    assert.equal(handleClaudePreCompact({ cwd: allowedProj }, { globalDir: env.globalDir }).instructions, COMPACT_POINTER_INSTRUCTION);
   } finally {
     env.cleanup();
   }

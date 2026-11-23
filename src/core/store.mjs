@@ -137,7 +137,13 @@ export class CortexStore {
     globalConfig,
     disableVec = false,
     onWrite = null,
+    syncOptions = null,
   } = {}) {
+    // Limits for every index sync this store runs (`deadline`, `maxFileBytes`, `bytesPerMs`, `perFileMs`,
+    // `now`; see `syncFromDisk`). The hooks set them so one slow document cannot use up the hook's time;
+    // without them every sync indexes everything that changed.
+    this.syncOptions = syncOptions && typeof syncOptions === 'object' ? { ...syncOptions } : null;
+    this._lastSync = new Map(); // scope -> result of the most recent sync of that tier
     this.projectRoot = path.resolve(projectDir);
     this.projectDir = getProjectMemoryDir(this.projectRoot);
     this.globalDir = getGlobalDir(globalDir);
@@ -206,7 +212,8 @@ export class CortexStore {
     }
 
     ensureTierDirs(dir);
-    const opened = openTierDb(dir, { disableVec: this.disableVec });
+    // With sync limits, a rebuilt index is filled by the next (limited) sync instead of a full one here.
+    const opened = openTierDb(dir, { disableVec: this.disableVec, autoSyncOnRecover: !this.syncOptions });
     const tier = {
       scope,
       dir,
@@ -232,9 +239,30 @@ export class CortexStore {
         results[s] = { addedOrUpdated: 0, statUpdated: 0, deleted: 0 };
         continue;
       }
-      results[s] = syncFromDisk(tier.db, tier.dir);
+      results[s] = this._syncTier(tier);
     }
     return results;
+  }
+
+  // One index sync of an open tier, under this store's sync limits (if any).
+  _syncTier(tier) {
+    const result = syncFromDisk(tier.db, tier.dir, this.syncOptions || undefined);
+    this._lastSync.set(tier.scope, result);
+    return result;
+  }
+
+  /**
+   * Documents the most recent sync of each tier did not index (deferred under the sync limits, or failed):
+   * [{ scope, path, size, reason, error? }] with paths relative to the tier directory.
+   */
+  getUnindexedDocs() {
+    const out = [];
+    for (const [scope, result] of this._lastSync) {
+      for (const item of [...(result.deferred || []), ...(result.failed || [])]) {
+        out.push({ scope, ...item });
+      }
+    }
+    return out;
   }
 
   // A write into the project tier keeps `.memory/` out of git unless the folder already has its own .gitignore.
@@ -294,7 +322,7 @@ export class CortexStore {
 
     const tier = this.getTier(scope, { create: true });
     this._prepareTierForWrite(tier);
-    syncFromDisk(tier.db, tier.dir);
+    this._syncTier(tier);
 
     const existing = tier.db.prepare('SELECT id, path FROM docs WHERE id = ?').get(id);
     if (existing) {
@@ -453,7 +481,7 @@ export class CortexStore {
     const otherTier = this.getTierIfExists(otherScope);
     let foundInOther = false;
     if (otherTier) {
-      syncFromDisk(otherTier.db, otherTier.dir);
+      this._syncTier(otherTier);
       foundInOther = Boolean(otherTier.db.prepare('SELECT id FROM docs WHERE id = ?').get(supersedesId));
     }
     return foundInOther
@@ -471,7 +499,7 @@ export class CortexStore {
     for (const s of candidateScopes) {
       const tier = this.getTierIfExists(s);
       if (!tier) continue;
-      syncFromDisk(tier.db, tier.dir);
+      this._syncTier(tier);
       const row = tier.db.prepare('SELECT id, path FROM docs WHERE id = ?').get(id);
       if (row) {
         foundTier = tier;
@@ -595,7 +623,7 @@ export class CortexStore {
     for (const s of candidateScopes) {
       const tier = this.getTierIfExists(s);
       if (!tier) continue;
-      syncFromDisk(tier.db, tier.dir);
+      this._syncTier(tier);
       const row = tier.db.prepare('SELECT * FROM docs WHERE id = ?').get(cleanId);
       if (!row) continue;
 
@@ -664,7 +692,7 @@ export class CortexStore {
           edges: [],
         };
       }
-      syncFromDisk(tier.db, tier.dir);
+      this._syncTier(tier);
       return {
         scope: scopes[0],
         ...exploreGraph(tier.db, { target: normalizedTarget, depth: maxDepth, direction: dir, limit: maxEdges }),
@@ -677,7 +705,7 @@ export class CortexStore {
     for (const s of scopes) {
       const tier = this.getTierIfExists(s);
       if (!tier) continue;
-      syncFromDisk(tier.db, tier.dir);
+      this._syncTier(tier);
       const res = exploreGraph(tier.db, { target: normalizedTarget, depth: maxDepth, direction: dir, limit: maxEdges });
       for (const node of res.nodes) {
         const prev = nodeMap.get(node.id);
@@ -742,7 +770,7 @@ export class CortexStore {
     let projectLastError = null;
 
     if (projectTier) {
-      syncFromDisk(projectTier.db, projectTier.dir);
+      this._syncTier(projectTier);
 
       // 0. Active P0 baselines (queried separately so 30 newer decisions never push them out)
       p0Baselines = projectTier.db
@@ -851,7 +879,7 @@ export class CortexStore {
     if (includeGlobal) {
       const globalTier = this.getTierIfExists('global');
       if (globalTier) {
-        syncFromDisk(globalTier.db, globalTier.dir);
+        this._syncTier(globalTier);
 
         globalPreferences = globalTier.db
           .prepare(`
