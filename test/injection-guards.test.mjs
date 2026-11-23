@@ -21,7 +21,7 @@ import {
   isPathInsideMemoryDir,
 } from '../src/hooks/claude.mjs';
 import { handleAntigravitySessionStart } from '../src/hooks/antigravity.mjs';
-import { installCortex, uninstallCortex } from '../src/hooks/installer.mjs';
+import { installCortex, isOwnHook, uninstallCortex } from '../src/hooks/installer.mjs';
 import {
   CLAUDE_PRE_TOOL_USE_MATCHER,
   CORTEX_MCP_SERVER_NAMES,
@@ -881,7 +881,7 @@ test('PreToolUse hook process: prints nothing for calls it does not act on, a de
   }
 });
 
-test('installer: the PreToolUse hook is registered once, for this server\'s tools (both names) and the file and shell tools', () => {
+test('installer: the PreToolUse hook is registered once, for this server\'s tools and the file and shell tools', () => {
   const env = makeTempEnv('cortex-guards-install-');
   try {
     const settingsPath = path.join(env.homeDir, '.claude', 'settings.json');
@@ -899,24 +899,26 @@ test('installer: the PreToolUse hook is registered once, for this server\'s tool
     installCortex({ repoRoot: env.root, homeDir: env.homeDir });
 
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    const managed = settings.hooks.PreToolUse.filter((entry) => entry.hooks.some((hook) => hook.command.includes('--id herdr-cortex')));
+    const managed = settings.hooks.PreToolUse.filter((entry) => entry.hooks.some((hook) => isOwnHook(hook)));
     assert.equal(managed.length, 1, 'idempotent: one managed entry, the old matcher is replaced');
     assert.equal(managed[0].matcher, CLAUDE_PRE_TOOL_USE_MATCHER);
     assert.equal(managed[0].hooks.length, 1);
-    assert.match(managed[0].hooks[0].command, /pre-tool-use --id herdr-cortex$/);
+    assert.deepEqual(managed[0].hooks[0].args.slice(-3), ['pre-tool-use', '--id', 'herdr-cortex']);
     assert.equal(settings.hooks.PreToolUse.length, 2);
     assert.equal(settings.hooks.PreToolUse.some((entry) => entry.hooks[0].command === 'echo user-own-hook'), true, 'the user\'s own hook is kept');
 
-    // The matcher, read as Claude Code reads it (a regular expression on the tool name), covers every tool the hook acts on
-    assert.equal(CLAUDE_PRE_TOOL_USE_MATCHER, 'mcp__herdr-cortex__.*|mcp__cortex__.*|Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell');
+    // The matcher, read as Claude Code reads it (a regular expression on the tool name), covers every tool the
+    // hook acts on. The server is registered as herdr-cortex only, so the old `cortex` prefix is not matched
+    // any more (the hook code itself still recognizes both prefixes, see the test above).
+    assert.equal(CLAUDE_PRE_TOOL_USE_MATCHER, 'mcp__herdr-cortex__.*|Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell');
     const matcher = new RegExp(`^(?:${CLAUDE_PRE_TOOL_USE_MATCHER})$`);
     for (const name of [
-      'mcp__cortex__memory_save', 'mcp__herdr-cortex__memory_save', 'mcp__herdr-cortex__relay_inbox',
+      'mcp__herdr-cortex__memory_save', 'mcp__herdr-cortex__relay_inbox',
       'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell',
     ]) {
       assert.equal(matcher.test(name), true, name);
     }
-    for (const name of ['Read', 'Grep', 'Glob', 'mcp__other__memory_save']) {
+    for (const name of ['Read', 'Grep', 'Glob', 'mcp__other__memory_save', 'mcp__cortex__memory_save']) {
       assert.equal(matcher.test(name), false, name);
     }
 

@@ -442,7 +442,7 @@ test('Stdio JSON-RPC 2.0 MCP server full child-process round-trip', async () => 
     });
     const initResp = await nextResponse();
     assert.equal(initResp.id, 1);
-    assert.equal(initResp.result.serverInfo.name, 'cortex');
+    assert.equal(initResp.result.serverInfo.name, 'herdr-cortex');
     assert.equal(initResp.result.serverInfo.version, '1.0.0');
 
     // 2. notifications/initialized (no response expected) + ping

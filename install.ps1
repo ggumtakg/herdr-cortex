@@ -1,14 +1,31 @@
 <#
 .SYNOPSIS
     Unified herdr-cortex Installer for Windows 11 Herdr GUI (herdr-core / hc):
-      - Registers cortex Stdio MCP server for Antigravity CLI and Claude Code
-      - Registers official hooks (Antigravity SessionStart/PreInvocation, Claude Code SessionStart/PreCompact/UserPromptSubmit/PreToolUse)
+      - Registers the herdr-cortex Stdio MCP server for Claude Code (through `claude mcp add`) and, when
+        Antigravity is present, for Antigravity CLI
+      - Registers official hooks (Claude Code SessionStart/SessionEnd/PreCompact/UserPromptSubmit/PreToolUse,
+        Antigravity SessionStart/PreInvocation) with the absolute path of node.exe
       - Installs cortex skills into ~/.claude/skills/cortex-* (when prompts/skills exists)
       - Initializes ~/.herdr-cortex/ (sessions, docs, config.json)
-      - Patches PowerShell $PROFILE with auto-resume + `revive-agents`, `revive-status`, `cortex-status`
+      - Adds a marker-delimited block to the PowerShell profile(s) that provides auto-resume and the commands
+        `cortex-status`, `cortex-trust`, `revive-agents`, `revive-status`
+    Every file is checked before anything is written, and every existing file that changes is first copied to
+    <file>.herdr-cortex.<yyyyMMdd-HHmmss>.bak.
+.PARAMETER NoAutoResume
+    Install the shell commands but do not restore agent tabs automatically when a shell starts.
+.PARAMETER SetExecutionPolicy
+    If the PowerShell ExecutionPolicy does not allow local scripts, set it to RemoteSigned for the current
+    user without asking.
+.PARAMETER SkipExecutionPolicy
+    Never change the ExecutionPolicy and do not ask.
+.PARAMETER NodePath
+    The node.exe to use (and to record in hooks and MCP entries) when `node` is not on PATH.
 #>
 param(
-    [switch]$NoAutoResume
+    [switch]$NoAutoResume,
+    [switch]$SetExecutionPolicy,
+    [switch]$SkipExecutionPolicy,
+    [string]$NodePath
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +33,8 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = $PSScriptRoot
 $InstallerScript = Join-Path $RepoRoot "src\hooks\installer.mjs"
 $AutoReviveScript = Join-Path $RepoRoot "scripts\auto-revive.ps1"
+
+. (Join-Path $RepoRoot "scripts\install-tools.ps1")
 
 $TestHome = if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_TEST_HOME)) {
     $env:HERDR_CORTEX_TEST_HOME
@@ -28,14 +47,28 @@ $EffectiveHome = if ($TestHome) { $TestHome } else { $env:USERPROFILE }
 $GlobalCortexDir = Join-Path $EffectiveHome ".herdr-cortex"
 
 Write-Host "=== herdr-cortex Installer ===" -ForegroundColor Cyan
+if ($TestHome) {
+    Write-Host "[TEST] Installing into the test home: $TestHome" -ForegroundColor DarkGray
+}
 
 # 1. Verify prerequisites (Node.js >= 22.13.0 for node:sqlite, sqlite-vec optional vector search, hc CLI)
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Write-Error "Node.js (node.exe >= 22.13.0) is required but was not found on PATH."
+$NodeExe = $null
+if (-not [string]::IsNullOrWhiteSpace($NodePath)) {
+    if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) {
+        Write-Error "-NodePath does not point at a file: $NodePath"
+        exit 1
+    }
+    $NodeExe = (Resolve-Path -LiteralPath $NodePath).ProviderPath
+} else {
+    $nodeCmd = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($nodeCmd) { $NodeExe = $nodeCmd.Source }
+}
+if (-not $NodeExe) {
+    Write-Error "Node.js (node.exe >= 22.13.0) is required but was not found on PATH. Install it, or pass -NodePath <full path of node.exe>."
     exit 1
 }
 
-$nodeVerRaw = (& node -v 2>$null | Select-Object -First 1)
+$nodeVerRaw = (& $NodeExe -v 2>$null | Select-Object -First 1)
 if ($nodeVerRaw -match '^v?(\d+)\.(\d+)\.(\d+)') {
     $nodeMajor = [int]$Matches[1]
     $nodeMinor = [int]$Matches[2]
@@ -59,42 +92,70 @@ if (-not (Get-Command hc -ErrorAction SilentlyContinue)) {
     Write-Warning "hc.exe was not found on PATH. Make sure Herdr-Core is installed for revive/relay features."
 }
 
-# 2. Register MCP server, official hooks, skills, and ~/.herdr-cortex/ directories
-& node --no-warnings $InstallerScript install $RepoRoot
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to install herdr-cortex hooks and MCP configuration."
+# 2. Register MCP server, official hooks, skills, and ~/.herdr-cortex/ directories.
+#    The Node installer reads and checks every file first; on any problem it changes nothing and exits with 1.
+$prevOutEnc = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    & $NodeExe --no-warnings $InstallerScript install $RepoRoot
+    $installerExit = $LASTEXITCODE
+} finally {
+    [Console]::OutputEncoding = $prevOutEnc
+}
+if ($installerExit -ne 0) {
+    Write-Error "herdr-cortex was not installed (see the messages above). The PowerShell profile and the ExecutionPolicy were not touched."
     exit 1
 }
-Write-Host "[OK] Global cortex store ready: $GlobalCortexDir" -ForegroundColor Green
 
-# 3. Ensure PowerShell ExecutionPolicy allows local profile scripts (skip in isolated test mode)
-if (-not $TestHome) {
-    $cuPolicy = Get-ExecutionPolicy -Scope CurrentUser
-    $lmPolicy = Get-ExecutionPolicy -Scope LocalMachine
-    $needsPolicy = ($cuPolicy -eq "Restricted") -or ($cuPolicy -eq "Undefined" -and ($lmPolicy -eq "Restricted" -or $lmPolicy -eq "Undefined"))
-    if ($needsPolicy) {
+# 3. PowerShell ExecutionPolicy: the profile is a local script, so it only loads when local scripts may run.
+#    Nothing is changed without consent; what is changed is recorded so that uninstall.ps1 can restore it.
+$policy = Get-HerdrPolicyState -TestHome $TestHome
+if ($policy -and (Test-HerdrPolicyBlocksProfile $policy)) {
+    $manualCommand = "Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned"
+    $changePolicy = $false
+    if ($SetExecutionPolicy) {
+        $changePolicy = $true
+    } elseif (-not $SkipExecutionPolicy) {
+        $canPrompt = $false
         try {
-            Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-            Write-Host "[OK] Set PowerShell ExecutionPolicy (CurrentUser) to RemoteSigned." -ForegroundColor Green
+            $canPrompt = (-not $TestHome) -and [Environment]::UserInteractive -and ($Host.Name -eq "ConsoleHost") -and (-not [Console]::IsInputRedirected)
         } catch {
-            Write-Warning "PowerShell ExecutionPolicy is Restricted. Run: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"
+            $canPrompt = $false
         }
+        if ($canPrompt) {
+            Write-Host ""
+            Write-Host "PowerShell does not run local scripts under the current ExecutionPolicy (CurrentUser=$($policy.CurrentUser), LocalMachine=$($policy.LocalMachine))."
+            Write-Host "The profile that provides cortex-status, cortex-trust and tab revive would not load."
+            try {
+                $answer = Read-Host "Set the ExecutionPolicy of the current user to RemoteSigned? [Y/N]"
+                $changePolicy = ($answer -match '^\s*(?i)y(es)?\s*$')
+            } catch {
+                $changePolicy = $false
+            }
+        }
+    }
+
+    if ($changePolicy) {
+        try {
+            Write-HerdrPolicyRecord -GlobalDir $GlobalCortexDir -Previous $policy.CurrentUser -NewValue "RemoteSigned"
+            Set-HerdrCurrentUserPolicy -Value "RemoteSigned" -TestHome $TestHome
+            Write-Host "[OK] Set PowerShell ExecutionPolicy (CurrentUser) to RemoteSigned (it was $($policy.CurrentUser); uninstall.ps1 restores it)." -ForegroundColor Green
+        } catch {
+            Remove-Item -LiteralPath (Get-HerdrPolicyRecordPath $GlobalCortexDir) -Force -ErrorAction SilentlyContinue
+            Write-Warning "Could not set the ExecutionPolicy ($($_.Exception.Message)). Run: $manualCommand"
+        }
+    } else {
+        Write-Host "[SKIP] PowerShell ExecutionPolicy not changed (CurrentUser=$($policy.CurrentUser), LocalMachine=$($policy.LocalMachine))." -ForegroundColor Yellow
+        Write-Host "       Until local scripts are allowed, PowerShell does not load the profile: cortex-status, cortex-trust and"
+        Write-Host "       tab revive are unavailable (hooks and the MCP server work without it). To allow them, run:"
+        Write-Host "         $manualCommand"
+        Write-Host "       or run this installer again with -SetExecutionPolicy."
     }
 }
 
-# 4. Patch PowerShell profile(s) with guarded marker block (migrating legacy herdr-revive block cleanly)
-$startMarker = "# >>> herdr-cortex >>>"
-$endMarker = "# <<< herdr-cortex <<<"
-$legacyStart = "# >>> herdr-revive >>>"
-$legacyEnd = "# <<< herdr-revive <<<"
-
-$disableLine = if ($NoAutoResume) { "`$env:HERDR_REVIVE_DISABLE = '1'`r`n" } else { "" }
-$escapedAutoRevive = $AutoReviveScript.Replace("'", "''")
-$block = @"
-$startMarker
-${disableLine}if (Test-Path '$escapedAutoRevive') { . '$escapedAutoRevive' }
-$endMarker
-"@
+# 4. PowerShell profile(s): a marker-delimited block, written in the file's own encoding after a dated backup.
+#    Only that block changes (the block of the predecessor herdr-revive is removed).
+$blockLines = Get-HerdrProfileBlockLines -AutoReviveScript $AutoReviveScript -NoAutoResume:$NoAutoResume
 
 $profileTargets = New-Object System.Collections.Generic.List[string]
 $docsDir = if ($TestHome) {
@@ -114,44 +175,49 @@ if (-not $TestHome -and $PROFILE -and ($profileTargets -notcontains $PROFILE)) {
     $profileTargets.Add($PROFILE)
 }
 
-$cortexPattern = "(?s)" + [regex]::Escape($startMarker) + ".*?" + [regex]::Escape($endMarker)
-$legacyPattern = "(?s)\r?\n?" + [regex]::Escape($legacyStart) + ".*?" + [regex]::Escape($legacyEnd) + "\r?\n?"
-$blockEvaluator = [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $block }
-$newlineEvaluator = [System.Text.RegularExpressions.MatchEvaluator]{ param($m) "`r`n" }
-
+$backupStamp = Get-HerdrBackupStamp
+$profileProblems = 0
 foreach ($profPath in ($profileTargets | Select-Object -Unique)) {
-    $profDir = Split-Path -Parent $profPath
-    if (-not (Test-Path $profDir)) {
-        New-Item -ItemType Directory -Force -Path $profDir | Out-Null
+    $res = Set-HerdrProfileBlock -ProfilePath $profPath -BlockLines $blockLines -Stamp $backupStamp
+    switch ($res.Status) {
+        "created" {
+            Write-Host "[OK] Created PowerShell profile: $profPath" -ForegroundColor Green
+        }
+        "updated" {
+            Write-Host "[OK] Updated PowerShell profile: $profPath (encoding kept: $($res.Encoding))" -ForegroundColor Green
+            Write-Host "[OK] Backup: $($res.BackupPath)" -ForegroundColor Green
+        }
+        "unchanged" {
+            Write-Host "[OK] PowerShell profile already up to date: $profPath" -ForegroundColor Green
+        }
+        default {
+            $profileProblems++
+            Write-Warning "PowerShell profile NOT changed: $profPath ($($res.Message)). Add these lines to it yourself:"
+            foreach ($line in $blockLines) { Write-Host "    $line" }
+        }
     }
-
-    $existing = ""
-    if (Test-Path $profPath) {
-        $existing = Get-Content -Raw -Path $profPath -Encoding UTF8
-        if ($null -eq $existing) { $existing = "" }
-    }
-
-    # Remove legacy herdr-revive block if present so profile has no duplicate loader
-    if ($existing -match [regex]::Escape($legacyStart)) {
-        $existing = [regex]::Replace($existing, $legacyPattern, $newlineEvaluator).Trim()
-        if ($existing.Length -gt 0) { $existing += "`r`n" }
-    }
-
-    if ($existing -match $cortexPattern) {
-        $updated = [regex]::Replace($existing, $cortexPattern, $blockEvaluator)
-    } else {
-        $sep = if ($existing.Length -gt 0 -and -not $existing.EndsWith("`n")) { "`r`n`r`n" } elseif ($existing.Length -gt 0) { "`r`n" } else { "" }
-        $updated = $existing + $sep + $block + "`r`n"
-    }
-
-    # Write UTF-8 with BOM so Windows PowerShell 5.1 reads Korean characters cleanly
-    [System.IO.File]::WriteAllText($profPath, $updated, (New-Object System.Text.UTF8Encoding($true)))
-    Write-Host "[OK] Updated PowerShell profile: $profPath" -ForegroundColor Green
 }
 
+# 5. Where documents would be sent for embedding (nothing, unless a provider is configured)
+$prevOutEnc = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    & $NodeExe --no-warnings $InstallerScript embedding-status
+} catch {
+    Write-Warning "Could not read the embedding status: $($_.Exception.Message)"
+} finally {
+    [Console]::OutputEncoding = $prevOutEnc
+}
+
+$escapedAutoRevive = $AutoReviveScript.Replace("'", "''")
 Write-Host ""
-Write-Host "herdr-cortex installation complete!" -ForegroundColor Cyan
+if ($profileProblems -gt 0) {
+    Write-Host "herdr-cortex installation complete, except for $profileProblems PowerShell profile(s) (see the warning above)." -ForegroundColor Yellow
+} else {
+    Write-Host "herdr-cortex installation complete!" -ForegroundColor Cyan
+}
 Write-Host "Next steps:"
 Write-Host "  1. Open a new terminal or run: . '$escapedAutoRevive'"
-Write-Host "  2. Restart Claude Code / Antigravity CLI tabs to load the cortex MCP server and official hooks."
-Write-Host "  3. Commands available anywhere: cortex-status, revive-agents, revive-status, revive-agents -DryRun"
+Write-Host "  2. Restart Claude Code / Antigravity CLI tabs to load the herdr-cortex MCP server and official hooks."
+Write-Host "  3. In each project folder that should have memory, run: cortex-trust approve"
+Write-Host "  4. Commands available anywhere: cortex-status, cortex-trust, revive-agents, revive-status, revive-agents -DryRun"

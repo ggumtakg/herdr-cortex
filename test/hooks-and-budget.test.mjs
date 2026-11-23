@@ -35,7 +35,9 @@ import {
   AGY_HOOK_KEY,
   LEGACY_AGY_HOOK_KEY,
   MCP_SERVER_KEY,
+  findBackups,
   installCortex,
+  isOwnHook,
   uninstallCortex,
 } from '../src/hooks/installer.mjs';
 import { enqueueMessage } from '../src/relay/inbox.mjs';
@@ -723,11 +725,13 @@ test('hooks/installer: idempotent install/uninstall round-trip preserves existin
     assert.equal(res1.antigravityHooks.action, 'installed');
     assert.equal(res2.claudeSettings.action, 'installed');
 
-    // Verify backups created
-    assert.equal(fs.existsSync(`${agyHooksPath}.herdr-cortex.bak`), true);
-    assert.equal(fs.existsSync(`${agyMcpPath}.herdr-cortex.bak`), true);
-    assert.equal(fs.existsSync(`${claudeSettingsPath}.herdr-cortex.bak`), true);
-    assert.equal(fs.existsSync(`${claudeJsonPath}.herdr-cortex.bak`), true);
+    // Verify backups created: one dated copy per changed file; the second (unchanged) install adds none
+    for (const file of [agyHooksPath, agyMcpPath, claudeSettingsPath, claudeJsonPath]) {
+      const backups = findBackups(file);
+      assert.equal(backups.length, 1, file);
+      assert.match(path.basename(backups[0]), /\.herdr-cortex\.\d{8}-\d{6}\.bak$/);
+    }
+    assert.deepEqual(res2.backups, []);
 
     // Verify Antigravity hooks: herdr-cortex added, legacy removed, user-custom preserved
     const agyHooks = JSON.parse(fs.readFileSync(agyHooksPath, 'utf8'));
@@ -744,12 +748,12 @@ test('hooks/installer: idempotent install/uninstall round-trip preserves existin
     const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf8'));
     assert.equal(claudeSettings.theme, 'dark');
     assert.equal(claudeSettings.hooks.SessionStart.length, 2); // echo keep-me + cortex
-    const cortexStartEntry = claudeSettings.hooks.SessionStart.find((e) => e.hooks.some((h) => h.command.includes('herdr-cortex')));
+    const cortexStartEntry = claudeSettings.hooks.SessionStart.find((e) => e.hooks.some((h) => isOwnHook(h)));
     assert.equal(cortexStartEntry.hooks.length, 1);
-    assert.match(cortexStartEntry.hooks[0].command, /session-start --id herdr-cortex/);
+    assert.deepEqual(cortexStartEntry.hooks[0].args.slice(-3), ['session-start', '--id', 'herdr-cortex']);
     assert.equal(claudeSettings.hooks.PreCompact.length, 1);
     assert.equal(claudeSettings.hooks.SessionEnd.length, 1);
-    assert.match(claudeSettings.hooks.SessionEnd[0].hooks[0].command, /session-end --id herdr-cortex/);
+    assert.deepEqual(claudeSettings.hooks.SessionEnd[0].hooks[0].args.slice(-3), ['session-end', '--id', 'herdr-cortex']);
     assert.ok(claudeSettings.hooks.SessionEnd[0].hooks[0].timeout >= 3, 'SessionEnd gets an explicit timeout above its 1.5 s default');
     assert.equal(claudeSettings.hooks.UserPromptSubmit.length, 1);
     assert.equal(claudeSettings.hooks.PreToolUse.length, 1);

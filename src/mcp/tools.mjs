@@ -254,7 +254,7 @@ function resolvePromptFile(promptsDir, kind, name) {
 }
 
 /**
- * Create the MCP tool registry for `cortex`.
+ * Create the MCP tool registry of the `herdr-cortex` server.
  * Supports registering extra tools (e.g., Stage 2 relay_tabs / relay_send / relay_inbox).
  */
 export function createToolRegistry(

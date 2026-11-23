@@ -22,9 +22,12 @@ import {
   sanitizeSingleLineTrigger,
 } from '../src/relay/hc.mjs';
 import {
+  INBOX_DELIVERED_DIR,
+  INBOX_DELIVERED_RETENTION_MS,
   INBOX_LOCK_FILE,
   INBOX_PREVIEW_MAX_CHARS,
   ackMessage,
+  countInboxMessages,
   countPendingMessages,
   deliverInboxForHook,
   drainInbox,
@@ -100,6 +103,13 @@ const REAL_HC_LS = {
   ],
 };
 
+// A tab that is waiting on a permission dialog, as hc 0.1.21 printed it (paths and labels are stand-ins).
+const REAL_HC_BLOCKED_LS_ROW = { address: 't3', agent: 'claude-code', cwd: 'C:\\Users\\dev\\proj', state: 'live', status: 'blocked', turn: 3, where: 'proj / Claude Code' };
+const REAL_HC_BLOCKED_GET_STATUS = { app: 'claude-code', kind: 'permission', msg: 'approve plan', state: 'blocked' };
+// `hc send` to that tab types nothing, exits with code 9 and prints this.
+const REAL_HC_SEND_BLOCKED_EXIT_CODE = 9;
+const REAL_HC_SEND_BLOCKED_OUTPUT = '{"error":{"kind":"blocked","message":"t3 is blocked (permission)","hint":"typing would answer its dialog; ..."}}';
+
 function hcLsRow({ address, agent = 'claude-code', cwd = 'C:\\Users\\dev', status, state = 'live', turn = 1, where = 'work / 1' }) {
   return { address, agent, cwd, state, ...(status ? { status } : {}), turn, where };
 }
@@ -138,9 +148,11 @@ function hcGetShell({ address, cwd = 'C:\\Users\\dev', where = 'work / 2' }) {
  * An hc client whose `hc` is a table: `ls` (object or function) answers `hc ls --json`, `get[id]` answers
  * `hc get <id> --json`. Every call is recorded in `calls`; `sent` lists the `hc send` calls
  * ({ ifCond, to, trigger }). `rejectIfFlag` makes `hc send --if` fail like an hc that does not know the flag.
+ * `hc send` to a terminal listed in `blockedSend` fails the way the real hc does for a tab that waits on a
+ * dialog (exit code 9, the JSON error on `blockedStream`); `refused` lists those attempts.
  */
 function makeFakeHc({ ls = { terminals: [] }, get = {} } = {}) {
-  const state = { calls: [], sent: [], rejectIfFlag: false };
+  const state = { calls: [], sent: [], refused: [], rejectIfFlag: false, blockedSend: new Set(), blockedStream: 'stdout' };
   const client = createHcClient({
     hcBin: FAKE_HC_BIN,
     execFileSync(bin, args, options) {
@@ -161,6 +173,15 @@ function makeFakeHc({ ls = { terminals: [] }, get = {} } = {}) {
       }
       if (args[0] === 'send') {
         assert.equal(args.includes('--force'), false, 'the relay never forces a wake trigger into a tab');
+        const target = args[1] === '--if' ? args[3] : args[1];
+        if (state.blockedSend.has(target)) {
+          state.refused.push(target);
+          const err = new Error(`Command failed: hc send ${target}`);
+          err.status = REAL_HC_SEND_BLOCKED_EXIT_CODE;
+          err.stdout = state.blockedStream === 'stdout' ? REAL_HC_SEND_BLOCKED_OUTPUT.replace('t3', target) : '';
+          err.stderr = state.blockedStream === 'stderr' ? REAL_HC_SEND_BLOCKED_OUTPUT.replace('t3', target) : '';
+          throw err;
+        }
         if (args[1] === '--if') {
           if (state.rejectIfFlag) {
             const err = new Error('unknown flag: --if');
@@ -451,7 +472,9 @@ test('relay/inbox lock: one consumer at a time (.lock, exclusive create, pid + t
     const afterEmpty = drainInbox('tab-L', { ...opts, nowMs: Date.now() + 60_000 });
     assert.equal(afterEmpty.busy, false);
     assert.deepEqual(afterEmpty.ack(), { acked: 1, kept: 0 });
-    assert.deepEqual(fs.readdirSync(inboxDir), []);
+    // Nothing pending and no lock is left; what the hook delivered above (m-2, m-3) is held in .delivered/
+    assert.deepEqual(fs.readdirSync(inboxDir), [INBOX_DELIVERED_DIR]);
+    assert.equal(fs.readdirSync(path.join(inboxDir, INBOX_DELIVERED_DIR)).length, 2);
   } finally {
     env.cleanup();
   }
@@ -665,7 +688,9 @@ test('relay/hooks: a message longer than the injection budget is announced once,
       assert.equal((await callTool(server, 'relay_inbox', { action: 'peek' })).data.count, 0);
     });
     assert.equal(claudePrompt(env, 'tab-long'), '');
-    assert.deepEqual(fs.readdirSync(getTerminalInboxDir('tab-long', opts)), []);
+    // No pending message is left; the short messages the hooks injected are held in .delivered/
+    assert.deepEqual(fs.readdirSync(getTerminalInboxDir('tab-long', opts)), [INBOX_DELIVERED_DIR]);
+    assert.equal(peekInbox('tab-long', opts).pendingCount, 0);
 
     // --- relay_send itself sets no length limit ---
     const hc = makeFakeHc({ get: { 'tab-long': hcGetAgent({ address: 'tab-long', cwd: env.projectDir }) } });
@@ -710,8 +735,194 @@ test('relay/hooks: a message longer than the injection budget is announced once,
 });
 
 // ---------------------------------------------------------------------------------------------
+// Delivered messages are kept for a retention period instead of being deleted
+// ---------------------------------------------------------------------------------------------
+
+test('relay/inbox retention: a message a hook injected is kept as delivered for 24 hours, is never injected again, can be listed and acknowledged, and is purged by a later drain', async () => {
+  const env = makeTempEnv('cortex-inbox-held-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  const opts = { globalDir: env.globalDir };
+  try {
+    assert.equal(INBOX_DELIVERED_RETENTION_MS, 24 * 60 * 60 * 1000);
+    assert.equal(INBOX_DELIVERED_DIR, '.delivered');
+    const inboxDir = getTerminalInboxDir('tab-h', opts);
+    const heldDir = path.join(inboxDir, INBOX_DELIVERED_DIR);
+
+    const m1 = enqueueMessage('tab-h', { id: 'held-1', from_terminal_id: 'tab-0', message: 'First handoff', context_docs: ['dec-1'] }, opts);
+    enqueueMessage('tab-h', { id: 'held-2', from_terminal_id: 'tab-0', message: 'Second handoff' }, opts);
+
+    // The hook injects both. Its output may still be discarded by the host, so nothing is deleted.
+    const t0 = Date.now();
+    const first = claudePrompt(env, 'tab-h');
+    assert.match(first, /First handoff/);
+    assert.match(first, /Second handoff/);
+    assert.deepEqual(fs.readdirSync(inboxDir), [INBOX_DELIVERED_DIR], 'no pending file and no lock is left');
+    assert.deepEqual(fs.readdirSync(heldDir).sort(), fs.readdirSync(heldDir).sort().filter((name) => name.endsWith('.json')));
+    const storedHeld = JSON.parse(fs.readFileSync(path.join(heldDir, m1.fileName), 'utf8'));
+    assert.equal(storedHeld.message, 'First handoff');
+    assert.deepEqual(storedHeld.context_docs, ['dec-1']);
+    assert.ok(Math.abs(Date.parse(storedHeld.delivered_at) - t0) < 60_000, 'delivered_at is the delivery time');
+
+    // Delivered messages are never injected again, by either host
+    assert.equal(claudePrompt(env, 'tab-h'), '');
+    assert.equal(handleAntigravityPreInvocation(
+      { conversationId: 'held-conv', cwd: env.projectDir },
+      { terminalId: 'tab-h', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    ).injectSteps, undefined);
+    assert.deepEqual(deliverInboxForHook('tab-h', opts).deliveredIds, []);
+
+    // Counts distinguish pending from held
+    assert.equal(countPendingMessages('tab-h', opts), 0);
+    assert.deepEqual(countInboxMessages('tab-h', opts), { pending: 0, held: 2, broken: 0 });
+
+    // peek: pending only by default; the held ones on request, flagged
+    const plain = peekInbox('tab-h', opts);
+    assert.deepEqual([plain.count, plain.pendingCount, plain.heldCount, plain.messages.length], [0, 0, 2, 0]);
+    const withHeld = peekInbox('tab-h', { ...opts, includeDelivered: true });
+    assert.deepEqual([withHeld.count, withHeld.pendingCount, withHeld.heldCount], [2, 0, 2]);
+    assert.deepEqual(withHeld.messages.map((m) => [m.id, m.delivered, m.message]), [
+      ['held-1', true, 'First handoff'],
+      ['held-2', true, 'Second handoff'],
+    ]);
+    assert.equal(withHeld.messages[0].delivered_at, storedHeld.delivered_at);
+
+    // The same through the MCP tools; a new pending message is listed first and is not "delivered"
+    enqueueMessage('tab-h', { id: 'fresh-3', from_terminal_id: 'tab-0', message: 'Not injected yet' }, opts);
+    const hc = makeFakeHc({ ls: { terminals: [hcLsRow({ address: 'tab-h', cwd: env.projectDir, status: 'idle' })] } });
+    const server = createMcpServer({ store, hcClient: hc });
+    await withTerminalId('tab-h', async () => {
+      const toolPeek = await callTool(server, 'relay_inbox', { action: 'peek' });
+      assert.deepEqual(toolPeek.data.messages.map((m) => [m.id, m.delivered]), [['fresh-3', false]]);
+      assert.equal(toolPeek.data.heldCount, 2);
+      const toolPeekAll = await callTool(server, 'relay_inbox', { action: 'peek', include_delivered: true });
+      assert.deepEqual(toolPeekAll.data.messages.map((m) => [m.id, m.delivered]), [['fresh-3', false], ['held-1', true], ['held-2', true]]);
+
+      const tabs = (await callTool(server, 'relay_tabs')).data.tabs;
+      assert.deepEqual([tabs[0].terminalId, tabs[0].pendingInboxCount, tabs[0].heldInboxCount], ['tab-h', 1, 2]);
+
+      // An explicit ack deletes a delivered message by id ...
+      const ackHeld = await callTool(server, 'relay_inbox', { action: 'ack', message_id: 'held-1' });
+      assert.deepEqual([ackHeld.data.acked, ackHeld.data.delivered], [true, true]);
+      assert.deepEqual(countInboxMessages('tab-h', opts), { pending: 1, held: 1, broken: 0 });
+      // ... "all" covers the pending messages only, unless the delivered ones are asked for as well
+      const ackAll = await callTool(server, 'relay_inbox', { action: 'ack', message_id: 'all' });
+      assert.deepEqual([ackAll.data.ackedCount, ackAll.data.messageIds], [1, ['fresh-3']]);
+      assert.deepEqual(countInboxMessages('tab-h', opts), { pending: 0, held: 1, broken: 0 });
+      const ackAllHeld = await callTool(server, 'relay_inbox', { action: 'ack', message_id: 'all', include_delivered: true });
+      assert.deepEqual([ackAllHeld.data.ackedCount, ackAllHeld.data.deliveredAckedCount, ackAllHeld.data.messageIds], [1, 1, ['held-2']]);
+      assert.deepEqual(countInboxMessages('tab-h', opts), { pending: 0, held: 0, broken: 0 });
+    });
+    assert.deepEqual(ackMessage('tab-h', 'held-1', opts), { acked: false, terminalId: 'tab-h', messageId: 'held-1' });
+
+    // Retention: kept until 24 hours after delivery, purged by the first drain after that
+    enqueueMessage('tab-h', { id: 'old-4', from_terminal_id: 'tab-0', message: 'Will expire' }, opts);
+    const deliveredAt = Date.now();
+    assert.deepEqual(deliverInboxForHook('tab-h', { ...opts, nowMs: deliveredAt }).deliveredIds, ['old-4']);
+    const almost = deliveredAt + INBOX_DELIVERED_RETENTION_MS - 60_000;
+    assert.deepEqual(deliverInboxForHook('tab-h', { ...opts, nowMs: almost }).deliveredIds, []);
+    assert.deepEqual(countInboxMessages('tab-h', opts), { pending: 0, held: 1, broken: 0 });
+    assert.equal(peekInbox('tab-h', { ...opts, includeDelivered: true, nowMs: almost }).count, 1);
+    const after = deliveredAt + INBOX_DELIVERED_RETENTION_MS + 60_000;
+    assert.equal(peekInbox('tab-h', { ...opts, includeDelivered: true, nowMs: after }).count, 0, 'an expired message is no longer listed');
+    assert.equal(fs.readdirSync(heldDir).length, 1, 'a peek deletes nothing');
+    assert.deepEqual(deliverInboxForHook('tab-h', { ...opts, nowMs: after }).deliveredIds, []);
+    assert.deepEqual(fs.readdirSync(inboxDir), [], 'the drain purged the expired message and the empty folder');
+
+    // A shorter retention can be passed (the default is the constant)
+    enqueueMessage('tab-h', { id: 'short-5', from_terminal_id: 'tab-0', message: 'Short retention' }, opts);
+    deliverInboxForHook('tab-h', { ...opts, nowMs: deliveredAt });
+    drainInbox('tab-h', { ...opts, nowMs: deliveredAt + 5000, retentionMs: 1000 }).release();
+    assert.deepEqual(countInboxMessages('tab-h', opts), { pending: 0, held: 0, broken: 0 });
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
 // A5: the real hc status shapes
 // ---------------------------------------------------------------------------------------------
+
+test('relay/hc blocked tab: the real hc ls / hc get shapes of a tab waiting on a permission dialog read as blocked, and a refused hc send is reported as target_blocked', async () => {
+  const env = makeTempEnv('cortex-hc-blocked-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  try {
+    // hc ls row and hc get result, as captured
+    const row = detectTerminalActivity(REAL_HC_BLOCKED_LS_ROW);
+    assert.deepEqual(
+      [row.terminalId, row.live, row.activity, row.blocked, row.busy, row.idle, row.unknown, row.isBareShell, row.agentName],
+      ['t3', true, 'blocked', true, false, false, false, false, 'claude-code'],
+    );
+    const got = detectTerminalActivity(hcGetAgent({ address: 't3', cwd: env.projectDir, status: REAL_HC_BLOCKED_GET_STATUS, where: 'proj / Claude Code' }));
+    assert.deepEqual([got.activity, got.blocked, got.busy, got.idle, got.agentName], ['blocked', true, false, false, 'claude-code']);
+
+    const hc = makeFakeHc({
+      ls: { terminals: [REAL_HC_BLOCKED_LS_ROW] },
+      get: {
+        t3: hcGetAgent({ address: 't3', cwd: env.projectDir, status: REAL_HC_BLOCKED_GET_STATUS, where: 'proj / Claude Code' }),
+        // hc get said "working" a moment ago, but the tab is on a dialog by the time hc send runs
+        t5: hcGetAgent({ address: 't5', cwd: env.projectDir, statusState: 'working' }),
+        t6: hcGetAgent({ address: 't6', cwd: env.projectDir, statusState: 'idle' }),
+      },
+    });
+    hc.state.blockedSend = new Set(['t3', 't5', 't6']);
+    assert.deepEqual(hc.listTerminals().terminals.map((t) => [t.terminalId, t.activity]), [['t3', 'blocked']]);
+
+    // The client reports the refusal as its own code, whichever stream carries the JSON
+    for (const stream of ['stdout', 'stderr']) {
+      hc.state.blockedStream = stream;
+      const refused = hc.sendTrigger('t3', 'ping');
+      assert.deepEqual([refused.ok, refused.code, refused.error], [false, 'HC_TARGET_BLOCKED', 't3 is blocked (permission)'], stream);
+    }
+    // Exit code 9 with plain text instead of JSON is understood as well; another failure stays a failure
+    const plainHc = createHcClient({
+      hcBin: FAKE_HC_BIN,
+      execFileSync() {
+        const err = new Error('Command failed');
+        err.status = 9;
+        err.stderr = 't3 is blocked (permission)';
+        throw err;
+      },
+    });
+    assert.equal(plainHc.sendTrigger('t3', 'ping').code, 'HC_TARGET_BLOCKED');
+    const otherHc = createHcClient({
+      hcBin: FAKE_HC_BIN,
+      execFileSync() {
+        const err = new Error('Command failed');
+        err.status = 1;
+        err.stderr = '{"error":{"kind":"not_found","message":"no terminal t3"}}';
+        throw err;
+      },
+    });
+    assert.equal(otherHc.sendTrigger('t3', 'ping').code, 'HC_EXEC_ERROR');
+
+    hc.state.blockedStream = 'stdout';
+    hc.state.refused.length = 0;
+    const server = createMcpServer({ store, hcClient: hc });
+    await withTerminalId('t1', async () => {
+      // auto: hc get already says blocked, nothing is sent
+      const auto = await callTool(server, 'relay_send', { to_terminal_id: 't3', message: 'needs a look', wake: 'auto' });
+      assert.deepEqual([auto.data.queued, auto.data.woke, auto.data.wakeReason], [true, false, 'target_blocked']);
+      assert.deepEqual(hc.state.refused, []);
+      // always: the send is attempted, hc refuses to type into the dialog, and that is reported as blocked
+      const always = await callTool(server, 'relay_send', { to_terminal_id: 't3', message: 'needs a look', wake: 'always' });
+      assert.deepEqual([always.data.queued, always.data.woke, always.data.wakeReason], [true, false, 'target_blocked']);
+      assert.equal(always.data.wakeError, 't3 is blocked (permission)');
+      assert.equal(always.data.triggerSent, undefined);
+      assert.deepEqual(hc.state.refused, ['t3']);
+      // The dialog appeared between hc get and hc send
+      const raced = await callTool(server, 'relay_send', { to_terminal_id: 't5', message: 'raced', wake: 'always' });
+      assert.deepEqual([raced.data.woke, raced.data.wakeReason], [false, 'target_blocked']);
+      const racedAuto = await callTool(server, 'relay_send', { to_terminal_id: 't6', message: 'raced', wake: 'auto' });
+      assert.deepEqual([racedAuto.data.woke, racedAuto.data.wakeReason, racedAuto.data.wakeError], [false, 'target_blocked', 't6 is blocked (permission)']);
+      assert.deepEqual(hc.state.sent, [], 'nothing was typed into any tab');
+    });
+    assert.equal(countPendingMessages('t3', { globalDir: env.globalDir }), 2, 'the messages wait in the inbox');
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
 
 test('relay/hc: reads real hc ls rows (string status) and hc get results (object status); unknown is not busy; single-line sendTrigger; graceful missing hc', () => {
   const hc = makeFakeHc({

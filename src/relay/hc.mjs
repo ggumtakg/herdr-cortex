@@ -9,6 +9,10 @@ const BARE_SHELLS = new Set([
   'powershell', 'pwsh', 'cmd', 'bash', 'zsh', 'sh',
 ]);
 
+// Agent status names. Seen in real `hc` 0.1.21 output: "idle", "working" and "blocked" (a tab waiting on a
+// permission dialog: `hc ls` prints "status":"blocked", `hc get` prints
+// "status":{"app":"claude-code","kind":"permission","msg":"approve plan","state":"blocked"}).
+// Every other name in these sets is a guess; in particular no error-state name has been observed yet.
 const BUSY_STATES = new Set([
   'busy', 'running', 'working', 'thinking', 'active', 'streaming', 'executing',
 ]);
@@ -59,8 +63,8 @@ export function parseTerminalAddress(address) {
   return { remote: false, machine: '', terminalId: raw };
 }
 
-// `status` as hc 0.1.21 prints it: a plain string in `hc ls` rows ("idle" / "working", absent for a bare
-// shell), an object { app, state, msg? } in `hc get` ("status": null for a bare shell).
+// `status` as hc 0.1.21 prints it: a plain string in `hc ls` rows ("idle" / "working" / "blocked", absent
+// for a bare shell), an object { app, state, msg?, kind? } in `hc get` ("status": null for a bare shell).
 function readStatus(status) {
   if (typeof status === 'string') {
     return { state: status.trim().toLowerCase(), app: '' };
@@ -153,7 +157,42 @@ export function detectTerminalActivity(terminal) {
   };
 }
 
+/** Exit code of `hc send` when the target is waiting on a dialog (seen with hc 0.1.21). */
+export const HC_EXIT_BLOCKED = 9;
+
+function outputText(value) {
+  if (typeof value === 'string') return value.trim();
+  if (Buffer.isBuffer(value)) return value.toString('utf8').trim();
+  return '';
+}
+
+// The `{"error":{"kind","message","hint"}}` object hc prints when a command fails (JSON is hc's output format
+// whenever its output is a pipe, as it is here), or null.
+function readHcErrorPayload(err) {
+  for (const text of [outputText(err?.stdout), outputText(err?.stderr)]) {
+    if (!text.startsWith('{')) continue;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed.error === 'object' && parsed.error) return parsed.error;
+    } catch {
+      // not JSON
+    }
+  }
+  return null;
+}
+
 function classifyExecError(err, hcBin) {
+  // `hc send` to a tab that is waiting on a permission dialog types nothing and fails with
+  // {"error":{"kind":"blocked","message":"t3 is blocked (permission)","hint":"typing would answer its dialog; ..."}}.
+  const payload = readHcErrorPayload(err);
+  const plainText = `${outputText(err?.stdout)}\n${outputText(err?.stderr)}`;
+  if (payload?.kind === 'blocked' || (!payload && err?.status === HC_EXIT_BLOCKED && /\bis blocked\b/i.test(plainText))) {
+    return {
+      ok: false,
+      code: 'HC_TARGET_BLOCKED',
+      error: (typeof payload?.message === 'string' && payload.message.trim()) || plainText.trim() || 'The target tab is blocked.',
+    };
+  }
   if (err && err.code === 'ENOENT') {
     return {
       ok: false,

@@ -1056,77 +1056,79 @@ test('exclusion policy: a junction or another spelling of the path does not bypa
 
 test('.memory/.gitignore: created by the first write, never overwritten, never created by a read', async () => {
   const env = makeTempEnv('cortex-gitignore-');
-  approveProject(env.projectDir, { globalDir: env.globalDir });
-  const memoryDir = path.join(env.projectDir, '.memory');
-  const gitignorePath = path.join(memoryDir, '.gitignore');
-  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
-  const registry = createToolRegistry(store, { promptsDir: env.promptsDir });
-
   try {
-    // Reads in an uninitialized project create nothing at all
-    assert.equal((await registry.callTool('memory_search', { query: 'anything' })).isError, false);
-    assert.equal((await registry.callTool('memory_overview', {})).isError, false);
-    assert.equal((await registry.callTool('memory_graph', { target: 'nothing' })).isError, false);
-    assert.equal((await registry.callTool('memory_read', { id: 'nothing' })).data.error, 'NOT_FOUND');
-    assert.equal(fs.existsSync(memoryDir), false);
+    approveProject(env.projectDir, { globalDir: env.globalDir });
+    const memoryDir = path.join(env.projectDir, '.memory');
+    const gitignorePath = path.join(memoryDir, '.gitignore');
+    const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+    const registry = createToolRegistry(store, { promptsDir: env.promptsDir });
 
-    // The first memory_save creates .memory/ and its .gitignore with a single "*" line
-    const saved = await registry.callTool('memory_save', { id: 'first-1', type: 'decision', title: 'First', summary: 'S' });
-    assert.equal(saved.isError, false, JSON.stringify(saved.data));
-    assert.equal(fs.readFileSync(gitignorePath, 'utf8'), '*\n');
+    try {
+      // Reads in an uninitialized project create nothing at all
+      assert.equal((await registry.callTool('memory_search', { query: 'anything' })).isError, false);
+      assert.equal((await registry.callTool('memory_overview', {})).isError, false);
+      assert.equal((await registry.callTool('memory_graph', { target: 'nothing' })).isError, false);
+      assert.equal((await registry.callTool('memory_read', { id: 'nothing' })).data.error, 'NOT_FOUND');
+      assert.equal(fs.existsSync(memoryDir), false);
 
-    // A global-scope write does not put a .gitignore into the global store
-    await registry.callTool('memory_save', { scope: 'global', id: 'g-1', type: 'knowledge', title: 'G', summary: 'S' });
-    assert.equal(fs.existsSync(path.join(env.globalDir, '.gitignore')), false);
+      // The first memory_save creates .memory/ and its .gitignore with a single "*" line
+      const saved = await registry.callTool('memory_save', { id: 'first-1', type: 'decision', title: 'First', summary: 'S' });
+      assert.equal(saved.isError, false, JSON.stringify(saved.data));
+      assert.equal(fs.readFileSync(gitignorePath, 'utf8'), '*\n');
 
-    // The user's own .gitignore is left exactly as it is by later writes
-    const custom = '# keep docs in git\n*\n!docs/\n!docs/**\n';
-    fs.writeFileSync(gitignorePath, custom);
-    await registry.callTool('memory_save', { id: 'second-1', type: 'decision', title: 'Second', summary: 'S' });
-    await registry.callTool('memory_update', { id: 'first-1', status: 'done' });
-    assert.equal(fs.readFileSync(gitignorePath, 'utf8'), custom);
+      // A global-scope write does not put a .gitignore into the global store
+      await registry.callTool('memory_save', { scope: 'global', id: 'g-1', type: 'knowledge', title: 'G', summary: 'S' });
+      assert.equal(fs.existsSync(path.join(env.globalDir, '.gitignore')), false);
+
+      // The user's own .gitignore is left exactly as it is by later writes
+      const custom = '# keep docs in git\n*\n!docs/\n!docs/**\n';
+      fs.writeFileSync(gitignorePath, custom);
+      await registry.callTool('memory_save', { id: 'second-1', type: 'decision', title: 'Second', summary: 'S' });
+      await registry.callTool('memory_update', { id: 'first-1', status: 'done' });
+      assert.equal(fs.readFileSync(gitignorePath, 'utf8'), custom);
+    } finally {
+      store.close();
+    }
+
+    // A project that already has a .memory/ with its own .gitignore before the first write through cortex
+    const preset = path.join(env.root, 'preset-project');
+    fs.mkdirSync(path.join(preset, '.memory'), { recursive: true });
+    fs.writeFileSync(path.join(preset, '.memory', '.gitignore'), 'index.sqlite*\n');
+    approveProject(preset, { globalDir: env.globalDir });
+    const presetStore = new CortexStore({ projectDir: preset, globalDir: env.globalDir, disableVec: true });
+    try {
+      presetStore.saveDoc({ id: 'p-1', type: 'decision', title: 'P', summary: 'S' });
+      assert.equal(fs.readFileSync(path.join(preset, '.memory', '.gitignore'), 'utf8'), 'index.sqlite*\n');
+    } finally {
+      presetStore.close();
+    }
+
+    // An existing .memory/ without a .gitignore (hand-written documents): reads leave it alone, a write adds the file
+    const legacy = path.join(env.root, 'legacy-project');
+    atomicWriteText(
+      path.join(legacy, '.memory', 'docs', '2026-11', 'old-1.md'),
+      '---\nid: old-1\ntype: decision\nstatus: active\ntitle: Old decision\nsummary: Written by hand\n---\n\nBody\n',
+    );
+    approveProject(legacy, { globalDir: env.globalDir });
+    const legacyGitignore = path.join(legacy, '.memory', '.gitignore');
+    const legacyStore = new CortexStore({ projectDir: legacy, globalDir: env.globalDir, disableVec: true });
+    try {
+      assert.equal(legacyStore.readDoc({ id: 'old-1' }).title, 'Old decision');
+      legacyStore.getOverview();
+      assert.equal(fs.existsSync(legacyGitignore), false, 'read-only operations do not create it');
+      legacyStore.updateDoc({ id: 'old-1', status: 'done' });
+      assert.equal(fs.readFileSync(legacyGitignore, 'utf8'), '*\n');
+    } finally {
+      legacyStore.close();
+    }
+
+    // A relay message is stored in the global inbox: nothing is created in any project folder
+    const relayTarget = path.join(env.root, 'relay-target');
+    fs.mkdirSync(relayTarget, { recursive: true });
+    const queued = enqueueMessage('tab-7', { from_terminal_id: 'tab-1', message: 'hello' }, { globalDir: env.globalDir });
+    assert.equal(path.dirname(queued.filePath), path.join(env.globalDir, 'state', 'inbox', 'tab-7'));
+    assert.deepEqual(fs.readdirSync(relayTarget), []);
   } finally {
-    store.close();
+    env.cleanup();
   }
-
-  // A project that already has a .memory/ with its own .gitignore before the first write through cortex
-  const preset = path.join(env.root, 'preset-project');
-  fs.mkdirSync(path.join(preset, '.memory'), { recursive: true });
-  fs.writeFileSync(path.join(preset, '.memory', '.gitignore'), 'index.sqlite*\n');
-  approveProject(preset, { globalDir: env.globalDir });
-  const presetStore = new CortexStore({ projectDir: preset, globalDir: env.globalDir, disableVec: true });
-  try {
-    presetStore.saveDoc({ id: 'p-1', type: 'decision', title: 'P', summary: 'S' });
-    assert.equal(fs.readFileSync(path.join(preset, '.memory', '.gitignore'), 'utf8'), 'index.sqlite*\n');
-  } finally {
-    presetStore.close();
-  }
-
-  // An existing .memory/ without a .gitignore (hand-written documents): reads leave it alone, a write adds the file
-  const legacy = path.join(env.root, 'legacy-project');
-  atomicWriteText(
-    path.join(legacy, '.memory', 'docs', '2026-11', 'old-1.md'),
-    '---\nid: old-1\ntype: decision\nstatus: active\ntitle: Old decision\nsummary: Written by hand\n---\n\nBody\n',
-  );
-  approveProject(legacy, { globalDir: env.globalDir });
-  const legacyGitignore = path.join(legacy, '.memory', '.gitignore');
-  const legacyStore = new CortexStore({ projectDir: legacy, globalDir: env.globalDir, disableVec: true });
-  try {
-    assert.equal(legacyStore.readDoc({ id: 'old-1' }).title, 'Old decision');
-    legacyStore.getOverview();
-    assert.equal(fs.existsSync(legacyGitignore), false, 'read-only operations do not create it');
-    legacyStore.updateDoc({ id: 'old-1', status: 'done' });
-    assert.equal(fs.readFileSync(legacyGitignore, 'utf8'), '*\n');
-  } finally {
-    legacyStore.close();
-  }
-
-  // A relay message is stored in the global inbox: nothing is created in any project folder
-  const relayTarget = path.join(env.root, 'relay-target');
-  fs.mkdirSync(relayTarget, { recursive: true });
-  const queued = enqueueMessage('tab-7', { from_terminal_id: 'tab-1', message: 'hello' }, { globalDir: env.globalDir });
-  assert.equal(path.dirname(queued.filePath), path.join(env.globalDir, 'state', 'inbox', 'tab-7'));
-  assert.deepEqual(fs.readdirSync(relayTarget), []);
-
-  env.cleanup();
 });

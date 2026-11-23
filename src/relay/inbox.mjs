@@ -22,11 +22,17 @@ import { resolveCortexGlobalDir, validateTerminalId } from '../revive/tracker.mj
  *     .lock                              held by the one consumer that is delivering or acknowledging right now
  *     .lock.recover                      exists only while a stale `.lock` is being replaced
  *     .broken/                           files that were not valid message JSON
+ *     .delivered/                        messages a hook has injected, kept for INBOX_DELIVERED_RETENTION_MS
  *
  * never inside a project folder, so a cloned repository cannot ship "messages from another tab".
  * Versions before this layout kept them in `<project>/.memory/state/inbox/<terminalId>/`; what is still there
  * is moved over once (`projectDir` option of `drainInbox` / `peekInbox` / `ackMessage`), and only for a project
  * the user approved and did not exclude.
+ *
+ * A hook does not delete the message it injects: the host may still discard the hook's output (a hook killed at
+ * its timeout). The message is moved to `.delivered/` with a `delivered_at` timestamp instead. It is never
+ * injected again, can be listed with `peekInbox(..., { includeDelivered: true })`, can be acknowledged
+ * (deleted) by id, and is removed by a later drain once the retention period has passed.
  */
 
 const TAKING_DIR_RE = /^\.taking-(\d+)-([a-zA-Z0-9_-]+)$/;
@@ -35,6 +41,11 @@ const SAFE_MSG_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
 export const INBOX_LOCK_FILE = '.lock';
 const LOCK_RECOVERY_FILE = '.lock.recover';
 const BROKEN_DIR = '.broken';
+/** Sub-directory of a terminal's inbox that holds the messages a hook has delivered (see the header). */
+export const INBOX_DELIVERED_DIR = '.delivered';
+
+/** How long a delivered message is kept before a later drain removes it. */
+export const INBOX_DELIVERED_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 // A lock file whose content cannot be read yet belongs to a consumer that is just writing it; after this
 // long it is treated as left behind by a process that died between creating and writing it.
@@ -166,6 +177,7 @@ function parseInboxText(rawText, fileName) {
   }
   const fallbackId = fileName.replace(/\.json$/, '');
   const announcedAt = typeof parsed.announced_at === 'string' ? parsed.announced_at.trim() : '';
+  const deliveredAt = typeof parsed.delivered_at === 'string' ? parsed.delivered_at.trim() : '';
   const record = {
     id: typeof parsed.id === 'string' && parsed.id.trim() ? parsed.id.trim() : fallbackId,
     from_terminal_id: typeof parsed.from_terminal_id === 'string' ? parsed.from_terminal_id : '',
@@ -179,6 +191,10 @@ function parseInboxText(rawText, fileName) {
     // budget). An announced message is never injected again; it waits for relay_inbox(peek) + ack.
     announced: Boolean(announcedAt),
     ...(announcedAt ? { announced_at: announcedAt } : {}),
+    // True once a hook has injected this message in full. A delivered message lives in `.delivered/`, is
+    // never injected again and is removed after INBOX_DELIVERED_RETENTION_MS or by an explicit ack.
+    delivered: Boolean(deliveredAt),
+    ...(deliveredAt ? { delivered_at: deliveredAt } : {}),
     ...(parsed.meta && typeof parsed.meta === 'object' ? { meta: parsed.meta } : {}),
   };
   return { record, raw: parsed };
@@ -187,7 +203,8 @@ function parseInboxText(rawText, fileName) {
 /**
  * Atomically enqueue a relay message into `<globalDir>/state/inbox/<terminalId>/`.
  * Stored fields: id, from_terminal_id, to_terminal_id, message, context_docs, created_at, optional meta;
- * `announced_at` is added later by a hook that announced the message instead of injecting it.
+ * `announced_at` is added later by a hook that announced the message instead of injecting it, `delivered_at`
+ * by a hook that injected it in full (the file then moves to `.delivered/`).
  */
 export function enqueueMessage(terminalId, msg = {}, { globalDir } = {}) {
   const cleanTerminalId = validateTerminalId(terminalId);
@@ -230,10 +247,131 @@ export function enqueueMessage(terminalId, msg = {}, { globalDir } = {}) {
 }
 
 /**
- * Number of messages waiting for a terminal. Looks at file names only: no lock, no migration, no parsing.
+ * Number of messages waiting for a terminal (not yet delivered by a hook). Looks at file names only: no lock,
+ * no migration, no parsing.
  */
 export function countPendingMessages(terminalId, { globalDir } = {}) {
   return listPendingJsonFiles(getTerminalInboxDir(terminalId, { globalDir })).length;
+}
+
+/**
+ * { pending, held, broken } for one terminal, from file names only (no lock, no parsing): messages waiting,
+ * delivered messages still kept (one whose retention has passed is counted until the next drain removes
+ * it), and quarantined files.
+ */
+export function countInboxMessages(terminalId, { globalDir } = {}) {
+  const targetDir = getTerminalInboxDir(terminalId, { globalDir });
+  let broken = 0;
+  try {
+    broken = fs.readdirSync(path.join(targetDir, BROKEN_DIR), { withFileTypes: true })
+      .filter((ent) => ent.isFile()).length;
+  } catch {
+    broken = 0;
+  }
+  return {
+    pending: listPendingJsonFiles(targetDir).length,
+    held: listPendingJsonFiles(path.join(targetDir, INBOX_DELIVERED_DIR)).length,
+    broken,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Delivered messages (kept for a while instead of being deleted)
+// ---------------------------------------------------------------------------------------------
+
+// When a held file was delivered: its `delivered_at`, else the time the file was written.
+function deliveredAtMs(filePath, record) {
+  const parsed = record?.delivered_at ? Date.parse(record.delivered_at) : NaN;
+  if (Number.isFinite(parsed)) return parsed;
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return NaN;
+  }
+}
+
+/**
+ * The delivered messages of an inbox directory that are still within the retention period, oldest first:
+ * [{ fileName, filePath, record }]. With `purge` the expired ones are deleted on the way. Held files are
+ * never rewritten and every step tolerates a file that another process removed meanwhile, so no lock is needed.
+ */
+function readHeldEntries(
+  targetDir,
+  { nowMs = Date.now(), retentionMs = INBOX_DELIVERED_RETENTION_MS, purge = false } = {},
+) {
+  const heldDir = path.join(targetDir, INBOX_DELIVERED_DIR);
+  const entries = [];
+  for (const fileName of listPendingJsonFiles(heldDir)) {
+    const filePath = path.join(heldDir, fileName);
+    let record = null;
+    try {
+      record = parseInboxText(fs.readFileSync(filePath, 'utf8'), fileName).record;
+    } catch (err) {
+      if (err && err.code === 'ENOENT') continue;
+      record = null; // not readable as a message: stays until its file is older than the retention period
+    }
+    const at = deliveredAtMs(filePath, record);
+    if (Number.isFinite(at) && nowMs - at > retentionMs) {
+      if (purge) removeQuietly(filePath);
+      continue;
+    }
+    if (!record) continue;
+    entries.push({
+      fileName,
+      filePath,
+      record: {
+        ...record,
+        delivered: true,
+        delivered_at: record.delivered_at || (Number.isFinite(at) ? new Date(at).toISOString() : ''),
+      },
+    });
+  }
+  if (purge && entries.length === 0) {
+    try {
+      fs.rmdirSync(heldDir);
+    } catch {
+      // missing, or something is still in it
+    }
+  }
+  return entries;
+}
+
+// Move one pending message into `.delivered/` with its delivery time. Returns true when the pending file is
+// gone afterwards. If the held copy cannot be written the message is deleted all the same, as before this
+// mechanism existed: it was injected, and keeping it pending would inject it again on every prompt.
+function holdDeliveredEntry(targetDir, entry, deliveredAt) {
+  const heldDir = path.join(targetDir, INBOX_DELIVERED_DIR);
+  try {
+    fs.mkdirSync(heldDir, { recursive: true });
+    let heldPath = assertInsideDir(heldDir, entry.fileName);
+    if (fs.existsSync(heldPath)) {
+      const stem = entry.fileName.replace(/\.json$/, '');
+      heldPath = assertInsideDir(heldDir, `${stem}-${crypto.randomBytes(3).toString('hex')}.json`);
+    }
+    atomicWriteJson(heldPath, { ...entry.raw, delivered_at: deliveredAt });
+  } catch {
+    // fall through to the delete
+  }
+  return removeQuietly(entry.filePath);
+}
+
+/**
+ * Delete delivered messages of a terminal before their retention ends: all of them, or only the one whose
+ * id (or file stem) is `messageId`. Returns the ids of the messages deleted.
+ */
+export function deleteHeldMessages(terminalId, { globalDir, messageId = '' } = {}) {
+  const targetDir = getTerminalInboxDir(terminalId, { globalDir });
+  const deleted = [];
+  for (const held of readHeldEntries(targetDir, { retentionMs: Infinity })) {
+    if (messageId && held.record.id !== messageId && held.fileName.replace(/\.json$/, '') !== messageId) continue;
+    try {
+      fs.unlinkSync(held.filePath);
+      deleted.push(held.record.id);
+    } catch {
+      // already gone
+    }
+  }
+  return deleted;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -541,6 +679,9 @@ function emptyDrain(extra = {}) {
     markAnnounced() {
       return 0;
     },
+    markDelivered() {
+      return 0;
+    },
     ack() {
       return { acked: 0, kept: 0 };
     },
@@ -588,11 +729,16 @@ function readPendingEntries(targetDir, notices) {
  *     now and every message stays for the next attempt.
  *  2) With `projectDir`: moves what an approved, enabled project still has in its old inbox location.
  *  3) Reads the pending files in place (oldest first) and quarantines corrupt JSON into .broken/.
- *  4) Returns { messages, notices, busy, markAnnounced(ids), ack(onlyIds), release() }, still holding the lock.
+ *  4) Returns { messages, notices, busy, markAnnounced(ids), markDelivered(ids), ack(onlyIds), release() },
+ *     still holding the lock.
  *     `markAnnounced(ids)` records `announced_at` on those messages (they stay in the inbox),
- *     `ack(onlyIds)` deletes the messages with those ids (all of them when called without argument) and
- *     releases the lock; messages that were not acknowledged stay. `release()` only releases the lock.
+ *     `markDelivered(ids)` moves those messages to `.delivered/` with a `delivered_at` timestamp (what a hook
+ *     does with the messages it injected; they are kept for `retentionMs` and never returned here again),
+ *     `ack(onlyIds)` deletes the pending messages with those ids (all of them when called without argument)
+ *     and releases the lock; messages that were not acknowledged stay. `release()` only releases the lock.
  *     With no pending message the lock is already released when this returns.
+ * Every call first removes the delivered messages whose retention period (`retentionMs`, default
+ * INBOX_DELIVERED_RETENTION_MS) has passed.
  * Message files are never renamed to claim them, so a consumer that dies while holding the lock leaves every
  * message in place; its lock is replaced once its process is gone or the lock is older than `staleMs`.
  * Messages already announced are included (`announced: true`); hooks skip them, `ack()` removes them.
@@ -606,11 +752,15 @@ export function drainInbox(
     isPidAlive = defaultIsPidAlive,
     nowMs = Date.now(),
     lockWaitMs = 0,
+    retentionMs = INBOX_DELIVERED_RETENTION_MS,
   } = {},
 ) {
   const cleanId = validateTerminalId(terminalId);
   const targetDir = getTerminalInboxDir(cleanId, { globalDir });
   const legacyDir = findLegacyInboxDir(projectDir, cleanId, { globalDir });
+
+  // Delivered messages past their retention go away here, whether or not anything is pending.
+  readHeldEntries(targetDir, { nowMs, retentionMs, purge: true });
 
   // Nothing waiting: no lock, and no directory is created.
   if (!legacyDir && listPendingJsonFiles(targetDir).length === 0) {
@@ -660,6 +810,20 @@ export function drainInbox(
     return marked;
   };
 
+  const markDelivered = (ids, deliveredAt = new Date().toISOString()) => {
+    if (finished || !Array.isArray(ids) || ids.length === 0) return 0;
+    const idSet = new Set(ids.map((id) => String(id)));
+    let moved = 0;
+    for (const entry of entries) {
+      if (entry.gone || !idSet.has(entry.record.id)) continue;
+      if (holdDeliveredEntry(targetDir, entry, deliveredAt)) {
+        entry.gone = true;
+        moved++;
+      }
+    }
+    return moved;
+  };
+
   const ack = (onlyIds) => {
     if (finished) return { acked: 0, kept: 0, alreadyAcked: true };
     finished = true;
@@ -668,6 +832,7 @@ export function drainInbox(
     let kept = 0;
     try {
       for (const entry of entries) {
+        if (entry.gone) continue; // moved to .delivered/ by markDelivered
         if (idSet && !idSet.has(entry.record.id)) {
           kept++;
           continue;
@@ -696,6 +861,7 @@ export function drainInbox(
     notices,
     busy: false,
     markAnnounced,
+    markDelivered,
     ack,
     release,
   };
@@ -703,7 +869,11 @@ export function drainInbox(
 
 /**
  * Non-destructively list a terminal's pending messages with their full bodies; each has `announced`
- * (true once a hook announced it instead of injecting it) and, then, `announced_at`.
+ * (true once a hook announced it instead of injecting it) and, then, `announced_at`, and `delivered: false`.
+ * With `includeDelivered` the messages a hook already injected and that are still kept follow them
+ * (`delivered: true`, `delivered_at`): the way to get back a message whose injection the host discarded.
+ * Returns { terminalId, messages, count, pendingCount, heldCount, notices }: `count` is the number of
+ * messages listed, `heldCount` the number of delivered messages still kept (listed or not).
  * With `projectDir` it also moves what an approved, enabled project still has in its old inbox location
  * (skipped when another consumer holds the lock at that moment).
  */
@@ -715,6 +885,8 @@ export function peekInbox(
     staleMs = DEFAULT_INBOX_STALE_MS,
     isPidAlive = defaultIsPidAlive,
     nowMs = Date.now(),
+    includeDelivered = false,
+    retentionMs = INBOX_DELIVERED_RETENTION_MS,
   } = {},
 ) {
   const cleanId = validateTerminalId(terminalId);
@@ -745,18 +917,25 @@ export function peekInbox(
     }
   }
 
+  const pendingCount = messages.length;
+  const held = readHeldEntries(targetDir, { nowMs, retentionMs });
+  if (includeDelivered) messages.push(...held.map((entry) => entry.record));
+
   return {
     terminalId: cleanId,
     messages,
     count: messages.length,
+    pendingCount,
+    heldCount: held.length,
     notices,
   };
 }
 
 /**
- * Acknowledge and delete one pending message by messageId (or file stem), under the terminal's lock.
- * Returns { acked, terminalId, messageId, fileName? }; with `busy: true` another consumer holds the lock
- * and nothing was changed (call again).
+ * Acknowledge and delete one message by messageId (or file stem): a pending one (under the terminal's lock),
+ * or a delivered one that is still kept (`delivered: true` in the result).
+ * Returns { acked, terminalId, messageId, fileName?, delivered? }; with `busy: true` another consumer holds
+ * the lock and nothing was changed (call again).
  */
 export function ackMessage(
   terminalId,
@@ -779,8 +958,11 @@ export function ackMessage(
   const targetDir = getTerminalInboxDir(cleanTerminalId, { globalDir });
   const legacyDir = findLegacyInboxDir(projectDir, cleanTerminalId, { globalDir });
   const notFound = { acked: false, terminalId: cleanTerminalId, messageId: cleanMsgId };
+  const ackHeld = () => (deleteHeldMessages(cleanTerminalId, { globalDir, messageId: cleanMsgId }).length > 0
+    ? { acked: true, terminalId: cleanTerminalId, messageId: cleanMsgId, delivered: true }
+    : notFound);
   if (!legacyDir && listPendingJsonFiles(targetDir).length === 0) {
-    return notFound;
+    return ackHeld();
   }
 
   fs.mkdirSync(targetDir, { recursive: true });
@@ -807,7 +989,7 @@ export function ackMessage(
         return { acked: true, terminalId: cleanTerminalId, messageId: cleanMsgId, fileName };
       }
     }
-    return notFound;
+    return ackHeld();
   } finally {
     lock.release();
   }
@@ -975,8 +1157,9 @@ export function formatInboxForHook(messages, options = {}) {
 
 /**
  * What a hook does with a terminal's inbox, as one locked sequence: take the pending messages, format the
- * ones not announced before into at most `maxChars` characters, delete the ones injected in full, record the
- * over-long ones as announced, and release the lock.
+ * ones not announced before into at most `maxChars` characters, mark the ones injected in full as delivered
+ * (they move to `.delivered/` and are kept for `retentionMs`, so a message survives a host that discards the
+ * hook's output), record the over-long ones as announced, and release the lock.
  * Returns { text, deliveredIds, announcedIds, waitingIds, busy, notices }:
  *   text ''      - nothing to inject (no new message, no room, or `busy`: another consumer is delivering
  *                  this terminal's messages right now; they stay for the next prompt).
@@ -995,9 +1178,10 @@ export function deliverInboxForHook(
     staleMs = DEFAULT_INBOX_STALE_MS,
     isPidAlive = defaultIsPidAlive,
     nowMs = Date.now(),
+    retentionMs = INBOX_DELIVERED_RETENTION_MS,
   } = {},
 ) {
-  const drained = drainInbox(terminalId, { globalDir, projectDir, staleMs, isPidAlive, nowMs });
+  const drained = drainInbox(terminalId, { globalDir, projectDir, staleMs, isPidAlive, nowMs, retentionMs });
   const result = {
     text: '',
     deliveredIds: [],
@@ -1013,7 +1197,7 @@ export function deliverInboxForHook(
     const detailed = formatInboxForHookDetailed(fresh, { maxChars, fullBlockChars });
     if (detailed.text) {
       drained.markAnnounced(detailed.announcedIds);
-      drained.ack(detailed.includedIds);
+      drained.markDelivered(detailed.includedIds, new Date(nowMs).toISOString());
       const delivered = new Set(detailed.includedIds);
       result.text = detailed.text;
       result.deliveredIds = detailed.includedIds;

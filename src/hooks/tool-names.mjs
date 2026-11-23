@@ -1,10 +1,14 @@
 /**
  * Recognition of this MCP server's tools by name, shared by the hook handlers and the installer.
  *
- * Claude Code names an MCP tool `mcp__<server>__<tool>`. The server is registered as `cortex` today and
- * will be registered as `herdr-cortex`; both names are accepted everywhere through the helpers below.
+ * Claude Code names an MCP tool `mcp__<server>__<tool>`. The server is registered as `herdr-cortex`
+ * (`MCP_SERVER_NAME`); installations made before the rename registered it as `cortex`. The hooks recognize
+ * the tools under both names (the helpers below), so a setup that has not been re-installed yet keeps working;
+ * only the new name is registered by the installer.
  */
-export const CORTEX_MCP_SERVER_NAMES = Object.freeze(['herdr-cortex', 'cortex']);
+export const MCP_SERVER_NAME = 'herdr-cortex';
+export const LEGACY_MCP_SERVER_NAME = 'cortex';
+export const CORTEX_MCP_SERVER_NAMES = Object.freeze([MCP_SERVER_NAME, LEGACY_MCP_SERVER_NAME]);
 
 const CORTEX_TOOL_PREFIX_RE = /^(?:mcp__)?(?:herdr-cortex|cortex)__/i;
 
@@ -50,11 +54,11 @@ export const FILE_WRITE_TOOL_NAMES = Object.freeze(['Write', 'Edit', 'MultiEdit'
 export const SHELL_TOOL_NAMES = Object.freeze(['Bash', 'PowerShell']);
 
 /**
- * Matcher the installer registers for the Claude Code PreToolUse hook: this server's tools under both
- * server names, plus the file and shell tools the subagent `.memory/` guard inspects.
+ * Matcher the installer registers for the Claude Code PreToolUse hook: this server's tools (under the name
+ * the installer registers), plus the file and shell tools the subagent `.memory/` guard inspects.
  */
 export const CLAUDE_PRE_TOOL_USE_MATCHER = [
-  ...CORTEX_MCP_SERVER_NAMES.map((name) => `mcp__${name}__.*`),
+  `mcp__${MCP_SERVER_NAME}__.*`,
   ...FILE_WRITE_TOOL_NAMES,
   ...SHELL_TOOL_NAMES,
 ].join('|');

@@ -2,6 +2,13 @@
 .SYNOPSIS
     One-click batch reviver for Antigravity (agy) and Claude Code (claude) terminals in Herdr-Core (hc).
     Reads ~/.herdr-cortex/sessions/ first with automatic fallback to ~/.herdr-revive/sessions/.
+
+    For every live tab that is a bare shell:
+      - a saved session id for the tab            -> claude --resume <id> / agy --conversation <id>
+      - ... saved in another folder than the tab's -> the tab changes to the saved folder first
+        (skipped when that folder no longer exists)
+      - no saved id, the tab title names the agent -> claude -c / agy -c
+        (skipped when another live tab in the same folder is the same agent: pick with `claude --resume`)
 .EXAMPLE
     .\revive-agents.ps1
     .\revive-agents.ps1 -DryRun
@@ -14,6 +21,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "revive-common.ps1")
 
 $EffectiveHome = if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_TEST_HOME)) {
     $env:HERDR_CORTEX_TEST_HOME
@@ -29,173 +38,8 @@ $CortexDir = if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_HOME)) {
     Join-Path $EffectiveHome ".herdr-cortex"
 }
 
-$CortexSessionsDir = Join-Path $CortexDir "sessions"
-$LegacySessionsDir = Join-Path $EffectiveHome ".herdr-revive\sessions"
-$CortexConfigPath = Join-Path $CortexDir "config.json"
-$LegacyConfigPath = Join-Path $EffectiveHome ".herdr-revive\config.json"
-$BareShells = @("powershell.exe", "pwsh.exe", "cmd.exe", "bash.exe", "nu.exe", "powershell", "pwsh", "cmd")
-$ReservedWinNames = @("con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9")
-
-function Test-ValidTerminalId {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-    $trimmed = $Value.Trim()
-    if ($trimmed -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$') { return $false }
-    if ($ReservedWinNames -contains $trimmed.ToLowerInvariant()) { return $false }
-    return $true
-}
-
-function Test-ValidSessionId {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-    $trimmed = $Value.Trim()
-    if ($trimmed -notmatch '^[a-zA-Z0-9._-]{1,128}$') { return $false }
-    if ($trimmed.Contains("..")) { return $false }
-    return $true
-}
-
-function Normalize-PathKey {
-    param([string]$PathValue)
-    if ([string]::IsNullOrWhiteSpace($PathValue)) { return "" }
-    return $PathValue.Trim().TrimEnd('\', '/').ToLowerInvariant()
-}
-
-function Get-TerminalMeta {
-    param($Terminal)
-
-    $addr = if ($Terminal.address) { [string]$Terminal.address } elseif ($Terminal.id) { [string]$Terminal.id } else { "" }
-    $agent = if ($Terminal.foreground -and $Terminal.foreground.name) {
-        [string]$Terminal.foreground.name
-    } elseif ($Terminal.agent) {
-        [string]$Terminal.agent
-    } else {
-        ""
-    }
-    $cwd = if ($Terminal.foreground -and $Terminal.foreground.cwd) {
-        [string]$Terminal.foreground.cwd
-    } elseif ($Terminal.cwd) {
-        [string]$Terminal.cwd
-    } else {
-        ""
-    }
-    $where = if ($Terminal.labels -and $Terminal.labels.where) {
-        [string]$Terminal.labels.where
-    } elseif ($Terminal.where) {
-        [string]$Terminal.where
-    } else {
-        ""
-    }
-
-    return [PSCustomObject]@{
-        Address = $addr.Trim()
-        State   = [string]$Terminal.state
-        Agent   = $agent.Trim()
-        Cwd     = $cwd.Trim()
-        Where   = $where.Trim()
-    }
-}
-
-function Get-ReviveConfig {
-    $defaults = @{
-        agyExtraArgs    = @()
-        claudeExtraArgs = @()
-    }
-    foreach ($cfgPath in @($CortexConfigPath, $LegacyConfigPath)) {
-        if (Test-Path $cfgPath) {
-            try {
-                $parsed = Get-Content -Raw -Path $cfgPath -Encoding UTF8 | ConvertFrom-Json
-                if ($parsed.agyExtraArgs -and $defaults.agyExtraArgs.Count -eq 0) { $defaults.agyExtraArgs = @($parsed.agyExtraArgs) }
-                if ($parsed.claudeExtraArgs -and $defaults.claudeExtraArgs.Count -eq 0) { $defaults.claudeExtraArgs = @($parsed.claudeExtraArgs) }
-            } catch {
-                # Ignore invalid config and use defaults
-            }
-        }
-    }
-    return $defaults
-}
-
-function Get-SavedSession {
-    param([string]$TerminalId)
-    if (-not (Test-ValidTerminalId $TerminalId)) { return $null }
-    $cleanId = $TerminalId.Trim()
-    foreach ($dir in @($CortexSessionsDir, $LegacySessionsDir)) {
-        $file = Join-Path $dir "$cleanId.json"
-        if (Test-Path $file) {
-            try {
-                return Get-Content -Raw -Path $file -Encoding UTF8 | ConvertFrom-Json
-            } catch {
-                # Fall through to next candidate
-            }
-        }
-    }
-    return $null
-}
-
-function Resolve-RevivePlan {
-    param(
-        $Meta,
-        $Config
-    )
-
-    $addr = $Meta.Address
-    $cwd = $Meta.Cwd
-    $where = $Meta.Where
-    $saved = Get-SavedSession -TerminalId $addr
-
-    $extraAgy = if ($Config.agyExtraArgs.Count -gt 0) { " " + ($Config.agyExtraArgs -join " ") } else { "" }
-    $extraClaude = if ($Config.claudeExtraArgs.Count -gt 0) { " " + ($Config.claudeExtraArgs -join " ") } else { "" }
-
-    # 1. Exact per-terminal session ID recorded by hooks (strictly validated against command injection)
-    if ($saved -and $saved.sessionId) {
-        $sid = ([string]$saved.sessionId).Trim()
-        if (Test-ValidSessionId $sid) {
-            $savedCwdNorm = Normalize-PathKey $saved.cwd
-            $liveCwdNorm = Normalize-PathKey $cwd
-            $cwdMatches = ([string]::IsNullOrEmpty($savedCwdNorm)) -or ($savedCwdNorm -eq $liveCwdNorm)
-
-            if ($cwdMatches) {
-                if ($saved.agent -eq "antigravity") {
-                    return [PSCustomObject]@{
-                        Agent     = "antigravity"
-                        Source    = "session-id"
-                        SessionId = $sid
-                        Command   = "agy --conversation $sid$extraAgy"
-                    }
-                }
-                if ($saved.agent -eq "claude") {
-                    return [PSCustomObject]@{
-                        Agent     = "claude"
-                        Source    = "session-id"
-                        SessionId = $sid
-                        Command   = "claude --resume $sid$extraClaude"
-                    }
-                }
-            }
-        } else {
-            Write-Warning "[SKIP]   $addr -> ignored invalid saved sessionId"
-        }
-    }
-
-    # 2. Fallback to Herdr tab title ("... / Antigravity" or "... / Claude")
-    if ($where -match '(?i)/\s*Antigravity\b') {
-        return [PSCustomObject]@{
-            Agent     = "antigravity"
-            Source    = "tab-title"
-            SessionId = $null
-            Command   = "agy -c$extraAgy"
-        }
-    }
-    if ($where -match '(?i)/\s*Claude(\s+Code)?\b') {
-        return [PSCustomObject]@{
-            Agent     = "claude"
-            Source    = "tab-title"
-            SessionId = $null
-            Command   = "claude -c$extraClaude"
-        }
-    }
-
-    return $null
-}
+$SessionDirs = @((Join-Path $CortexDir "sessions"), (Join-Path $EffectiveHome ".herdr-revive\sessions"))
+$ConfigPaths = @((Join-Path $CortexDir "config.json"), (Join-Path $EffectiveHome ".herdr-revive\config.json"))
 
 $hcCmd = Get-Command hc -ErrorAction SilentlyContinue
 if (-not $hcCmd) {
@@ -230,56 +74,64 @@ try {
         exit 1
     }
     $terminals = if ($lsData -is [System.Array]) { @($lsData) } elseif ($lsData.terminals) { @($lsData.terminals) } else { @() }
-    $config = Get-ReviveConfig
+    $metas = @($terminals | ForEach-Object { Get-HerdrTerminalMeta $_ })
+    $config = Read-HerdrReviveConfig -ConfigPaths $ConfigPaths
 
     if ($Status) {
         Write-Host "=== Herdr Live Terminals & Saved Sessions ===" -ForegroundColor Cyan
-        foreach ($t in $terminals) {
-            $meta = Get-TerminalMeta $t
-            $saved = Get-SavedSession -TerminalId $meta.Address
+        foreach ($meta in $metas) {
+            $saved = Read-HerdrSavedSession -TerminalId $meta.Address -SessionDirs $SessionDirs
             $savedInfo = if ($saved) { "$($saved.agent):$($saved.sessionId)" } else { "(none)" }
-            $isShell = $BareShells -contains $meta.Agent.ToLowerInvariant()
-            $tag = if ($isShell) { "SHELL" } else { "ACTIVE" }
+            $tag = if (Test-HerdrBareShell $meta.Agent) { "SHELL" } else { "ACTIVE" }
             Write-Host ("[{0,-6}] {1,-5} agent={2,-15} where={3,-32} saved={4}" -f $tag, $meta.Address, $meta.Agent, $meta.Where, $savedInfo)
         }
         exit 0
     }
 
     $revivedCount = 0
+    $activeCount = 0
     $skippedCount = 0
 
-    foreach ($t in $terminals) {
-        $meta = Get-TerminalMeta $t
-        if ($meta.State -ne "live") { continue }
-        if (-not (Test-ValidTerminalId $meta.Address)) {
-            Write-Warning "[SKIP]   invalid terminalId '$($meta.Address)'"
-            continue
+    $plans = @(Resolve-HerdrRevivePlans -Metas $metas -Config $config -SessionDirs $SessionDirs)
+    foreach ($plan in $plans) {
+        $label = "$($plan.Address) ($($plan.Where))"
+        if ($plan.Warning) {
+            Write-Host "[NOTE]   $($plan.Address) -> $($plan.Warning)" -ForegroundColor Yellow
         }
 
-        $agentLower = $meta.Agent.ToLowerInvariant()
-        if ($BareShells -notcontains $agentLower) {
-            Write-Host "[SKIP]   $($meta.Address) ($($meta.Where)) -> already running $($meta.Agent)" -ForegroundColor DarkGray
+        if ($plan.Action -eq "active") {
+            Write-Host "[SKIP]   $label -> already running $($plan.ShellName)" -ForegroundColor DarkGray
+            $activeCount++
+            continue
+        }
+        if ($plan.Action -eq "ignore") {
+            Write-Host "[IGNORE] $label -> regular shell" -ForegroundColor DarkGray
+            continue
+        }
+        if ($plan.Action -eq "skip") {
+            Write-Host "[SKIP]   $label -> $($plan.Reason)" -ForegroundColor Yellow
             $skippedCount++
             continue
         }
 
-        $plan = Resolve-RevivePlan -Meta $meta -Config $config
-        if (-not $plan) {
-            Write-Host "[IGNORE] $($meta.Address) ($($meta.Where)) -> regular shell" -ForegroundColor DarkGray
-            continue
-        }
-
+        $source = if ($plan.ChangeTo) { "$($plan.Source), saved folder" } else { $plan.Source }
         if ($DryRun) {
-            Write-Host "[DRYRUN] $($meta.Address) ($($meta.Where)) [$($plan.Source)] -> $($plan.Command)" -ForegroundColor Yellow
+            Write-Host "[DRYRUN] $label [$source] -> $($plan.Command)" -ForegroundColor Yellow
             $revivedCount++
             continue
         }
 
-        Write-Host "[REVIVE] $($meta.Address) ($($meta.Where)) [$($plan.Source)] -> $($plan.Command)" -ForegroundColor Green
+        Write-Host "[REVIVE] $label [$source] -> $($plan.Command)" -ForegroundColor Green
         $ErrorActionPreference = "Continue"
-        & hc send $meta.Address $plan.Command 2>$null | Out-Null
+        & hc send $plan.Address $plan.Command 2>$null | Out-Null
+        $sendExit = $LASTEXITCODE
         $ErrorActionPreference = $prevEap
-        $revivedCount++
+        if ($sendExit -ne 0) {
+            Write-Host "[FAILED] $($plan.Address) -> hc send exited with code $sendExit; nothing was typed into the tab" -ForegroundColor Red
+            $skippedCount++
+        } else {
+            $revivedCount++
+        }
 
         if ($DelayMs -gt 0) {
             Start-Sleep -Milliseconds $DelayMs
@@ -288,9 +140,9 @@ try {
 
     Write-Host ""
     if ($DryRun) {
-        Write-Host "Dry run complete: $revivedCount terminal(s) would be revived, $skippedCount already active." -ForegroundColor Cyan
+        Write-Host "Dry run complete: $revivedCount terminal(s) would be revived, $activeCount already active, $skippedCount skipped." -ForegroundColor Cyan
     } else {
-        Write-Host "Done: revived $revivedCount terminal(s), $skippedCount already active." -ForegroundColor Cyan
+        Write-Host "Done: revived $revivedCount terminal(s), $activeCount already active, $skippedCount skipped." -ForegroundColor Cyan
     }
 } finally {
     $ErrorActionPreference = $prevEap

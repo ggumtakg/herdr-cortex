@@ -1,7 +1,14 @@
 import path from 'node:path';
 import { isProjectEnabled, loadConfig, projectPathKey } from '../core/config.mjs';
 import { createHcClient, parseTerminalAddress, sanitizeSingleLineTrigger } from './hc.mjs';
-import { ackMessage, countPendingMessages, drainInbox, enqueueMessage, peekInbox } from './inbox.mjs';
+import {
+  ackMessage,
+  countInboxMessages,
+  deleteHeldMessages,
+  drainInbox,
+  enqueueMessage,
+  peekInbox,
+} from './inbox.mjs';
 import { isValidTerminalId, listSavedSessions, readSavedSession, validateTerminalId } from '../revive/tracker.mjs';
 import { isSubagentCaller } from '../mcp/tools.mjs';
 
@@ -103,7 +110,8 @@ export function createRelayTools({
   const relayTabsTool = {
     name: 'relay_tabs',
     description: 'List live Herdr terminals combined with saved revive sessions and project memory session mapping. '
-      + 'activity is idle | working | blocked | error | unknown | shell | not_live; tabs on another machine are listed with remote: true and cannot receive relay messages.',
+      + 'activity is idle | working | blocked | error | unknown | shell | not_live; tabs on another machine are listed with remote: true and cannot receive relay messages. '
+      + 'pendingInboxCount = messages waiting to be injected, heldInboxCount = messages already injected and kept for 24 hours.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -136,12 +144,17 @@ export function createRelayTools({
 
           if (args.only_same_project && !sameProject) continue;
 
+          // pending: waiting to be injected; held: already injected by a hook and kept for a while
           let pendingInboxCount = 0;
+          let heldInboxCount = 0;
           if (relayCapable) {
             try {
-              pendingInboxCount = countPendingMessages(tid, { globalDir });
+              const counts = countInboxMessages(tid, { globalDir });
+              pendingInboxCount = counts.pending;
+              heldInboxCount = counts.held;
             } catch {
               pendingInboxCount = 0;
+              heldInboxCount = 0;
             }
           }
 
@@ -163,6 +176,7 @@ export function createRelayTools({
             cwd: tabCwd,
             sameProject,
             pendingInboxCount,
+            heldInboxCount,
             savedSession: saved
               ? {
                   agent: saved.agent,
@@ -308,7 +322,9 @@ export function createRelayTools({
           wakeReason = sentReason;
           triggerSent = sendRes.sent;
         } else {
-          wakeReason = 'hc_send_failed';
+          // hc refuses to type into a tab that is waiting on a dialog (typing would answer the dialog);
+          // that is the tab's state, not a failure of hc.
+          wakeReason = sendRes.code === 'HC_TARGET_BLOCKED' ? 'target_blocked' : 'hc_send_failed';
           wakeError = sendRes.error;
         }
       };
@@ -354,12 +370,18 @@ export function createRelayTools({
 
   const relayInboxTool = {
     name: 'relay_inbox',
-    description: 'Inspect (peek: full message bodies, announced flag) or acknowledge (ack) incoming Herdr relay messages for the current HC_TERMINAL_ID.',
+    description: 'Inspect (peek: full message bodies, announced/delivered flags) or acknowledge (ack) incoming Herdr relay messages for the current HC_TERMINAL_ID. '
+      + 'A message a hook injected is kept for 24 hours as delivered; it is listed only with include_delivered=true.',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['peek', 'ack'], default: 'peek' },
-        message_id: { type: 'string', description: 'Message ID to acknowledge (or "all" to acknowledge all pending messages) when action="ack"' },
+        message_id: { type: 'string', description: 'Message ID to acknowledge (a pending or a delivered message), or "all" to acknowledge all pending messages, when action="ack"' },
+        include_delivered: {
+          type: 'boolean',
+          default: false,
+          description: 'peek: also list the messages a hook already injected and that are still kept (delivered: true). ack with message_id="all": also delete those.',
+        },
         terminal_id: { type: 'string', description: 'Optional terminal ID override (defaults to HC_TERMINAL_ID)' },
       },
     },
@@ -403,8 +425,10 @@ export function createRelayTools({
       // per-project location; the messages themselves are in the global store.
       const inboxOptions = { globalDir, projectDir: resolvedProjectDir };
 
+      const includeDelivered = args.include_delivered === true;
+
       if (action === 'peek') {
-        return peekInbox(terminalId, inboxOptions);
+        return peekInbox(terminalId, { ...inboxOptions, includeDelivered });
       }
 
       if (action === 'ack') {
@@ -422,11 +446,14 @@ export function createRelayTools({
         if (msgId === 'all') {
           const drained = drainInbox(terminalId, { ...inboxOptions, lockWaitMs: ACK_LOCK_WAIT_MS });
           const ackRes = drained.ack();
+          // Delivered messages are deleted only on request; without it they stay until their retention ends.
+          const heldIds = includeDelivered && !drained.busy ? deleteHeldMessages(terminalId, { globalDir }) : [];
           return {
-            acked: ackRes.acked > 0,
-            ackedCount: ackRes.acked,
+            acked: ackRes.acked + heldIds.length > 0,
+            ackedCount: ackRes.acked + heldIds.length,
             terminalId,
-            messageIds: drained.messages.map((m) => m.id),
+            messageIds: [...drained.messages.map((m) => m.id), ...heldIds],
+            ...(includeDelivered ? { deliveredAckedCount: heldIds.length } : {}),
             notices: drained.notices,
             ...(drained.busy ? { busy: true, message: busyMessage } : {}),
           };

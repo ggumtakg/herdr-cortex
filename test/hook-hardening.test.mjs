@@ -60,7 +60,7 @@ import {
   extractRecentTurns,
   stripSystemReminders,
 } from '../src/hooks/recent-turns.mjs';
-import { CLAUDE_SESSION_END_TIMEOUT_SECONDS, installCortex, uninstallCortex } from '../src/hooks/installer.mjs';
+import { CLAUDE_SESSION_END_TIMEOUT_SECONDS, installCortex, isOwnHook, uninstallCortex } from '../src/hooks/installer.mjs';
 import { createServerRuntime } from '../src/mcp/server.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-hardening-') {
@@ -731,13 +731,14 @@ test('/clear: the tab record still identifies the previous session exactly, and 
     const hooks = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).hooks;
     assert.deepEqual(Object.keys(hooks).sort(), ['PreCompact', 'PreToolUse', 'SessionEnd', 'SessionStart', 'UserPromptSubmit']);
     assert.equal(hooks.SessionEnd.length, 2);
-    const ours = hooks.SessionEnd.filter((entry) => entry.hooks.some((h) => h.command.includes('herdr-cortex')));
+    const ours = hooks.SessionEnd.filter((entry) => entry.hooks.some((h) => isOwnHook(h)));
     assert.equal(ours.length, 1);
     assert.deepEqual(ours[0], {
       matcher: '',
       hooks: [{
         type: 'command',
-        command: `node --no-warnings "${path.join(env.root, 'src', 'hooks', 'claude.mjs')}" session-end --id herdr-cortex`,
+        command: process.execPath,
+        args: ['--no-warnings', path.join(env.root, 'src', 'hooks', 'claude.mjs'), 'session-end', '--id', 'herdr-cortex'],
         timeout: CLAUDE_SESSION_END_TIMEOUT_SECONDS,
       }],
     });
