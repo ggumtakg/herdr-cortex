@@ -1,5 +1,5 @@
 import { chunkMarkdown, splitLongText } from '../core/frontmatter.mjs';
-import { ensureVectorTable, readIndexMeta, syncFromDisk, withTransaction } from '../core/db.mjs';
+import { ensureVectorTable, readIndexMeta, syncFromDiskShared, withTransaction } from '../core/db.mjs';
 import { classifyEmbeddingError } from './breaker.mjs';
 import { MAX_EMBED_ATTEMPTS, MAX_EMBED_SERVICE_FAILURES } from './failed.mjs';
 import { resolveEmbeddingProvider, resolveTierEmbeddingProviders } from './resolve.mjs';
@@ -140,6 +140,10 @@ const isUsableProvider = (candidate) => Boolean(candidate) && typeof candidate.e
  *     MAX_EMBED_SERVICE_FAILURES of them it is no longer retried either (it is then the likely cause).
  *   - auth (HTTP 401/403): not counted against any document. The run stops with `reason: 'auth_failed'`.
  * While `breaker` is open nothing is attempted at all (`reason: 'circuit_open'`).
+ * Before a tier's waiting documents are read, the tier's index is brought up to date with the yielding,
+ * shared sync (`syncFromDiskShared`): the event loop gets a turn after every file, and a sync that is already
+ * running on the connection (the MCP server's index catch-up) is joined instead of being repeated. A run
+ * therefore never blocks a tool call for longer than one file.
  * `circuitBroken` is true whenever the run was stopped or skipped for one of these reasons.
  * `more` is true when a tier still had a full batch of candidates, i.e. another run may find more work.
  */
@@ -218,7 +222,7 @@ export async function processPendingEmbeddings(
     if (!tier) continue;
     tierResults[s] = tierResult;
 
-    syncFromDisk(tier.db, tier.dir);
+    await syncFromDiskShared(tier.db, tier.dir);
 
     if (!tier.vecAvailable) {
       continue;

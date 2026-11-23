@@ -499,7 +499,10 @@ export async function searchMemory(store, params = {}) {
       ? store.getTierIfExists(s)
       : store.getTier(s);
     if (!tier) continue;
-    syncFromDisk(tier.db, tier.dir);
+    // Through the store, so its sync limits apply (a tool call of the MCP server indexes what fits its
+    // budget and leaves the rest to the background); a store without them indexes everything that changed.
+    if (typeof store.syncTier === 'function') store.syncTier(tier);
+    else syncFromDisk(tier.db, tier.dir);
     const vecRowCount = trimmedQuery ? getVecRowCount(tier.db, tier.vecAvailable) : 0;
     const meta = vecRowCount > 0 ? readIndexMeta(tier.db) : null;
     activeTiers.push({ scope: s, tier, vecRowCount, meta });

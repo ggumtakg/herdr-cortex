@@ -41,7 +41,7 @@ import {
 } from '../src/relay/inbox.mjs';
 import { handleClaudeSessionStart, handleClaudeUserPrompt } from '../src/hooks/claude.mjs';
 import { handleAntigravityPreInvocation } from '../src/hooks/antigravity.mjs';
-import { approveProject } from '../src/core/trust.mjs';
+import { approveAsUser } from './support/approve.mjs';
 import { UNTRUSTED_MEMORY_PREAMBLE } from '../src/core/budget.mjs';
 
 // Safety net: anything in this file that forgets to pass its temp `globalDir` (or the legacy revive home)
@@ -72,7 +72,7 @@ function makeTempEnv(prefix = 'herdr-cortex-relay-') {
   for (const dir of [projectDir, globalDir, homeDir, promptsDir]) fs.mkdirSync(dir, { recursive: true });
   atomicWriteText(path.join(promptsDir, 'HEAD_CORE.md'), '# HEAD_CORE\n\n- Delegate high-resolution work.\n');
   // The project folder of every test environment is approved, as a user would do with cortex-trust.
-  approveProject(projectDir, { globalDir });
+  approveAsUser(projectDir, { globalDir });
   return {
     root,
     projectDir,
@@ -854,7 +854,7 @@ test('relay/hc blocked tab: the real hc ls / hc get shapes of a tab waiting on a
       ['t3', true, 'blocked', true, false, false, false, false, 'claude-code'],
     );
     const got = detectTerminalActivity(hcGetAgent({ address: 't3', cwd: env.projectDir, status: REAL_HC_BLOCKED_GET_STATUS, where: 'proj / Claude Code' }));
-    assert.deepEqual([got.activity, got.blocked, got.busy, got.idle, got.agentName], ['blocked', true, false, false, 'claude-code']);
+    assert.deepEqual([got.activity, got.blocked, got.busy, got.idle, got.agentName, got.blockedKind], ['blocked', true, false, false, 'claude-code', 'permission']);
 
     const hc = makeFakeHc({
       ls: { terminals: [REAL_HC_BLOCKED_LS_ROW] },
@@ -894,7 +894,7 @@ test('relay/hc blocked tab: the real hc ls / hc get shapes of a tab waiting on a
         throw err;
       },
     });
-    assert.equal(otherHc.sendTrigger('t3', 'ping').code, 'HC_EXEC_ERROR');
+    assert.equal(otherHc.sendTrigger('t3', 'ping').code, 'HC_TARGET_NOT_FOUND', 'a tab that is gone is reported as such, not as a failure of hc');
 
     hc.state.blockedStream = 'stdout';
     hc.state.refused.length = 0;
@@ -1476,7 +1476,7 @@ test('relay/tools and project_dir: a folder reached through a junction is the sa
     assert.equal(store.readDoc({ id: 'dec-via-link', scope: 'project' }).title, 'Saved through the junction');
 
     // A really different folder still goes through its own store
-    approveProject(elsewhere, { globalDir: env.globalDir });
+    approveAsUser(elsewhere, { globalDir: env.globalDir });
     scheduled.length = 0;
     const other = await callTool(server, 'memory_save', { id: 'dec-else', type: 'decision', title: 'Elsewhere', summary: 'Other project', project_dir: elsewhere });
     assert.equal(other.isError, false);
@@ -1495,7 +1495,7 @@ test('excluded project: relay_tabs, relay_send and relay_inbox (peek and ack) re
   const env = makeTempEnv('cortex-relay-excluded-');
   const excludedProj = path.join(env.root, 'excluded_relay_proj');
   fs.mkdirSync(excludedProj, { recursive: true });
-  approveProject(excludedProj, { globalDir: env.globalDir });
+  approveAsUser(excludedProj, { globalDir: env.globalDir });
   atomicWriteJson(path.join(env.globalDir, 'config.json'), { mode: 'all', excludedProjects: ['excluded_relay_proj'] });
 
   const excludedStore = new CortexStore({ projectDir: excludedProj, globalDir: env.globalDir, disableVec: true });
@@ -1568,7 +1568,7 @@ test('P0-3, P0-11, P1-8, P1-11, P2-5 regression: MCP excludedProjects enforcemen
   const otherEnabledProj = path.join(env.root, 'other_enabled_proj');
   fs.mkdirSync(excludedProj, { recursive: true });
   fs.mkdirSync(otherEnabledProj, { recursive: true });
-  approveProject(otherEnabledProj, { globalDir: env.globalDir });
+  approveAsUser(otherEnabledProj, { globalDir: env.globalDir });
 
   atomicWriteJson(path.join(env.globalDir, 'config.json'), {
     mode: 'all',

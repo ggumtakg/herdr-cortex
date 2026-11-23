@@ -47,6 +47,18 @@ export const INBOX_DELIVERED_DIR = '.delivered';
 /** How long a delivered message is kept before a later drain removes it. */
 export const INBOX_DELIVERED_RETENTION_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * A retention time in words ("24 hours", "1 hour", "90 minutes"), for texts that tell an agent how long a
+ * delivered message is kept. Derived from the constant so the texts cannot drift from the behavior.
+ */
+export function describeRetention(retentionMs = INBOX_DELIVERED_RETENTION_MS) {
+  const ms = Math.max(0, Number(retentionMs) || 0);
+  const hours = ms / (60 * 60 * 1000);
+  if (hours >= 1 && Number.isInteger(hours)) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  const minutes = Math.round(ms / (60 * 1000));
+  return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+}
+
 // A lock file whose content cannot be read yet belongs to a consumer that is just writing it; after this
 // long it is treated as left behind by a process that died between creating and writing it.
 const LOCK_UNREADABLE_GRACE_MS = 2000;

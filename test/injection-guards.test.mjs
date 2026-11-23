@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { REPO_ROOT, atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
 import { CortexStore } from '../src/core/store.mjs';
 import { UNTRUSTED_MEMORY_PREAMBLE, fitOverviewToBudget, sanitizeInline } from '../src/core/budget.mjs';
-import { approveProject } from '../src/core/trust.mjs';
+import { approveAsUser } from './support/approve.mjs';
 import {
   SUBAGENT_CORTEX_WRITE_DENY_REASON,
   SUBAGENT_MEMORY_DIR_DENY_REASON,
@@ -44,7 +44,7 @@ function makeTempEnv(prefix = 'herdr-cortex-guards-') {
   fs.mkdirSync(globalDir, { recursive: true });
   fs.mkdirSync(promptsDir, { recursive: true });
   // The project folder is approved, as a user would do with cortex-trust.
-  approveProject(projectDir, { globalDir });
+  approveAsUser(projectDir, { globalDir });
   atomicWriteText(path.join(promptsDir, 'HEAD_CORE.md'), '# HEAD_CORE\n\n- Delegate high-resolution work.\n');
   return {
     root,

@@ -8,7 +8,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "test": "node --no-warnings --test test/*.test.mjs",
+    "test": "node --no-warnings --import ./test/support/isolate-home.mjs --test test/*.test.mjs",
     "mcp": "node --no-warnings src/mcp/server.mjs",
     "embed": "node --no-warnings src/embeddings/cli.mjs",
     "trust": "node --no-warnings src/core/trust-cli.mjs"

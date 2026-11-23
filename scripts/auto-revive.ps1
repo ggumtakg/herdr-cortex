@@ -13,19 +13,11 @@ $script:HerdrStatusScript = Join-Path $PSScriptRoot "cortex-status.mjs"
 $script:HerdrTrustScript = Join-Path $script:HerdrCortexRoot "src\core\trust-cli.mjs"
 
 . (Join-Path $PSScriptRoot "revive-common.ps1")
+. (Join-Path $PSScriptRoot "store-location.ps1")
 
-function script:Get-HerdrEffectiveHome {
-    if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_TEST_HOME)) { return $env:HERDR_CORTEX_TEST_HOME }
-    if (-not [string]::IsNullOrWhiteSpace($env:HERDR_REVIVE_TEST_HOME)) { return $env:HERDR_REVIVE_TEST_HOME }
-    return $env:USERPROFILE
-}
-
+# Home directory and global store: decided in store-location.ps1.
 $script:HerdrHome = Get-HerdrEffectiveHome
-$script:HerdrCortexDir = if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_HOME)) {
-    $env:HERDR_CORTEX_HOME
-} else {
-    Join-Path $script:HerdrHome ".herdr-cortex"
-}
+$script:HerdrCortexDir = Get-HerdrCortexGlobalDir
 $script:HerdrCortexSessionsDir = Join-Path $script:HerdrCortexDir "sessions"
 $script:HerdrCortexConfigPath = Join-Path $script:HerdrCortexDir "config.json"
 $script:HerdrLegacySessionsDir = Join-Path $script:HerdrHome ".herdr-revive\sessions"
@@ -108,8 +100,9 @@ function global:revive-status {
     & $script:HerdrReviveScript -Status
 }
 
-# cortex-trust approve|revoke|status|list [folder] [--json]
-# Approves a project folder for herdr-cortex (default: the current location of this shell).
+# cortex-trust approve|revoke|status|list|acknowledge [folder] [--json]
+# Approves a project folder for herdr-cortex (default: the current location of this shell). "approve" and
+# "acknowledge" show a confirmation dialog first; only its Yes button confirms.
 function global:cortex-trust {
     $node = Resolve-HerdrNode
     if (-not $node) {

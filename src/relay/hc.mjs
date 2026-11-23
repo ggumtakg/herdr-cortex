@@ -9,25 +9,26 @@ const BARE_SHELLS = new Set([
   'powershell', 'pwsh', 'cmd', 'bash', 'zsh', 'sh',
 ]);
 
-// Agent status names. Seen in real `hc` 0.1.21 output: "idle", "working" and "blocked" (a tab waiting on a
-// permission dialog: `hc ls` prints "status":"blocked", `hc get` prints
-// "status":{"app":"claude-code","kind":"permission","msg":"approve plan","state":"blocked"}).
-// Every other name in these sets is a guess; in particular no error-state name has been observed yet.
-const BUSY_STATES = new Set([
-  'busy', 'running', 'working', 'thinking', 'active', 'streaming', 'executing',
-]);
+/**
+ * The agent status vocabulary of `hc`, as its own schema defines it (`hc schema`, record `Status`):
+ * `state` is one of exactly these five words ("Words are the program's own; nothing is translated."):
+ *   idle     the agent waits for input
+ *   working  the agent is in a turn
+ *   done     the agent finished its work and waits (wakeable, like idle)
+ *   blocked  the agent waits on a dialog; `kind` then says which: permission, question or auth
+ *   error    the agent reports an error
+ * Any other word is not interpreted (`activity: 'unknown'`). The terminal's own `state` is "live" or
+ * "finished". `hc send --if <STATUS>` accepts only "idle" and "working" and matches the status exactly.
+ * Seen on a real installation (hc 0.1.21): idle, working, blocked with kind "permission" (`hc ls` prints
+ * "status":"blocked", `hc get` prints "status":{"app":"claude-code","kind":"permission","msg":"approve
+ * plan","state":"blocked"}), a bare shell (no status), finished terminals. `done` and `error` are known
+ * from the schema only.
+ */
+export const HC_STATUS_STATES = Object.freeze(['idle', 'working', 'done', 'blocked', 'error']);
+/** Values of `Status.kind` (present only while blocked, when the program said). */
+export const HC_BLOCKED_KINDS = Object.freeze(['permission', 'question', 'auth']);
 
-const BLOCKED_STATES = new Set([
-  'blocked', 'waiting_permission', 'permission', 'stuck', 'approval',
-]);
-
-const ERROR_STATES = new Set([
-  'error', 'errored', 'failed', 'crashed',
-]);
-
-const IDLE_STATES = new Set([
-  'idle', 'waiting', 'ready', 'input', 'prompt', 'paused', 'done',
-]);
+const STATUS_STATE_SET = new Set(HC_STATUS_STATES);
 
 export const MAX_WAKE_TRIGGER_CHARS = 240;
 
@@ -65,32 +66,35 @@ export function parseTerminalAddress(address) {
 
 // `status` as hc 0.1.21 prints it: a plain string in `hc ls` rows ("idle" / "working" / "blocked", absent
 // for a bare shell), an object { app, state, msg?, kind? } in `hc get` ("status": null for a bare shell).
+// The words are compared exactly as hc defines them (lower case, nothing translated).
 function readStatus(status) {
   if (typeof status === 'string') {
-    return { state: status.trim().toLowerCase(), app: '' };
+    return { state: status.trim(), app: '', kind: '' };
   }
   if (status && typeof status === 'object' && !Array.isArray(status)) {
     return {
-      state: typeof status.state === 'string' ? status.state.trim().toLowerCase() : '',
+      state: typeof status.state === 'string' ? status.state.trim() : '',
       app: typeof status.app === 'string' ? status.app.trim() : '',
+      kind: typeof status.kind === 'string' ? status.kind.trim() : '',
     };
   }
-  return { state: '', app: '' };
+  return { state: '', app: '', kind: '' };
 }
 
 /**
  * Normalize one terminal from `hc ls --json` (a row) or `hc get <id> --json` into
- * { terminalId, remote, machine, state, live, activity, idle, busy, blocked, error, unknown,
- *   agentName, isBareShell, cwd, where }.
+ * { terminalId, remote, machine, state, live, activity, idle, busy, done, blocked, blockedKind, error,
+ *   unknown, agentName, isBareShell, cwd, where }.
  *
  * `activity` is exactly one of:
- *   'not_live' - the tab's `state` is not "live"
+ *   'not_live' - the tab's `state` is not "live" (hc: "finished")
  *   'shell'    - a bare shell (program name is a shell and hc reports no agent status)
- *   'idle' | 'working' | 'blocked' | 'error' - what the agent's status says ('error' also when the tab's
- *                own `state` is an error state)
- *   'unknown'  - a live agent tab whose status is missing or not understood. Unknown is NOT busy:
- *                callers must not report it as "busy", and must not treat it as idle either.
- * `idle`, `busy`, `blocked`, `error` and `unknown` are the matching booleans (at most one is true).
+ *   'idle' | 'working' | 'done' | 'blocked' | 'error' - the agent's status word (see HC_STATUS_STATES)
+ *   'unknown'  - a live agent tab whose status is missing or is not one of those five words. Unknown is
+ *                NOT busy: callers must not report it as "busy", and must not treat it as idle either.
+ * `idle`, `busy` (working), `done`, `blocked`, `error` and `unknown` are the matching booleans (at most one
+ * is true). `blockedKind` is hc's `kind` of a blocked tab ("permission", "question" or "auth"; '' when hc
+ * did not say, as in `hc ls` rows, or when the tab is not blocked).
  */
 export function detectTerminalActivity(terminal) {
   if (!terminal || typeof terminal !== 'object') {
@@ -103,7 +107,9 @@ export function detectTerminalActivity(terminal) {
       activity: 'not_live',
       idle: false,
       busy: false,
+      done: false,
       blocked: false,
+      blockedKind: '',
       error: false,
       unknown: false,
       agentName: '',
@@ -115,7 +121,7 @@ export function detectTerminalActivity(terminal) {
 
   const terminalId = String(terminal.address || terminal.id || terminal.terminalId || '').trim();
   const address = parseTerminalAddress(terminalId);
-  const stateRaw = String(terminal.state || '').trim().toLowerCase();
+  const stateRaw = String(terminal.state || '').trim();
   const live = stateRaw ? stateRaw === 'live' : true;
 
   const status = readStatus(terminal.status);
@@ -129,13 +135,9 @@ export function detectTerminalActivity(terminal) {
   const where = String(terminal.labels?.where || terminal.where || '').trim();
 
   let activity;
-  if (ERROR_STATES.has(stateRaw)) activity = 'error';
-  else if (!live) activity = 'not_live';
+  if (!live) activity = 'not_live';
   else if (isBareShell) activity = 'shell';
-  else if (ERROR_STATES.has(status.state)) activity = 'error';
-  else if (BLOCKED_STATES.has(status.state)) activity = 'blocked';
-  else if (BUSY_STATES.has(status.state)) activity = 'working';
-  else if (IDLE_STATES.has(status.state)) activity = 'idle';
+  else if (STATUS_STATE_SET.has(status.state)) activity = status.state;
   else activity = 'unknown';
 
   return {
@@ -147,7 +149,9 @@ export function detectTerminalActivity(terminal) {
     activity,
     idle: activity === 'idle',
     busy: activity === 'working',
+    done: activity === 'done',
     blocked: activity === 'blocked',
+    blockedKind: activity === 'blocked' ? status.kind : '',
     error: activity === 'error',
     unknown: activity === 'unknown',
     agentName,
@@ -181,16 +185,41 @@ function readHcErrorPayload(err) {
   return null;
 }
 
+/**
+ * Error kinds of `hc` that describe the target tab rather than a failure of `hc` itself, and the code this
+ * client reports for each (the kinds are listed in `hc schema`; "blocked" was also seen on a real tab):
+ *   blocked          the tab waits on a dialog; hc types nothing without --force (which is never used)
+ *   status_mismatch  `--if <status>` did not match: the status changed after it was read
+ *   finished         the terminal has ended
+ *   not_found        there is no such terminal
+ */
+export const HC_TARGET_ERROR_CODES = Object.freeze({
+  blocked: 'HC_TARGET_BLOCKED',
+  status_mismatch: 'HC_STATUS_MISMATCH',
+  finished: 'HC_TARGET_FINISHED',
+  not_found: 'HC_TARGET_NOT_FOUND',
+});
+
 function classifyExecError(err, hcBin) {
   // `hc send` to a tab that is waiting on a permission dialog types nothing and fails with
   // {"error":{"kind":"blocked","message":"t3 is blocked (permission)","hint":"typing would answer its dialog; ..."}}.
   const payload = readHcErrorPayload(err);
   const plainText = `${outputText(err?.stdout)}\n${outputText(err?.stderr)}`;
-  if (payload?.kind === 'blocked' || (!payload && err?.status === HC_EXIT_BLOCKED && /\bis blocked\b/i.test(plainText))) {
+  const kind = typeof payload?.kind === 'string' ? payload.kind : '';
+  if (kind === 'blocked' || (!payload && err?.status === HC_EXIT_BLOCKED && /\bis blocked\b/i.test(plainText))) {
     return {
       ok: false,
-      code: 'HC_TARGET_BLOCKED',
+      code: HC_TARGET_ERROR_CODES.blocked,
+      kind: 'blocked',
       error: (typeof payload?.message === 'string' && payload.message.trim()) || plainText.trim() || 'The target tab is blocked.',
+    };
+  }
+  if (Object.prototype.hasOwnProperty.call(HC_TARGET_ERROR_CODES, kind)) {
+    return {
+      ok: false,
+      code: HC_TARGET_ERROR_CODES[kind],
+      kind,
+      error: (typeof payload?.message === 'string' && payload.message.trim()) || kind,
     };
   }
   if (err && err.code === 'ENOENT') {
@@ -215,7 +244,8 @@ function classifyExecError(err, hcBin) {
   return {
     ok: false,
     code: 'HC_EXEC_ERROR',
-    error: stderr || err?.message || `Failed to run "${hcBin}"`,
+    ...(kind ? { kind } : {}),
+    error: (typeof payload?.message === 'string' && payload.message.trim()) || stderr || err?.message || `Failed to run "${hcBin}"`,
   };
 }
 
@@ -416,6 +446,8 @@ export function createHcClient({
     }
   }
 
+  // `ifIdle` adds `--if idle`: hc then types only while the status is exactly "idle" (and fails with
+  // kind "status_mismatch" otherwise). A tab whose status is "done" must be sent to without it.
   function sendTrigger(terminalId, text, { ifIdle = false } = {}) {
     const cleanId = validateTerminalId(terminalId);
     const singleLine = sanitizeSingleLineTrigger(text);

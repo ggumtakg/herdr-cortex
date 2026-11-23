@@ -11,15 +11,25 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import {
+  GLOBAL_DIR_NAME,
   REPO_ROOT,
   getConfigProblems,
   isMainModule,
   isProjectEnabled,
   loadConfig,
+  resolveGlobalDir,
+  resolveHomeDir,
 } from '../src/core/config.mjs';
 import { getDuplicateDocIds, readDeferredIndex } from '../src/core/db.mjs';
 import { CortexStore } from '../src/core/store.mjs';
-import { TRUST_COMMAND, describeProjectTrust } from '../src/core/trust.mjs';
+import {
+  ACKNOWLEDGE_COMMAND,
+  TRUST_COMMAND,
+  describeApprovalsChange,
+  describeProjectTrust,
+  formatApprovalsChangedWarning,
+  listTrustedProjects,
+} from '../src/core/trust.mjs';
 import { describeEmbeddingStatus, formatEmbeddingStatus } from '../src/embeddings/resolve.mjs';
 import {
   MCP_SERVER_KEY,
@@ -29,11 +39,7 @@ import {
   readInstallRecord,
 } from '../src/hooks/installer.mjs';
 import { countInboxMessages, getInboxRootDir, peekInbox } from '../src/relay/inbox.mjs';
-import {
-  isValidTerminalId,
-  resolveCortexGlobalDir,
-  resolveEffectiveHome,
-} from '../src/revive/tracker.mjs';
+import { isValidTerminalId } from '../src/revive/tracker.mjs';
 
 const REINSTALL_ADVICE = 'run install.ps1 again';
 
@@ -160,16 +166,14 @@ export async function collectStatus({
   env = process.env,
 } = {}) {
   const resolvedRoot = path.resolve(repoRoot);
-  const resolvedHome = resolveEffectiveHome(homeDir);
+  const resolvedHome = resolveHomeDir(homeDir);
   // A home directory given explicitly keeps its own store; otherwise the usual lookup applies.
-  const resolvedGlobal = globalDir
-    ? path.resolve(globalDir)
-    : (homeDir ? path.join(resolvedHome, '.herdr-cortex') : resolveCortexGlobalDir());
+  const resolvedGlobal = resolveGlobalDir({ globalDir, homeDir });
   const folder = path.resolve(cwd);
   const warnings = [];
 
   // Node
-  const record = readInstallRecord(resolvedGlobal) || readInstallRecord(path.join(resolvedHome, '.herdr-cortex'));
+  const record = readInstallRecord(resolvedGlobal) || readInstallRecord(path.join(resolvedHome, GLOBAL_DIR_NAME));
   const recordedNode = typeof record?.nodePath === 'string' ? record.nodePath : '';
   const node = {
     running: process.execPath,
@@ -255,6 +259,18 @@ export async function collectStatus({
     hookBudget: config.hookBudget,
   };
 
+  // Approvals: the whole list, and what in it was never confirmed in the dialog (or vanished without it)
+  const approvalsChange = describeApprovalsChange({ globalDir: resolvedGlobal });
+  const approvals = {
+    count: listTrustedProjects({ globalDir: resolvedGlobal }).length,
+    changed: approvalsChange.changed,
+    added: approvalsChange.added,
+    removed: approvalsChange.removed,
+  };
+  if (approvals.changed) {
+    warnings.push(formatApprovalsChangedWarning(approvalsChange).replace(/^\[herdr-cortex\] WARNING: /, 'Approvals: '));
+  }
+
   const store = new CortexStore({ projectDir: folder, globalDir: resolvedGlobal, config, globalConfig, disableVec: true });
   let tiers;
   let embedding;
@@ -318,6 +334,7 @@ export async function collectStatus({
     claudeMcp,
     antigravity,
     project,
+    approvals,
     embedding,
     embeddingLines: embeddingLines.filter((line) => !/^embedding config problem/.test(line)),
     tiers,
@@ -384,6 +401,15 @@ export function formatStatus(status) {
     ? `yes${project.approvedAt ? ` (since ${project.approvedAt})` : ''}`
     : `no (approve with: ${TRUST_COMMAND} approve)`}`);
   lines.push(`${label('  enabled')}${project.enabled ? 'yes' : 'no'} (${project.rule}) | headCore=${project.headCoreEnabled ? 'on' : 'off'} | hookBudget=${project.hookBudget}`);
+
+  const approvals = status.approvals;
+  if (approvals) {
+    lines.push(`${label('Approvals')}${approvals.count} folder(s) approved | ${approvals.changed
+      ? `CHANGED without the confirmation dialog: ${approvals.added.length} added, ${approvals.removed.length} removed (accept with: ${ACKNOWLEDGE_COMMAND})`
+      : 'all confirmed in the dialog'}`);
+    for (const entry of approvals.added) lines.push(`${label('')}added: ${entry.path}${entry.approvedAt ? ` (${entry.approvedAt})` : ''}`);
+    for (const entry of approvals.removed) lines.push(`${label('')}removed: ${entry.path}${entry.approvedAt ? ` (${entry.approvedAt})` : ''}`);
+  }
 
   for (const line of status.embeddingLines) {
     lines.push(`${label('Embedding')}${line.replace(/^embedding:?\s*/, '')}`);

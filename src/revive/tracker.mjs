@@ -1,11 +1,11 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   assertInsideDir,
   atomicWriteJson,
-  getGlobalDir,
   getTierPaths,
+  resolveGlobalDir,
+  resolveHomeDir,
 } from '../core/config.mjs';
 
 const TERMINAL_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -48,19 +48,14 @@ export function validateTerminalId(id) {
   return trimmed;
 }
 
+/** The home directory in use; see `resolveHomeDir` in core/config.mjs (the one place it is decided). */
 export function resolveEffectiveHome(overrideHome) {
-  if (overrideHome) return path.resolve(overrideHome);
-  if (process.env.HERDR_CORTEX_TEST_HOME) return path.resolve(process.env.HERDR_CORTEX_TEST_HOME);
-  if (process.env.HERDR_REVIVE_TEST_HOME) return path.resolve(process.env.HERDR_REVIVE_TEST_HOME);
-  return os.homedir();
+  return resolveHomeDir(overrideHome);
 }
 
+/** The global store directory; see `resolveGlobalDir` in core/config.mjs (the one place it is decided). */
 export function resolveCortexGlobalDir(overrideGlobalDir) {
-  if (overrideGlobalDir) return path.resolve(overrideGlobalDir);
-  if (process.env.HERDR_CORTEX_HOME) return path.resolve(process.env.HERDR_CORTEX_HOME);
-  const testHome = process.env.HERDR_CORTEX_TEST_HOME || process.env.HERDR_REVIVE_TEST_HOME;
-  if (testHome) return path.join(path.resolve(testHome), '.herdr-cortex');
-  return getGlobalDir();
+  return resolveGlobalDir({ globalDir: overrideGlobalDir });
 }
 
 export function getSessionsDir(overrideGlobalDir) {

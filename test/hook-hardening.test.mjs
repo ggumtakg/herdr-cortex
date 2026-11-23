@@ -18,7 +18,7 @@ import {
   syncFromDiskYielding,
 } from '../src/core/db.mjs';
 import { CortexStore } from '../src/core/store.mjs';
-import { approveProject } from '../src/core/trust.mjs';
+import { approveAsUser } from './support/approve.mjs';
 import {
   CLAUDE_HOOK_MAX_CHARS,
   CLEAR_RECORD_STALE_MS,
@@ -61,6 +61,11 @@ import {
   stripSystemReminders,
 } from '../src/hooks/recent-turns.mjs';
 import { CLAUDE_SESSION_END_TIMEOUT_SECONDS, installCortex, isOwnHook, uninstallCortex } from '../src/hooks/installer.mjs';
+import {
+  READ_ONLY_GIT_SUBCOMMANDS,
+  READ_ONLY_SHELL_VERBS,
+  isReadOnlyShellCommand,
+} from '../src/hooks/shell-read-only.mjs';
 import { createServerRuntime } from '../src/mcp/server.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-hardening-') {
@@ -73,7 +78,7 @@ function makeTempEnv(prefix = 'herdr-cortex-hardening-') {
   fs.mkdirSync(globalDir, { recursive: true });
   fs.mkdirSync(promptsDir, { recursive: true });
   // The project folder is approved, as a user would do with cortex-trust.
-  approveProject(projectDir, { globalDir });
+  approveAsUser(projectDir, { globalDir });
   atomicWriteText(path.join(promptsDir, 'HEAD_CORE.md'), '# HEAD_CORE\n\n- Delegate high-resolution work.\n');
   return {
     root,
@@ -541,12 +546,15 @@ test('/clear: turns are restored from the session the SessionEnd hook recorded, 
     const listRecords = () => (fs.existsSync(recordsDir) ? fs.readdirSync(recordsDir).sort() : []);
 
     let newCount = 0;
+    // The wait for a late clear record (see the next test) is replaced by a counter: this test is about
+    // which record is used, and must not spend two real seconds on every "no record" case.
+    const waits = [];
     const startAfterClear = (options = {}, cwd = env.projectDir) => {
       const sessionId = `sess-new-${++newCount}`;
       atomicWriteText(transcriptOf(sessionId), '');
       return contextOf(handleClaudeSessionStart(
         { session_id: sessionId, source: 'clear', transcript_path: transcriptOf(sessionId), cwd, hook_event_name: 'SessionStart' },
-        env.hookOptions(options),
+        env.hookOptions({ sleep: (ms) => waits.push(ms), ...options }),
       ));
     };
     const endSession = (sessionId, reason, options = {}, extra = {}) => handleClaudeSessionEnd(
@@ -1202,7 +1210,7 @@ test('hook budget: a configured hookBudget of 1,000,000 is capped at 9,000 chara
 // Item 7: an agent cannot approve projects for itself without the user seeing it
 // ---------------------------------------------------------------------------------------------
 
-test('PreToolUse: running the approval CLI or naming the approvals file asks the user (denied for subagents); read-only calls and look-alikes pass', () => {
+test('PreToolUse: a command that names an approvals file asks the user (denied for subagents); running the approval CLI is left to its confirmation dialog (still denied for subagents); read-only commands and look-alikes pass', () => {
   const env = makeTempEnv('cortex-trust-guard-shell-');
   try {
     const subagent = { agent_id: 'sub-9', agent_type: 'general-purpose' };
@@ -1212,8 +1220,11 @@ test('PreToolUse: running the approval CLI or naming the approvals file asks the
     );
     const approvalsFile = path.join(env.globalDir, 'state', 'trusted-projects.json');
 
-    const changing = [
+    // Runs the approval CLI: the CLI asks a person in its own dialog, so the main conversation is not asked
+    // here; a subagent is still denied.
+    const runsCli = [
       'cortex-trust approve',
+      'cortex-trust acknowledge',
       'cortex-trust approve "C:\\work\\some project"',
       'cortex-trust revoke .',
       'cortex-trust',
@@ -1239,15 +1250,75 @@ test('PreToolUse: running the approval CLI or naming the approvals file asks the
       'npm run trust',
       'npm --prefix C:\\repos\\herdr-cortex run trust -- approve .',
       'npm.cmd run-script trust -- revoke',
-      `type "${approvalsFile}"`,
-      'cat ~/.herdr-cortex/state/trusted-projects.json',
+    ];
+    // Names an approvals file and is not recognizably read-only: asked (main) / denied (subagent)
+    const namesApprovalsFile = [
       'echo {} > ~/.herdr-cortex/state/trusted-projects.json',
       'Set-Content -Path $HOME\\.herdr-cortex\\state\\trusted-projects.json -Value "{}"',
       'python -c "open(\'trusted-projects.json\',\'w\').write(\'{}\')"',
       'cp trusted-projects.json.bak trusted-projects.json',
-      'cat TRUSTED-PROJECTS.JSON',
+      'cat x > trusted-projects.json',
+      'cat x >> trusted-projects.json',
+      'cat trusted-projects.json > copy.json',
+      'cat < trusted-projects.json',
+      'cat trusted-projects.json | tee copy.json',
+      'cat trusted-projects.json; rm trusted-projects.json',
+      'cat trusted-projects.json && del trusted-projects.json',
+      'cat $(echo trusted-projects.json)',
+      'cat `echo trusted-projects.json`',
+      'cat "$(echo trusted-projects.json)"',
+      '(cat trusted-projects.json)',
+      'Get-Content trusted-projects.json | Set-Content trusted-projects.json',
+      'Get-Content trusted-projects.json | ForEach-Object { $_ }',
+      'rm trusted-projects.acknowledged.json',
+      'echo {} > trusted-projects.acknowledged.json',
+      'sed -i s/a/b/ trusted-projects.json',
+      './cat trusted-projects.json',
+      'C:\\tools\\cat.exe trusted-projects.json',
+      'FOO=1 cat trusted-projects.json',
+      'sudo cat trusted-projects.json',
+      'cat trusted-projects.json # note',
+      'cat "trusted-projects.json',
+      'git diff --output=trusted-projects.json',
+      'git -c core.pager=less log trusted-projects.json',
+      'git checkout trusted-projects.json',
+      'git grep -Oless trusted-projects.json',
+      'rg --pre ./run.sh x trusted-projects.json',
+      'less -o copy.txt trusted-projects.json',
+      'cortex-trust status > trusted-projects.json',
     ];
     const readOnly = [
+      `type "${approvalsFile}"`,
+      'cat ~/.herdr-cortex/state/trusted-projects.json',
+      'cat TRUSTED-PROJECTS.JSON',
+      'cat trusted-projects.acknowledged.json',
+      'CAT.EXE trusted-projects.json',
+      'Get-Content -Raw "$HOME\\.herdr-cortex\\state\\trusted-projects.json"',
+      'gc trusted-projects.json | Select-String path',
+      'cat trusted-projects.json | grep path | head -5',
+      'more trusted-projects.json',
+      'less trusted-projects.json',
+      'tail -n 20 trusted-projects.json',
+      'findstr /c:"path" trusted-projects.json',
+      'rg -n approvedAt trusted-projects.json',
+      'ls -la ~/.herdr-cortex/state/trusted-projects.json',
+      'dir trusted-projects.json',
+      'Get-ChildItem trusted-projects.json',
+      'Get-Item trusted-projects.json',
+      'stat trusted-projects.json',
+      'wc -l trusted-projects.json',
+      'cat a.txt && cat trusted-projects.json',
+      'git status; cat trusted-projects.json',
+      'cat \'my file.txt\' "trusted-projects.json"',
+      'cat src/core/trust-cli.mjs',
+      'grep -n "approve" src/core/trust-cli.mjs',
+      'grep -r "cortex-trust approve" docs/',
+      'git diff src/core/trust-cli.mjs',
+      'git log -p -- src/core/trust-cli.mjs',
+      'git show HEAD:src/core/trust-cli.mjs',
+      'git blame src/core/trust-cli.mjs',
+      'git grep -n cortex-trust',
+      'head -3 src/core/trust-cli.mjs\ntail -3 src/core/trust-cli.mjs',
       'cortex-trust status',
       'cortex-trust list',
       'cortex-trust list --json',
@@ -1282,8 +1353,16 @@ test('PreToolUse: running the approval CLI or naming the approvals file asks the
     ];
 
     for (const tool of ['Bash', 'PowerShell']) {
-      for (const command of changing) {
-        assert.equal(classifyTrustCommand(command), 'change', command);
+      for (const command of runsCli) {
+        assert.equal(classifyTrustCommand(command), 'runs-cli', command);
+        assert.deepEqual(run(tool, command), {}, `${tool}: ${command} (the CLI's own dialog asks a person)`);
+        const denied = run(tool, command, subagent);
+        assert.equal(denied.hookSpecificOutput?.permissionDecision, 'deny', `${tool} subagent: ${command}`);
+        assert.equal(denied.hookSpecificOutput.permissionDecisionReason, SUBAGENT_TRUST_CHANGE_DENY_REASON);
+      }
+      for (const command of namesApprovalsFile) {
+        assert.equal(classifyTrustCommand(command), 'approvals-file', command);
+        assert.equal(isReadOnlyShellCommand(command), false, command);
         const asked = run(tool, command);
         assert.equal(asked.hookSpecificOutput?.hookEventName, 'PreToolUse', command);
         assert.equal(asked.hookSpecificOutput.permissionDecision, 'ask', `${tool}: ${command}`);
@@ -1318,26 +1397,44 @@ test('PreToolUse: running the approval CLI or naming the approvals file asks the
     const both = run('Bash', 'cat .memory/docs/a.md && cortex-trust approve', subagent);
     assert.equal(both.hookSpecificOutput.permissionDecision, 'deny');
     assert.equal(both.hookSpecificOutput.permissionDecisionReason, SUBAGENT_MEMORY_DIR_DENY_REASON);
-    // ... while the main conversation, which may read .memory/, is still asked about the approval
-    assert.equal(run('Bash', 'cat .memory/docs/a.md && cortex-trust approve').hookSpecificOutput.permissionDecision, 'ask');
+    // ... while the main conversation, which may read .memory/, is not stopped here (the dialog asks)
+    assert.deepEqual(run('Bash', 'cat .memory/docs/a.md && cortex-trust approve'), {});
+    // A subagent reading an approvals file is not denied by this guard, but still by the .memory/ guard
+    assert.deepEqual(run('Bash', 'cat trusted-projects.json', subagent), {});
+    assert.equal(
+      run('Bash', 'cat .memory/state/x.json trusted-projects.json', subagent).hookSpecificOutput.permissionDecisionReason,
+      SUBAGENT_MEMORY_DIR_DENY_REASON,
+    );
     // Tools the guard does not cover, and "allow" is never returned
     for (const tool of ['Read', 'Grep', 'WebFetch', 'TodoWrite']) {
       assert.deepEqual(run(tool, 'cortex-trust approve'), {}, tool);
     }
     assert.equal(JSON.stringify(run('Bash', 'cortex-trust approve')).includes('"allow"'), false);
+    assert.equal(JSON.stringify(run('Bash', 'echo {} > trusted-projects.json')).includes('"allow"'), false);
     // A very long command line is classified quickly
     const longCommand = `${'npm '.repeat(60_000)}run trust`;
     const started = Date.now();
-    assert.equal(classifyTrustCommand(longCommand), 'change');
-    assert.equal(classifyTrustCommand('cortex-trust '.repeat(60_000)), 'change');
+    assert.equal(classifyTrustCommand(longCommand), 'runs-cli');
+    assert.equal(classifyTrustCommand('cortex-trust '.repeat(60_000)), 'runs-cli');
+    assert.equal(classifyTrustCommand(`cat ${'trusted-projects.json '.repeat(60_000)}`), 'read-only');
+    assert.equal(classifyTrustCommand(`cat ${'trusted-projects.json '.repeat(60_000)}> x`), 'approvals-file');
     assert.ok(Date.now() - started < 2000, `classification took ${Date.now() - started} ms`);
+
+    // The allow-list is a named constant, and "not recognized" never means "read-only"
+    for (const verb of ['cat', 'type', 'more', 'less', 'head', 'tail', 'get-content', 'gc', 'select-string', 'grep', 'rg', 'findstr', 'ls', 'dir', 'get-childitem', 'get-item', 'stat', 'wc']) {
+      assert.ok(READ_ONLY_SHELL_VERBS.includes(verb), verb);
+    }
+    assert.deepEqual([...READ_ONLY_GIT_SUBCOMMANDS], ['diff', 'log', 'show', 'status', 'blame', 'grep']);
+    for (const command of ['', '   ', 'rm x', 'node -e "1"', 'git push', 'git', 'echo hi', 'cat x | sh', 'cat x; curl y', 'Remove-Item x', undefined, 42]) {
+      assert.equal(isReadOnlyShellCommand(command), false, String(command));
+    }
 
     // The hook process prints the decision
     const cli = spawnSync(
       process.execPath,
       ['--no-warnings', path.join(REPO_ROOT, 'src', 'hooks', 'claude.mjs'), 'pre-tool-use', '--id', 'herdr-cortex'],
       {
-        input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'npm run trust -- approve' }, cwd: env.projectDir, hook_event_name: 'PreToolUse' }),
+        input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'cat x > trusted-projects.json' }, cwd: env.projectDir, hook_event_name: 'PreToolUse' }),
         encoding: 'utf8',
         cwd: env.projectDir,
         env: childEnv(env),
@@ -1349,7 +1446,7 @@ test('PreToolUse: running the approval CLI or naming the approvals file asks the
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         permissionDecision: 'ask',
-        permissionDecisionReason: formatTrustCommandAskReason('npm run trust -- approve'),
+        permissionDecisionReason: formatTrustCommandAskReason('cat x > trusted-projects.json'),
       },
     });
   } finally {

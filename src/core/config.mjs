@@ -83,14 +83,51 @@ export function isMainModule(importMetaUrl, argv1 = process.argv[1]) {
   return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
+/** Folder name of the global store inside a home directory. */
+export const GLOBAL_DIR_NAME = '.herdr-cortex';
+
+function envText(env, name) {
+  const value = env && typeof env === 'object' ? env[name] : undefined;
+  return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
 /**
- * Resolve global cortex home directory.
- * Respects process.env.HERDR_CORTEX_HOME for test isolation.
+ * The home directory herdr-cortex works against (Claude Code and Antigravity settings, the predecessor's
+ * `.herdr-revive` store, and the default place of the global store):
+ *   1. `homeDir` when given,
+ *   2. `HERDR_CORTEX_TEST_HOME` (`HERDR_REVIVE_TEST_HOME` is the predecessor's name for the same thing),
+ *   3. the user's home directory.
+ */
+export function resolveHomeDir(homeDir, { env = process.env } = {}) {
+  if (typeof homeDir === 'string' && homeDir.trim()) return path.resolve(homeDir.trim());
+  const testHome = envText(env, 'HERDR_CORTEX_TEST_HOME') || envText(env, 'HERDR_REVIVE_TEST_HOME');
+  if (testHome) return path.resolve(testHome);
+  return os.homedir();
+}
+
+/**
+ * The one place the location of the global store is decided. The runtime (store, hooks, MCP server, relay,
+ * session tracker), the command lines and the installer all go through it; the PowerShell scripts apply the
+ * same order in `scripts/store-location.ps1`. Precedence:
+ *   1. an explicit argument: `globalDir`, else `homeDir` (the store is then `<homeDir>/.herdr-cortex`),
+ *   2. `HERDR_CORTEX_HOME`,
+ *   3. `<HERDR_CORTEX_TEST_HOME>/.herdr-cortex` (`HERDR_REVIVE_TEST_HOME` counts as the same variable),
+ *   4. `<user home>/.herdr-cortex`.
+ * `env` is injectable for tests.
+ */
+export function resolveGlobalDir({ globalDir, homeDir, env = process.env } = {}) {
+  if (typeof globalDir === 'string' && globalDir.trim()) return path.resolve(globalDir.trim());
+  if (typeof homeDir === 'string' && homeDir.trim()) return path.join(path.resolve(homeDir.trim()), GLOBAL_DIR_NAME);
+  const fromEnv = envText(env, 'HERDR_CORTEX_HOME');
+  if (fromEnv) return path.resolve(fromEnv);
+  return path.join(resolveHomeDir('', { env }), GLOBAL_DIR_NAME);
+}
+
+/**
+ * The global store directory: `overrideGlobalDir` when given, otherwise what `resolveGlobalDir` finds.
  */
 export function getGlobalDir(overrideGlobalDir) {
-  if (overrideGlobalDir) return path.resolve(overrideGlobalDir);
-  if (process.env.HERDR_CORTEX_HOME) return path.resolve(process.env.HERDR_CORTEX_HOME);
-  return path.join(os.homedir(), '.herdr-cortex');
+  return resolveGlobalDir({ globalDir: overrideGlobalDir });
 }
 
 /**

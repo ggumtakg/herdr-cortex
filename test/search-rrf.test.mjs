@@ -14,7 +14,7 @@ import { createOllamaProvider } from '../src/embeddings/ollama.mjs';
 import { runEmbedCli } from '../src/embeddings/cli.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
 import { REPO_ROOT, atomicWriteText } from '../src/core/config.mjs';
-import { approveProject } from '../src/core/trust.mjs';
+import { approveAsUser } from './support/approve.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-rrf-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -24,7 +24,7 @@ function makeTempEnv(prefix = 'herdr-cortex-rrf-') {
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
   // The project folder of every test environment is approved, as a user would do with cortex-trust.
-  approveProject(projectDir, { globalDir });
+  approveAsUser(projectDir, { globalDir });
   fs.mkdirSync(path.join(promptsDir, 'agents'), { recursive: true });
   fs.mkdirSync(path.join(promptsDir, 'skills', 'plan-run', 'steps'), { recursive: true });
   fs.writeFileSync(path.join(promptsDir, 'HEAD_CORE.md'), '# HEAD_CORE\n테스트 코어\n', 'utf8');
@@ -969,7 +969,7 @@ test('P0-3 + P0-8 embeddings CLI: skips excluded projects, loops batches until 0
     // 2. Multi-batch loop with --max-docs 2 processes all 5 docs
     const okProj = path.join(env.root, 'ok-cli-proj');
     fs.mkdirSync(okProj, { recursive: true });
-    approveProject(okProj, { globalDir: env.globalDir });
+    approveAsUser(okProj, { globalDir: env.globalDir });
     const store = new CortexStore({ projectDir: okProj, globalDir: env.globalDir });
     for (let i = 0; i < 5; i++) {
       store.saveDoc({ id: `cli-doc-${i}`, type: 'knowledge', title: `CLI ${i}`, summary: `S ${i}`, content: `C ${i}` });

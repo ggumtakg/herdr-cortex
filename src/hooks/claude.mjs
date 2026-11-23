@@ -17,7 +17,14 @@ import {
   resolveProjectRoot,
 } from '../core/config.mjs';
 import { HOOK_MAX_CHARS, fitOverviewToBudget, resolveHookBudget, sanitizeInline } from '../core/budget.mjs';
-import { formatProjectNotApprovedNotice } from '../core/trust.mjs';
+import {
+  APPROVAL_STATE_FILE_NAMES,
+  formatProjectNotApprovedNotice,
+  formatProjectNotApprovedUserNotice,
+  getAcknowledgedApprovalsPath,
+} from '../core/trust.mjs';
+import { checkApprovalsForSession, pruneApprovalCheckRecords } from './approvals-watch.mjs';
+import { isReadOnlyShellCommand } from './shell-read-only.mjs';
 import {
   FILE_WRITE_TOOL_NAMES,
   SHELL_TOOL_NAMES,
@@ -34,7 +41,7 @@ import {
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
 import { deliverInboxForHook } from '../relay/inbox.mjs';
-import { formatUnindexedNotice, loadHookOverview, resolveHookSyncOptions } from './overview.mjs';
+import { formatUnindexedNotice, formatUnindexedUserNotice, loadHookOverview, resolveHookSyncOptions } from './overview.mjs';
 import {
   RESTORE_FAILURE_NO_TURNS_WITHIN_CAP,
   RESTORE_FAILURE_RECORD_TOO_LARGE,
@@ -96,6 +103,20 @@ export const CLEAR_RECORD_WINDOW_MS = 60 * 1000;
 export const CLEAR_RECORD_STALE_MS = 10 * 60 * 1000;
 // A record written "in the future" by this much is still accepted (clock steps between two processes).
 const CLEAR_RECORD_FUTURE_SLACK_MS = 5 * 1000;
+/**
+ * After /clear it is not known whether Claude Code lets the SessionEnd hook (which writes the clear record)
+ * finish before it starts the SessionStart hook. When SessionStart(clear) finds neither a previous session
+ * in the tab record nor a clear record, it looks again every CLEAR_RECORD_POLL_MS for up to
+ * CLEAR_RECORD_WAIT_MS before it gives up. No other path waits.
+ */
+export const CLEAR_RECORD_WAIT_MS = 2000;
+export const CLEAR_RECORD_POLL_MS = 100;
+
+const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(ms) {
+  if (ms > 0) Atomics.wait(SLEEP_BUF, 0, 0, ms);
+}
 
 const WRITE_PROTECTED_CORTEX_TOOLS = new Set([
   'memory_save',
@@ -174,7 +195,9 @@ const TRUST_COMMAND_NAMES = new Set([
   'cortex-trust.exe',
 ]);
 const TRUST_CLI_SCRIPT_NAME = 'trust-cli.mjs';
-const TRUSTED_PROJECTS_FILE_NAME = 'trusted-projects.json';
+// The approvals list and the acknowledged list (what a person confirmed in the dialog): a change to either
+// one behind the dialog's back has to be seen.
+const APPROVAL_FILE_NAMES = APPROVAL_STATE_FILE_NAMES.map((name) => name.toLowerCase());
 const NPM_COMMAND_NAMES = new Set(['npm', 'npm.cmd', 'npm.ps1', 'npm.exe']);
 const TRUST_READ_ONLY_SUBCOMMANDS = new Set(['status', 'list']);
 
@@ -219,27 +242,37 @@ function isNameChar(ch) {
   return ch !== undefined && /[A-Za-z0-9_-]/.test(ch);
 }
 
-// `trusted-projects.json` as a file name inside a word: not part of a longer name on either side
-// ("untrusted-projects.json" and "trusted-projects.jsonl" do not count; a ".bak" copy does).
+// An approvals file name (`trusted-projects.json`, `trusted-projects.acknowledged.json`) inside a word: not
+// part of a longer name on either side ("untrusted-projects.json" and "trusted-projects.jsonl" do not count;
+// a ".bak" copy does).
 function wordNamesApprovalsFile(word) {
   const lower = word.toLowerCase();
-  let from = 0;
-  for (;;) {
-    const at = lower.indexOf(TRUSTED_PROJECTS_FILE_NAME, from);
-    if (at === -1) return false;
-    const before = at > 0 ? lower[at - 1] : undefined;
-    const after = lower[at + TRUSTED_PROJECTS_FILE_NAME.length];
-    if (!isNameChar(before) && before !== '.' && !isNameChar(after)) return true;
-    from = at + 1;
+  for (const fileName of APPROVAL_FILE_NAMES) {
+    let from = 0;
+    for (;;) {
+      const at = lower.indexOf(fileName, from);
+      if (at === -1) break;
+      const before = at > 0 ? lower[at - 1] : undefined;
+      const after = lower[at + fileName.length];
+      if (!isNameChar(before) && before !== '.' && !isNameChar(after)) return true;
+      from = at + 1;
+    }
   }
+  return false;
 }
 
 /**
  * Does a shell command line run the project-approval CLI (`cortex-trust`, `trust-cli.mjs`, `npm run trust`)
- * or name the approvals file? Returns:
- * - 'change'    : it does, and it may change approvals (or it cannot be told apart from one that does);
- * - 'read-only' : a single plain `status` / `list` call of the CLI, nothing else on the line;
- * - ''          : neither.
+ * or name an approvals file (`trusted-projects.json`, `trusted-projects.acknowledged.json`)? Returns:
+ * - 'approvals-file' : it names an approvals file and is not recognizably read-only, so it may change the
+ *                      approvals behind the confirmation dialog's back;
+ * - 'runs-cli'       : it runs the approval CLI in a way that may change approvals (or that cannot be told
+ *                      apart from one that does). The CLI itself asks a person in a dialog before it approves;
+ * - 'read-only'      : it only reads: a single plain `status` / `list` call of the CLI, or a command line
+ *                      made of read-only programs only (`isReadOnlyShellCommand`: `cat`, `type`, `grep`,
+ *                      `git diff`, ... without redirection), even though it names an approvals file or the
+ *                      CLI's source file;
+ * - ''               : neither.
  * It is a string heuristic like `commandReferencesMemoryDir`: a name that is assembled at run time is not seen.
  */
 export function classifyTrustCommand(command) {
@@ -268,11 +301,13 @@ export function classifyTrustCommand(command) {
   }
 
   if (invocations.length === 0 && !namesApprovalsFile) return '';
-  if (namesApprovalsFile || complex || invocations.length !== 1) return 'change';
+  if (isReadOnlyShellCommand(command)) return 'read-only';
+  if (namesApprovalsFile) return 'approvals-file';
+  if (complex || invocations.length !== 1) return 'runs-cli';
 
   // One plain call: read-only only when the CLI's first argument is `status` or `list`.
   const args = words.slice(invocations[0] + 1).filter((w) => w !== '--' && w.toLowerCase() !== '--json');
-  return args.length > 0 && TRUST_READ_ONLY_SUBCOMMANDS.has(args[0].toLowerCase()) ? 'read-only' : 'change';
+  return args.length > 0 && TRUST_READ_ONLY_SUBCOMMANDS.has(args[0].toLowerCase()) ? 'read-only' : 'runs-cli';
 }
 
 function clipForReason(value, maxChars = 300) {
@@ -321,7 +356,10 @@ function comparablePaths(targetPath) {
 function stateFileWriteTarget(toolName, rawInput, cwd, globalDir) {
   if (!FILE_WRITE_TOOLS.has(typeof toolName === 'string' ? toolName.trim() : '')) return null;
   const stateForms = comparablePaths(getTierPaths(globalDir).stateDir);
-  const approvalsForms = new Set(comparablePaths(getTrustedProjectsPath(globalDir)));
+  const approvalsForms = new Set([
+    ...comparablePaths(getTrustedProjectsPath(globalDir)),
+    ...comparablePaths(getAcknowledgedApprovalsPath(globalDir)),
+  ]);
 
   for (const target of [rawInput.file_path, rawInput.notebook_path]) {
     if (typeof target !== 'string' || !target.trim()) continue;
@@ -523,6 +561,18 @@ function trimLinesToBudget(text, budget) {
   return out.join('\n').trimEnd();
 }
 
+/** Most characters of one hook's `systemMessage` (Claude Code caps the field at 10,000). */
+export const USER_NOTICE_MAX_CHARS = 2000;
+
+// One line per notice; a notice never brings line breaks of its own.
+function joinUserNotices(notices) {
+  const text = notices
+    .map((notice) => String(notice || '').replace(/\s*[\r\n]+\s*/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
+  return text.length > USER_NOTICE_MAX_CHARS ? `${text.slice(0, USER_NOTICE_MAX_CHARS - 3)}...` : text;
+}
+
 export function restoreFailureNote(restoreFailure) {
   if (restoreFailure === RESTORE_FAILURE_RECORD_TOO_LARGE) return TURNS_NOT_RESTORED_TOO_LARGE_NOTE;
   if (restoreFailure === RESTORE_FAILURE_NO_TURNS_WITHIN_CAP) return TURNS_NOT_RESTORED_NO_TURNS_NOTE;
@@ -534,6 +584,14 @@ export function restoreFailureNote(restoreFailure) {
  * Supports optional part: 'all' (default) | 'core' | 'context'.
  * `startedAt` (epoch ms the hook process started) and `indexBudget` set the index sync limits, see
  * `resolveHookSyncOptions`; `turnOptions` is passed to the transcript reader (window sizes, for tests).
+ * `now` and `sleep` are the clock and the wait used while looking for a clear record (see
+ * CLEAR_RECORD_WAIT_MS); `clearRecordWaitMs` / `clearRecordPollMs` override the two constants.
+ *
+ * Besides `hookSpecificOutput.additionalContext` (read by the model, not shown to the user) the result can
+ * carry a top-level `systemMessage`, which Claude Code shows to the user: one compact line for each thing
+ * the user should know about - project memory not loaded (folder not approved), documents not indexed yet,
+ * recent turns not restored, approvals changed without the confirmation dialog. Routine output never goes
+ * there.
  */
 export function handleClaudeSessionStart(
   payload = {},
@@ -547,6 +605,9 @@ export function handleClaudeSessionStart(
     indexBudget,
     turnOptions,
     now = Date.now,
+    sleep = sleepSync,
+    clearRecordWaitMs = CLEAR_RECORD_WAIT_MS,
+    clearRecordPollMs = CLEAR_RECORD_POLL_MS,
   } = {},
 ) {
   if (isSubagentPayload(payload)) {
@@ -582,6 +643,19 @@ export function handleClaudeSessionStart(
     ? formatProjectNotApprovedNotice(projectDir)
     : '';
 
+  // Lines for the user's own screen (`systemMessage`); see the function comment.
+  const userNotices = [];
+  if (notApprovedNotice) userNotices.push(formatProjectNotApprovedUserNotice(projectDir));
+
+  // Approvals changed without the confirmation dialog: announced once per session and change.
+  let approvalsNotice = null;
+  if (part !== 'core') {
+    pruneApprovalCheckRecords(effectiveGlobalDir);
+    approvalsNotice = checkApprovalsForSession({ globalDir: effectiveGlobalDir, sessionId: extractSessionId(payload) });
+    if (approvalsNotice) userNotices.push(approvalsNotice.userText);
+  }
+  const approvalsContext = approvalsNotice ? approvalsNotice.contextText : '';
+
   const sections = [];
   let used = 0;
 
@@ -597,7 +671,8 @@ export function handleClaudeSessionStart(
   if ((part === 'all' || part === 'core') && !skipDuplicateHeadCore) {
     const headCore = readHeadCore(promptsDir, config);
     if (headCore) {
-      const noticeReserve = notApprovedNotice ? notApprovedNotice.length + 2 : 0;
+      const noticeReserve = (notApprovedNotice ? notApprovedNotice.length + 2 : 0)
+        + (approvalsContext ? approvalsContext.length + 2 : 0);
       pushSection(trimLinesToBudget(headCore, maxChars - noticeReserve));
     }
     if (part === 'core') {
@@ -615,6 +690,9 @@ export function handleClaudeSessionStart(
 
   if (notApprovedNotice) {
     pushSection(notApprovedNotice);
+  }
+  if (approvalsContext) {
+    pushSection(approvalsContext);
   }
 
   const sepCost = (n) => (sections.length + n > 0 ? 2 : 0);
@@ -636,6 +714,7 @@ export function handleClaudeSessionStart(
   });
   if (unindexed.length > 0) {
     pushSection(formatUnindexedNotice(unindexed, { maxChars: maxChars - used - sepCost(0) }));
+    userNotices.push(formatUnindexedUserNotice(unindexed));
   }
 
   // 2. Budget-first relay inbox delivery. The inbox belongs to the terminal and lives in the global store,
@@ -708,15 +787,28 @@ export function handleClaudeSessionStart(
         }
 
         if (!identified) {
-          const nowMs = Number(typeof now === 'function' ? now() : now) || Date.now();
-          const found = findClearedSession({
+          const readClock = () => Number(typeof now === 'function' ? now() : now) || Date.now();
+          const lookForRecord = () => findClearedSession({
             globalDir: effectiveGlobalDir,
             projectDir,
             terminalId,
             newSessionId: extractSessionId(payload),
             currentTranscript: resolvedCurrent,
-            nowMs,
+            nowMs: readClock(),
           });
+          let found = lookForRecord();
+          // The SessionEnd hook of the cleared session may still be writing its record: look again for a
+          // short while. Only this path waits (no previous session known, no record yet).
+          // The wait is counted in time slept, so it ends after the limit whatever clock was injected.
+          const waitLimitMs = Math.max(0, Number(clearRecordWaitMs) || 0);
+          const pollMs = Math.max(1, Number(clearRecordPollMs) || CLEAR_RECORD_POLL_MS);
+          let waitedMs = 0;
+          while (found.status === 'none' && typeof sleep === 'function' && waitedMs < waitLimitMs) {
+            const step = Math.min(pollMs, waitLimitMs - waitedMs);
+            sleep(step);
+            waitedMs += step;
+            found = lookForRecord();
+          }
           if (found.status === 'one') {
             identified = true;
             extracted = readTurns(found.transcript);
@@ -735,6 +827,7 @@ export function handleClaudeSessionStart(
       }
     }
     pushNote(turnsNote);
+    if (turnsNote) userNotices.push(turnsNote);
   }
 
   // 4. Non-truncating FIT_STEPS memory overview
@@ -761,16 +854,17 @@ export function handleClaudeSessionStart(
     }
   }
 
-  if (sections.length === 0) {
-    return {};
-  }
-
-  return {
-    hookSpecificOutput: {
+  const output = {};
+  if (sections.length > 0) {
+    output.hookSpecificOutput = {
       hookEventName: 'SessionStart',
       additionalContext: sections.join('\n\n'),
-    },
-  };
+    };
+  }
+  if (userNotices.length > 0) {
+    output.systemMessage = joinUserNotices(userNotices);
+  }
+  return output;
 }
 
 /**
@@ -797,9 +891,13 @@ export function handleClaudePreCompact(payload = {}, { globalDir } = {}) {
 }
 
 /**
- * Claude Code UserPromptSubmit handler: deliver the relay inbox of HC_TERMINAL_ID.
- * The inbox is the terminal's (global store), so delivery does not depend on the current project having a
- * `.memory/` or being approved; a project excluded by the configuration gets nothing.
+ * Claude Code UserPromptSubmit handler:
+ * - checks whether the approvals list was changed without the confirmation dialog since this session last
+ *   looked (two `stat` calls and one small read on an ordinary prompt). A new change is announced once: to
+ *   the user through `systemMessage`, to the model through `additionalContext`;
+ * - delivers the relay inbox of HC_TERMINAL_ID. The inbox is the terminal's (global store), so delivery does
+ *   not depend on the current project having a `.memory/` or being approved.
+ * A project excluded by the configuration gets nothing.
  */
 export function handleClaudeUserPrompt(
   payload = {},
@@ -811,9 +909,6 @@ export function handleClaudeUserPrompt(
   if (isSubagentPayload(payload)) {
     return {};
   }
-  if (!isValidTerminalId(terminalId)) {
-    return {};
-  }
 
   const projectDir = extractCwd(payload, process.cwd());
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
@@ -823,21 +918,39 @@ export function handleClaudeUserPrompt(
   }
   const maxChars = resolveHookBudget(config);
 
-  // One consumer at a time: when another process is delivering this terminal's messages right now,
-  // nothing is injected and the messages stay for the next prompt.
-  const delivered = deliverInboxForHook(terminalId, {
+  const approvalsNotice = checkApprovalsForSession({
     globalDir: effectiveGlobalDir,
-    projectDir,
-    maxChars,
+    sessionId: extractSessionId(payload),
   });
+  const contextParts = approvalsNotice ? [approvalsNotice.contextText] : [];
 
-  if (!delivered.text) return {};
-  return {
-    hookSpecificOutput: {
+  if (isValidTerminalId(terminalId)) {
+    const inboxBudget = approvalsNotice ? maxChars - approvalsNotice.contextText.length - 2 : maxChars;
+    if (inboxBudget >= 120 || !approvalsNotice) {
+      // One consumer at a time: when another process is delivering this terminal's messages right now,
+      // nothing is injected and the messages stay for the next prompt.
+      const delivered = deliverInboxForHook(terminalId, {
+        globalDir: effectiveGlobalDir,
+        projectDir,
+        maxChars: inboxBudget,
+        // A message that fits an ordinary prompt waits for one instead of being announced as too long.
+        fullBlockChars: maxChars,
+      });
+      if (delivered.text) contextParts.push(delivered.text);
+    }
+  }
+
+  const output = {};
+  if (contextParts.length > 0) {
+    output.hookSpecificOutput = {
       hookEventName: 'UserPromptSubmit',
-      additionalContext: delivered.text,
-    },
-  };
+      additionalContext: contextParts.join('\n\n'),
+    };
+  }
+  if (approvalsNotice) {
+    output.systemMessage = joinUserNotices([approvalsNotice.userText]);
+  }
+  return output;
 }
 
 function preToolUseDecision(permissionDecision, permissionDecisionReason, extra = {}) {
@@ -864,19 +977,33 @@ function subagentTouchesMemoryDir(toolName, rawInput, cwd) {
 }
 
 /**
- * Reason to put a file or shell tool call to the user because it would change project approvals or the
- * state folder they live in, or '' when the call does neither.
+ * What a file or shell tool call means for the project approvals: { askReason, subagentDenied }.
+ * `askReason` is the reason to put the call to the user of the main conversation ('' = no question);
+ * `subagentDenied` is true when a subagent may not make the call at all.
+ * - A shell command that names an approvals file (and is not read-only), and a file tool that writes into
+ *   <globalDir>/state/: the main conversation is asked, a subagent is denied.
+ * - A shell command that merely runs the approval CLI: no question for the main conversation (the CLI shows
+ *   its own confirmation dialog to a person), still denied for a subagent.
  */
-function trustChangeAskReason(toolName, rawInput, cwd, globalDir) {
+function inspectTrustChange(toolName, rawInput, cwd, globalDir) {
   const name = typeof toolName === 'string' ? toolName.trim() : '';
   if (SHELL_TOOLS.has(name)) {
-    return classifyTrustCommand(rawInput.command) === 'change' ? formatTrustCommandAskReason(rawInput.command) : '';
+    const kind = classifyTrustCommand(rawInput.command);
+    if (kind === 'approvals-file') {
+      return { askReason: formatTrustCommandAskReason(rawInput.command), subagentDenied: true };
+    }
+    return { askReason: '', subagentDenied: kind === 'runs-cli' };
   }
   if (FILE_WRITE_TOOLS.has(name)) {
     const target = stateFileWriteTarget(name, rawInput, cwd, globalDir);
-    return target ? formatStateFileWriteAskReason(target.path, { approvalsFile: target.approvalsFile }) : '';
+    if (target) {
+      return {
+        askReason: formatStateFileWriteAskReason(target.path, { approvalsFile: target.approvalsFile }),
+        subagentDenied: true,
+      };
+    }
   }
-  return '';
+  return { askReason: '', subagentDenied: false };
 }
 
 /**
@@ -901,11 +1028,13 @@ export function formatOtherProjectWriteReason(targetDir) {
  * Claude Code PreToolUse handler. In order:
  * - A subagent's Write / Edit / MultiEdit / NotebookEdit into a `.memory/` folder, or Bash / PowerShell
  *   command that mentions one, is denied (subagents hand results back to the main conversation).
+ * - A Bash / PowerShell command that names an approvals file (unless it only reads, see
+ *   `isReadOnlyShellCommand`), and a Write / Edit / MultiEdit / NotebookEdit into <globalDir>/state/, returns
+ *   permissionDecision: 'ask' for the main conversation and 'deny' for a subagent, so the approvals are not
+ *   changed behind the confirmation dialog's back without the user seeing it.
  * - A Bash / PowerShell command that runs the project-approval CLI (`cortex-trust`, `trust-cli.mjs`,
- *   `npm run trust`) or names the approvals file, and a Write / Edit / MultiEdit / NotebookEdit into
- *   <globalDir>/state/, returns permissionDecision: 'ask' for the main conversation and 'deny' for a
- *   subagent, so an agent cannot approve a project without the user seeing it. A plain `status` / `list`
- *   call of the CLI is not put to the user.
+ *   `npm run trust`) is denied for a subagent. The main conversation is not asked: the CLI itself shows a
+ *   confirmation dialog to a person before it approves anything. A plain `status` / `list` call passes.
  * - For subagents calling write-protected cortex tools (memory_save, memory_update,
  *   relay_send, relay_inbox(action="ack")), directly return permissionDecision: 'deny'.
  * - A memory_save / memory_update whose `project_dir` is another project returns permissionDecision: 'ask',
@@ -929,11 +1058,12 @@ export function handleClaudePreToolUse(payload = {}, { globalDir } = {}) {
     if (callerIsSubagent && subagentTouchesMemoryDir(toolName, rawInput, cwd)) {
       return preToolUseDecision('deny', SUBAGENT_MEMORY_DIR_DENY_REASON);
     }
-    const askReason = trustChangeAskReason(toolName, rawInput, cwd, resolveCortexGlobalDir(globalDir));
-    if (askReason) {
-      return callerIsSubagent
-        ? preToolUseDecision('deny', SUBAGENT_TRUST_CHANGE_DENY_REASON)
-        : preToolUseDecision('ask', askReason);
+    const trustChange = inspectTrustChange(toolName, rawInput, cwd, resolveCortexGlobalDir(globalDir));
+    if (callerIsSubagent && trustChange.subagentDenied) {
+      return preToolUseDecision('deny', SUBAGENT_TRUST_CHANGE_DENY_REASON);
+    }
+    if (!callerIsSubagent && trustChange.askReason) {
+      return preToolUseDecision('ask', trustChange.askReason);
     }
     return {};
   }

@@ -51,6 +51,41 @@ export function isSubagentCaller(args = {}, meta = {}) {
   return false;
 }
 
+/** Most document names the `indexing` note of a tool result lists. */
+export const INDEXING_NOTE_MAX_DOCUMENTS = 5;
+
+/**
+ * The `indexing` field of a tool result: present when the index sync of this call left documents to the
+ * background index catch-up (too large or too many for a tool call's time budget, or the index was busy),
+ * so the caller knows the answer was made from an index that is not complete yet.
+ *   { pending: <number of waiting documents>, documents: [<up to INDEXING_NOTE_MAX_DOCUMENTS names>] }
+ * A name is the path inside the memory folder ("global:" in front for the global store). Returns null when
+ * nothing is waiting. Documents that cannot be indexed at all are not counted here; the session-start
+ * notice and `cortex-status` report those.
+ */
+export function describeIndexing(unindexed) {
+  const pending = (Array.isArray(unindexed) ? unindexed : [])
+    .filter((item) => item && typeof item.path === 'string' && item.reason !== 'error');
+  if (pending.length === 0) return null;
+  return {
+    pending: pending.length,
+    documents: pending
+      .slice(0, INDEXING_NOTE_MAX_DOCUMENTS)
+      .map((item) => (item.scope === 'global' ? `global:${item.path}` : item.path)),
+  };
+}
+
+// A tool result with the `indexing` note added (to `data` of an error result, to the result object otherwise).
+function withIndexingNote(result, note) {
+  if (!note || !result || typeof result !== 'object' || Array.isArray(result)) return result;
+  if (result.isError && 'data' in result) {
+    return result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+      ? { ...result, data: { ...result.data, indexing: note } }
+      : result;
+  }
+  return { ...result, indexing: note };
+}
+
 function isSameFolder(a, b) {
   if (!a || !b) return false;
   try {
@@ -297,6 +332,26 @@ export function createToolRegistry(
     return isProjectTrusted(projectDir, { globalDir: store.globalDir });
   };
 
+  // One tool call against one store. The call's index syncs share one time budget when the store has tool
+  // sync limits (the MCP server's store); whatever they leave out is named in the result's `indexing` field.
+  const runToolCall = async (targetStore, info, fn) => {
+    const tracked = Boolean(targetStore?.toolSyncLimits) && typeof targetStore.beginSyncWindow === 'function';
+    if (tracked) targetStore.beginSyncWindow();
+    const currentNote = () => (tracked ? describeIndexing(targetStore.getUnindexedDocs()) : null);
+    try {
+      return withIndexingNote(await fn(targetStore, info), currentNote());
+    } catch (err) {
+      // "not found" from a tool may only mean "not indexed yet": the error says so as well
+      if (err && typeof err === 'object') {
+        const note = currentNote();
+        if (note) err.indexing = note;
+      }
+      throw err;
+    } finally {
+      if (tracked) targetStore.endSyncWindow();
+    }
+  };
+
   const withProjectStore = async (args, fn) => {
     const requestedDir = typeof args?.project_dir === 'string' && args.project_dir.trim()
       ? path.resolve(args.project_dir.trim())
@@ -306,12 +361,12 @@ export function createToolRegistry(
     // Same folder by real path: a `project_dir` that reaches the default project through a junction or a
     // symlink uses the default store instead of opening a second one on the same files.
     if (!requestedDir || isSameFolder(requestedDir, defaultRoot)) {
-      return fn(store, {
+      return runToolCall(store, {
         projectDir: defaultRoot,
         enabled: isDefaultProjectEnabled(),
         approved: isApproved(defaultRoot),
         isDefaultStore: true,
-      });
+      }, fn);
     }
 
     const cfg = loadConfig({ projectDir: requestedDir, globalDir: store.globalDir });
@@ -321,14 +376,17 @@ export function createToolRegistry(
       globalDir: store.globalDir,
       config: cfg,
       disableVec: store.disableVec,
+      // The same limits as the server's own store; what a sync leaves out is reported to the same owner.
+      toolSyncLimits: store.toolSyncLimits || null,
+      onSyncDeferred: store.onSyncDeferred || null,
     });
     try {
-      return await fn(tempStore, {
+      return await runToolCall(tempStore, {
         projectDir: requestedDir,
         enabled,
         approved: isApproved(requestedDir),
         isDefaultStore: false,
-      });
+      }, fn);
     } finally {
       tempStore.close();
     }
@@ -716,6 +774,7 @@ export function createToolRegistry(
           data: {
             error: 'TOOL_EXECUTION_ERROR',
             message: err?.message || String(err),
+            ...(err?.indexing ? { indexing: err.indexing } : {}),
           },
         };
       }

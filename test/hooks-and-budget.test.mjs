@@ -41,7 +41,7 @@ import {
   uninstallCortex,
 } from '../src/hooks/installer.mjs';
 import { enqueueMessage } from '../src/relay/inbox.mjs';
-import { approveProject } from '../src/core/trust.mjs';
+import { approveAsUser } from './support/approve.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-hooks-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -53,7 +53,7 @@ function makeTempEnv(prefix = 'herdr-cortex-hooks-') {
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
   // The project folder of every test environment is approved, as a user would do with cortex-trust.
-  approveProject(projectDir, { globalDir });
+  approveAsUser(projectDir, { globalDir });
   fs.mkdirSync(path.join(promptsDir, 'skills', 'start-job'), { recursive: true });
 
   atomicWriteText(

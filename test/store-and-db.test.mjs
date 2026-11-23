@@ -26,7 +26,7 @@ import { CortexStore } from '../src/core/store.mjs';
 import { searchMemory } from '../src/core/search.mjs';
 import { fitOverviewToBudget } from '../src/core/budget.mjs';
 import { processPendingEmbeddings } from '../src/embeddings/index.mjs';
-import { approveProject } from '../src/core/trust.mjs';
+import { approveAsUser } from './support/approve.mjs';
 import { UNTRUSTED_MEMORY_PREAMBLE } from '../src/core/budget.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-test-') {
@@ -36,7 +36,7 @@ function makeTempEnv(prefix = 'herdr-cortex-test-') {
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
   // The project folder of every test environment is approved, as a user would do with cortex-trust.
-  approveProject(projectDir, { globalDir });
+  approveAsUser(projectDir, { globalDir });
   return {
     root,
     projectDir,
@@ -547,7 +547,7 @@ test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/ex
     const secretProj = path.join(env.root, 'secret-repo');
     fs.mkdirSync(secretProj, { recursive: true });
     // Even for a folder the user approved, the project file can only set the whitelisted keys
-    approveProject(secretProj, { globalDir: env.globalDir });
+    approveAsUser(secretProj, { globalDir: env.globalDir });
 
     // Global config excludes secret-repo and uses a safe baseUrl/apiKeyEnv for its provider
     atomicWriteText(
@@ -613,7 +613,7 @@ test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/ex
     // Project `enabled: false` IS honored to disable an otherwise allowed project
     const optOutProj = path.join(env.root, 'opt-out-repo');
     fs.mkdirSync(optOutProj, { recursive: true });
-    approveProject(optOutProj, { globalDir: env.globalDir });
+    approveAsUser(optOutProj, { globalDir: env.globalDir });
     atomicWriteText(path.join(env.globalDir, 'config.json'), JSON.stringify({ mode: 'all', excludedProjects: [] }));
     atomicWriteText(path.join(optOutProj, '.memory', 'config.json'), JSON.stringify({ enabled: false }));
     const optOutCfg = loadConfig({ projectDir: optOutProj, globalDir: env.globalDir });

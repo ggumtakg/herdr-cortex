@@ -1444,3 +1444,39 @@ export async function syncFromDiskYielding(db, tierDir, options = {}) {
     steps.return();
   }
 }
+
+// connection -> { promise, cancelChecks } of the yielding sync that is running on it
+const sharedSyncs = new WeakMap();
+
+/**
+ * The yielding sync, one at a time per connection: a caller that asks while a run is in progress joins that
+ * run and gets its result instead of starting a second pass over the same files. The background work of a
+ * long-lived process goes through this (the MCP server's index catch-up and its embedding queue), so
+ * neither holds the event loop for longer than one file and no document is read twice.
+ * A joined run started earlier, so a file that changed after it was passed is left to the next run.
+ * The run stops (`{ cancelled: true }`) as soon as any caller's `isCancelled()` says so.
+ */
+export function syncFromDiskShared(db, tierDir, options = {}) {
+  const running = sharedSyncs.get(db);
+  if (running) {
+    if (typeof options.isCancelled === 'function') running.cancelChecks.push(options.isCancelled);
+    return running.promise;
+  }
+  const entry = {
+    cancelChecks: typeof options.isCancelled === 'function' ? [options.isCancelled] : [],
+    promise: null,
+  };
+  entry.promise = syncFromDiskYielding(db, tierDir, {
+    ...options,
+    isCancelled: () => entry.cancelChecks.some((check) => check()),
+  }).finally(() => {
+    if (sharedSyncs.get(db) === entry) sharedSyncs.delete(db);
+  });
+  sharedSyncs.set(db, entry);
+  return entry.promise;
+}
+
+/** True while a `syncFromDiskShared` run is in progress on this connection. */
+export function isSharedSyncRunning(db) {
+  return sharedSyncs.has(db);
+}

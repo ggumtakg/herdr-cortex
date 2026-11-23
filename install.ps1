@@ -30,21 +30,27 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Report a problem that ends the installation and exit with code 1.
+# With $ErrorActionPreference = "Stop" a plain Write-Error throws, so an "exit 1" written after it is never
+# reached and a caller that looks at $LASTEXITCODE sees a stale value. The error is therefore written
+# without stopping, and the exit is made here, explicitly.
+function Stop-HerdrInstall {
+    param([string]$Message)
+    Write-Error -Message $Message -ErrorAction Continue
+    exit 1
+}
+
 $RepoRoot = $PSScriptRoot
 $InstallerScript = Join-Path $RepoRoot "src\hooks\installer.mjs"
 $AutoReviveScript = Join-Path $RepoRoot "scripts\auto-revive.ps1"
 
 . (Join-Path $RepoRoot "scripts\install-tools.ps1")
+. (Join-Path $RepoRoot "scripts\store-location.ps1")
 
-$TestHome = if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_TEST_HOME)) {
-    $env:HERDR_CORTEX_TEST_HOME
-} elseif (-not [string]::IsNullOrWhiteSpace($env:HERDR_REVIVE_TEST_HOME)) {
-    $env:HERDR_REVIVE_TEST_HOME
-} else {
-    $null
-}
-$EffectiveHome = if ($TestHome) { $TestHome } else { $env:USERPROFILE }
-$GlobalCortexDir = Join-Path $EffectiveHome ".herdr-cortex"
+# Home directory and global store: decided in scripts\store-location.ps1 (the Node installer applies the same order).
+$TestHome = Get-HerdrTestHome
+$EffectiveHome = Get-HerdrEffectiveHome
+$GlobalCortexDir = Get-HerdrCortexGlobalDir
 
 Write-Host "=== herdr-cortex Installer ===" -ForegroundColor Cyan
 if ($TestHome) {
@@ -55,8 +61,7 @@ if ($TestHome) {
 $NodeExe = $null
 if (-not [string]::IsNullOrWhiteSpace($NodePath)) {
     if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) {
-        Write-Error "-NodePath does not point at a file: $NodePath"
-        exit 1
+        Stop-HerdrInstall "-NodePath does not point at a file: $NodePath"
     }
     $NodeExe = (Resolve-Path -LiteralPath $NodePath).ProviderPath
 } else {
@@ -64,8 +69,7 @@ if (-not [string]::IsNullOrWhiteSpace($NodePath)) {
     if ($nodeCmd) { $NodeExe = $nodeCmd.Source }
 }
 if (-not $NodeExe) {
-    Write-Error "Node.js (node.exe >= 22.13.0) is required but was not found on PATH. Install it, or pass -NodePath <full path of node.exe>."
-    exit 1
+    Stop-HerdrInstall "Node.js (node.exe >= 22.13.0) is required but was not found on PATH. Install it, or pass -NodePath <full path of node.exe>."
 }
 
 $nodeVerRaw = (& $NodeExe -v 2>$null | Select-Object -First 1)
@@ -73,8 +77,7 @@ if ($nodeVerRaw -match '^v?(\d+)\.(\d+)\.(\d+)') {
     $nodeMajor = [int]$Matches[1]
     $nodeMinor = [int]$Matches[2]
     if ($nodeMajor -lt 22 -or ($nodeMajor -eq 22 -and $nodeMinor -lt 13)) {
-        Write-Error "Node.js >= 22.13.0 is required for built-in node:sqlite, but found $nodeVerRaw."
-        exit 1
+        Stop-HerdrInstall "Node.js >= 22.13.0 is required for built-in node:sqlite, but found $nodeVerRaw."
     }
     Write-Host "[OK] Node.js $nodeVerRaw detected." -ForegroundColor Green
 } else {
@@ -103,8 +106,7 @@ try {
     [Console]::OutputEncoding = $prevOutEnc
 }
 if ($installerExit -ne 0) {
-    Write-Error "herdr-cortex was not installed (see the messages above). The PowerShell profile and the ExecutionPolicy were not touched."
-    exit 1
+    Stop-HerdrInstall "herdr-cortex was not installed (see the messages above). The PowerShell profile and the ExecutionPolicy were not touched."
 }
 
 # 3. PowerShell ExecutionPolicy: the profile is a local script, so it only loads when local scripts may run.

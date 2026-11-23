@@ -1,7 +1,7 @@
 import path from 'node:path';
 import readline from 'node:readline';
-import { CortexStore } from '../core/store.mjs';
-import { readDeferredIndex, syncFromDiskYielding } from '../core/db.mjs';
+import { CortexStore, DEFAULT_TOOL_SYNC_LIMITS } from '../core/store.mjs';
+import { readDeferredIndex, syncFromDiskShared } from '../core/db.mjs';
 import { REPO_ROOT, isMainModule, isProjectEnabled, loadConfig } from '../core/config.mjs';
 import {
   createEmbeddingQueue,
@@ -21,75 +21,185 @@ export const DEFAULT_PROTOCOL_VERSION = '2024-11-05';
 
 /** How long after the server starts the background index catch-up begins. */
 export const INDEX_CATCH_UP_DELAY_MS = 250;
+/** How long after a tool call left documents out the catch-up starts again (the answer goes out first). */
+export const INDEX_CATCH_UP_REQUEST_DELAY_MS = 50;
 
 /**
- * Index, in the background, the documents the session-start hooks left out (too big or too slow for a hook's
- * time budget) together with everything else that changed on disk. This process has no hook timeout; the
- * sync gives the event loop a turn after every file, so tool calls that arrive meanwhile are answered
- * between two files. A tool call's own sync indexes whatever is still missing, so nothing depends on this
- * run having finished. `onIndexed(scope, result)` is called for a tier that got new or changed documents.
- * When a hook had left documents out (the tier's deferred-index record), one line on stderr says what became of them.
- * Returns { done, cancel }: `done` resolves with the per-tier sync results plus `waitingBefore`, the number of
- * documents the record listed ({} when cancelled before start).
+ * The background index catch-up of a long-lived process.
+ *
+ * It indexes what was left out elsewhere: by the session-start hooks (too big or too slow for a hook's time
+ * budget), and by the tool calls of this process, whose own sync has a small time budget so that a call
+ * never waits for large or many documents (`toolSyncLimits` of the store). Nothing is ever excluded: what a
+ * limited sync leaves out is indexed here.
+ *
+ * - The first pass starts `delayMs` after the call and covers both tiers of `store`.
+ * - `request({ scope, projectRoot })` asks for another pass of one tier (the store calls it through
+ *   `onSyncDeferred`). A request for another project (`projectRoot` differs from the store's; a tool call
+ *   with `project_dir`) is served with a store opened for that pass through `openProjectStore`.
+ * - Every pass is the yielding, shared sync (`syncFromDiskShared`): the event loop gets a turn after every
+ *   file, so tool calls that arrive meanwhile are answered between two files, and a sync the embedding queue
+ *   started on the same connection is joined, not repeated. One file is still indexed in one piece: while a
+ *   very large document is being read, a tool call waits for that one document.
+ * - `onIndexed(scope, result, { projectDir })` is called for a tier that got new or changed documents.
+ * - When a hook had left documents out (the tier's deferred-index record), one line on stderr says what
+ *   became of them.
+ *
+ * Returns { done, request, whenIdle, cancel }: `done` resolves with the results of the first pass, per tier
+ * the sync result plus `waitingBefore`, the number of documents the record listed ({} when cancelled before
+ * the start); `whenIdle()` resolves when no pass is running and none is asked for.
  */
 export function startIndexCatchUp(
   store,
   {
     delayMs = INDEX_CATCH_UP_DELAY_MS,
+    requestDelayMs = INDEX_CATCH_UP_REQUEST_DELAY_MS,
     onIndexed = null,
+    openProjectStore = null,
     log = (line) => process.stderr.write(`${line}\n`),
   } = {},
 ) {
   let cancelled = false;
   let timer = null;
+  let running = null;
+  let firstPassDone = false;
   let finish;
   const done = new Promise((resolve) => {
     finish = resolve;
   });
+  const idleWaiters = [];
 
-  const run = async () => {
+  const pendingScopes = new Set(['project', 'global']);
+  const pendingProjects = new Map(); // normalized project root -> project root
+  const hasPending = () => pendingScopes.size > 0 || pendingProjects.size > 0;
+  const pathKey = (dir) => (process.platform === 'win32' ? path.resolve(dir).toLowerCase() : path.resolve(dir));
+
+  const syncTier = async (tier, scope, extra = {}) => {
+    const waitingBefore = readDeferredIndex(tier.dir).count;
+    const result = await syncFromDiskShared(tier.db, tier.dir, { isCancelled: () => cancelled });
+    if (result.cancelled) return { ...result, waitingBefore };
+    if (waitingBefore > 0 && typeof log === 'function') {
+      const stillFailing = result.failed?.length || 0;
+      log(
+        `[herdr-cortex-mcp] index catch-up (${scope}): ${waitingBefore} document(s) had been left out by a hook or a tool call; `
+        + `indexed ${result.addedOrUpdated}${stillFailing > 0 ? `, ${stillFailing} could not be indexed` : ''}`,
+      );
+    }
+    if (result.addedOrUpdated > 0 && typeof onIndexed === 'function') {
+      onIndexed(scope, result, extra);
+    }
+    return { ...result, waitingBefore };
+  };
+
+  const runPass = async (scopes, projects) => {
     const results = {};
     for (const scope of ['project', 'global']) {
-      if (cancelled) break;
+      if (cancelled || !scopes.includes(scope)) continue;
       try {
         const tier = store.getTierIfExists(scope);
-        if (!tier) continue;
-        const waitingBefore = readDeferredIndex(tier.dir).count;
-        const result = await syncFromDiskYielding(tier.db, tier.dir, { isCancelled: () => cancelled });
-        results[scope] = { ...result, waitingBefore };
-        if (result.cancelled) continue;
-        if (waitingBefore > 0 && typeof log === 'function') {
-          const stillFailing = result.failed?.length || 0;
-          log(
-            `[herdr-cortex-mcp] index catch-up (${scope}): ${waitingBefore} document(s) had been left out by a hook; `
-            + `indexed ${result.addedOrUpdated}${stillFailing > 0 ? `, ${stillFailing} could not be indexed` : ''}`,
-          );
-        }
-        if (result.addedOrUpdated > 0 && typeof onIndexed === 'function') {
-          onIndexed(scope, result);
-        }
+        if (tier) results[scope] = await syncTier(tier, scope);
       } catch (err) {
         results[scope] = { error: String(err?.message || err) };
       }
     }
-    finish(results);
+    for (const projectDir of projects) {
+      if (cancelled || typeof openProjectStore !== 'function') continue;
+      let other = null;
+      try {
+        other = openProjectStore(projectDir);
+        const tier = other.getTierIfExists('project');
+        if (tier) await syncTier(tier, 'project', { projectDir });
+      } catch {
+        // another project's index is brought up to date by the next call that needs it
+      } finally {
+        try {
+          if (other) other.close();
+        } catch {
+          // ignore close errors
+        }
+      }
+    }
+    return results;
   };
 
-  timer = setTimeout(() => {
-    timer = null;
-    run();
-  }, Math.max(0, Number(delayMs) || 0));
-  if (typeof timer.unref === 'function') timer.unref();
+  const settleIdle = () => {
+    if (running || timer || (hasPending() && !cancelled)) return;
+    for (const resolve of idleWaiters.splice(0)) resolve();
+  };
+
+  const pump = () => {
+    if (running || cancelled) return;
+    running = (async () => {
+      while (!cancelled && hasPending()) {
+        const scopes = [...pendingScopes];
+        pendingScopes.clear();
+        const projects = [...pendingProjects.values()];
+        pendingProjects.clear();
+        const results = await runPass(scopes, projects);
+        if (!firstPassDone) {
+          firstPassDone = true;
+          finish(results);
+        }
+      }
+    })().catch(() => {}).finally(() => {
+      running = null;
+      if (!firstPassDone) {
+        firstPassDone = true;
+        finish({});
+      }
+      // A request that came in after the last round was checked still gets its pass.
+      if (hasPending() && !cancelled) arm(0);
+      settleIdle();
+    });
+  };
+
+  // Plan a pass after `ms`, unless one is already planned for an earlier moment or one is running.
+  // (a function declaration, so that the pass above can ask for the next one)
+  let timerDue = 0;
+  function arm(ms) {
+    if (running || cancelled) return;
+    const delay = Math.max(0, Number(ms) || 0);
+    const due = Date.now() + delay;
+    if (timer && timerDue <= due) return;
+    if (timer) clearTimeout(timer);
+    timerDue = due;
+    timer = setTimeout(() => {
+      timer = null;
+      pump();
+      settleIdle();
+    }, delay);
+    if (typeof timer.unref === 'function') timer.unref();
+  }
+
+  arm(delayMs);
 
   return {
     done,
+    /** Ask for another pass: `scope` 'project' | 'global'; `projectRoot` when it is another project's tier. */
+    request({ scope = 'project', projectRoot = '' } = {}) {
+      if (cancelled) return;
+      const otherProject = scope === 'project' && projectRoot && pathKey(projectRoot) !== pathKey(store.projectRoot);
+      if (otherProject) pendingProjects.set(pathKey(projectRoot), projectRoot);
+      else pendingScopes.add(scope === 'global' ? 'global' : 'project');
+      // A pass that is running picks the request up when it finishes its current round.
+      arm(requestDelayMs);
+    },
+    whenIdle() {
+      if (!running && !timer && !(hasPending() && !cancelled)) return Promise.resolve();
+      return new Promise((resolve) => {
+        idleWaiters.push(resolve);
+      });
+    },
     cancel() {
       cancelled = true;
       if (timer) {
         clearTimeout(timer);
         timer = null;
+      }
+      if (!running && !firstPassDone) {
+        firstPassDone = true;
         finish({});
       }
+      settleIdle();
     },
   };
 }
@@ -98,6 +208,7 @@ export const SERVER_INSTRUCTIONS = `herdr-cortex MCP 도구 안내 (서버 이�
 - 기억 조회: memory_overview(활성 세션·결정·할 일), memory_search(하이브리드 1단계 요약), memory_read(전문), memory_graph(1~10홉 계보·파일 영향).
 - 기억 저장(메인 HEAD 전용, 서브에이전트 읽기 전용): memory_save(type: decision|worklog|knowledge|todo|baseline, supersedes, derived_from, files, scope: project|global, global 선호는 category: "preferences") 및 memory_update(status: active|done|superseded|archived, supersedes: 대체할 문서 ID — memory_save와 같은 전이).
 - 멀티 워크스페이스: 필요 시 memory_* 도구에 project_dir 지정 가능.
+- 색인 대기: memory_* 결과에 indexing { pending, documents }가 있으면 그 문서들은 아직 색인 중이라(백그라운드에서 처리) 결과에 빠져 있을 수 있음.
 - Herdr 탭 협업: relay_tabs(탭 조회), relay_send(context_docs 첨부, HEAD 전용), relay_inbox(action: peek|ack; 훅이 이미 주입한 메시지는 24시간 보관되며 include_delivered: true로 다시 조회).
 - 프롬프트 로드: cortex_prompt로 start-job, product-planning, delegate, independent-review, plan-run(kind: "skill"), DEVELOPMENT_STANDARD(kind: "standard"), coder/developer/reviewer(kind: "agent") 로드.`;
 
@@ -316,7 +427,8 @@ export function createMcpServer({
 function parseCliOptions(argv) {
   const opts = {
     projectDir: process.env.HERDR_CORTEX_PROJECT || process.cwd(),
-    globalDir: process.env.HERDR_CORTEX_HOME || undefined,
+    // Without --global the store is located by `resolveGlobalDir` (HERDR_CORTEX_HOME, the test home, the user's home).
+    globalDir: undefined,
     promptsDir: path.join(REPO_ROOT, 'prompts'),
   };
 
@@ -338,7 +450,10 @@ function parseCliOptions(argv) {
  * Documents that are still waiting for an embedding are scheduled right away, so work left over from an earlier
  * session or an outage does not wait for the next save.
  * Shortly after the start (`indexCatchUpDelayMs`, a negative value turns it off) the index catch-up runs in the
- * background, see `startIndexCatchUp`.
+ * background, see `startIndexCatchUp`. The store gets tool sync limits (`toolSyncLimits`, default
+ * `DEFAULT_TOOL_SYNC_LIMITS`; `null` turns them off): a tool call indexes what fits its small budget, answers
+ * from what is indexed, names what is still waiting in the result's `indexing` field, and the catch-up
+ * indexes the rest. With the catch-up turned off the limits are off as well, so nothing is left unindexed.
  * `embeddingProvider` (one provider for every tier), `embeddingProviders` ({ project, global }),
  * `embeddingBreaker`, `input` and `output` are injectable for tests.
  */
@@ -352,12 +467,26 @@ export function createServerRuntime({
   hcClient = null,
   queueDebounceMs = 200,
   indexCatchUpDelayMs = INDEX_CATCH_UP_DELAY_MS,
+  indexCatchUpRequestDelayMs = INDEX_CATCH_UP_REQUEST_DELAY_MS,
+  toolSyncLimits = DEFAULT_TOOL_SYNC_LIMITS,
   input,
   output,
 } = {}) {
   const config = loadConfig({ projectDir, globalDir });
   const projectEnabled = isProjectEnabled(projectDir, config);
-  const store = new CortexStore({ projectDir, globalDir, config });
+  const catchUpEnabled = Number(indexCatchUpDelayMs) >= 0;
+  // Assigned below; the store only reports what its limited syncs left out.
+  let indexCatchUp = null;
+  const store = new CortexStore({
+    projectDir,
+    globalDir,
+    config,
+    // Limited tool syncs need the catch-up to finish their work: without it every sync indexes everything.
+    toolSyncLimits: catchUpEnabled ? toolSyncLimits : null,
+    onSyncDeferred: ({ scope, projectRoot }) => {
+      if (indexCatchUp) indexCatchUp.request({ scope, projectRoot });
+    },
+  });
 
   const breaker = embeddingBreaker
     || getSharedEmbeddingBreaker({ cooldownMs: config.embedding?.circuitBreakMs });
@@ -416,13 +545,17 @@ export function createServerRuntime({
 
   embeddingQueue.schedule('all');
 
-  // Documents a hook deferred are indexed here; what gets indexed is then queued for embedding.
-  const indexCatchUp = Number(indexCatchUpDelayMs) >= 0
+  // Documents a hook or a tool call deferred are indexed here; what gets indexed is then queued for embedding.
+  indexCatchUp = catchUpEnabled
     ? startIndexCatchUp(store, {
         delayMs: indexCatchUpDelayMs,
-        onIndexed: (scope) => embeddingQueue.schedule(scope),
+        requestDelayMs: indexCatchUpRequestDelayMs,
+        openProjectStore: (otherProjectDir) => new CortexStore({ projectDir: otherProjectDir, globalDir: store.globalDir }),
+        onIndexed: (scope, _result, { projectDir: otherProjectDir } = {}) => (
+          otherProjectDir ? embeddingQueue.schedule(scope, { projectDir: otherProjectDir }) : embeddingQueue.schedule(scope)
+        ),
       })
-    : { done: Promise.resolve({}), cancel() {} };
+    : { done: Promise.resolve({}), request() {}, whenIdle: () => Promise.resolve(), cancel() {} };
 
   let stopped = false;
   const shutdown = async () => {
@@ -430,7 +563,7 @@ export function createServerRuntime({
     stopped = true;
     indexCatchUp.cancel();
     try {
-      await indexCatchUp.done;
+      await indexCatchUp.whenIdle();
     } catch {
       // ignore catch-up errors on shutdown
     }

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 import { DEFAULT_CONFIG, REPO_ROOT, atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
+import { runTrustCli } from '../src/core/trust-cli.mjs';
 import { OLD_DEFAULT_CONFIGS, findBackups, installCortex, isOwnHook } from '../src/hooks/installer.mjs';
 
 // The PowerShell scripts are driven through Windows PowerShell 5.1 (`powershell -NoProfile -File`), always
@@ -627,24 +628,39 @@ test('shell commands: cortex-trust and cortex-status run with the Node path reco
     fs.mkdirSync(project, { recursive: true });
     installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, antigravityPresent: false });
 
-    // PATH holds neither node nor hc: everything below works through the recorded absolute path
-    const results = runInLoadedShell(env, [
+    // PATH holds neither node nor hc: everything below works through the recorded absolute path.
+    // (the variables npm sets for a script are present, as in a shell started from one: the default folder
+    // must still be the shell's location, not npm's INIT_CWD)
+    const shellOptions = { extra: { npm_lifecycle_event: 'test', INIT_CWD: REPO_ROOT } };
+    const [before] = runInLoadedShell(env, [
       { kind: 'command', cwd: project, command: 'cortex-trust status' },
-      { kind: 'command', cwd: project, command: 'cortex-trust approve' },
+    ], shellOptions);
+    assert.match(before.text, /^Not approved: .*my project 작업/);
+    assert.equal(before.exitCode, 1);
+
+    // `cortex-trust approve` shows a confirmation dialog, so no child shell of a test may run it for a folder
+    // that is not approved yet. The approval is made here, with the confirmation injected, in the store the
+    // shell uses; the shell commands below read it.
+    const sink = { write() { return true; } };
+    assert.equal(
+      runTrustCli(['approve', project], {
+        globalDir: env.globalDir,
+        stdout: sink,
+        stderr: sink,
+        confirm: () => ({ confirmed: true, via: 'dialog', detail: '' }),
+      }),
+      0,
+    );
+
+    const results = runInLoadedShell(env, [
       { kind: 'command', cwd: project, command: 'cortex-trust status' },
       { kind: 'command', cwd: env.root, command: `cortex-trust status ${psQuote(project)} --json` },
       { kind: 'command', cwd: env.root, command: 'cortex-trust list' },
       { kind: 'command', cwd: project, command: 'cortex-status' },
       { kind: 'command', cwd: env.root, command: 'cortex-trust frobnicate' },
-      // (the variables npm sets for a script are present, as in a shell started from one: the default folder
-      // must still be the shell's location, not npm's INIT_CWD)
-    ], { extra: { npm_lifecycle_event: 'test', INIT_CWD: REPO_ROOT } });
-    const [before, approve, after, json, list, status, usage] = results;
+    ], shellOptions);
+    const [after, json, list, status, usage] = results;
 
-    assert.match(before.text, /^Not approved: .*my project 작업/);
-    assert.equal(before.exitCode, 1);
-    assert.match(approve.text, /^Approved: .*my project 작업/);
-    assert.equal(approve.exitCode, 0);
     assert.match(after.text, /^Approved: .*my project 작업 \(since /);
     assert.equal(after.exitCode, 0);
     assert.deepEqual([JSON.parse(json.text).action, JSON.parse(json.text).approved], ['status', true]);

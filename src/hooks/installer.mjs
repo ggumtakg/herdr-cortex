@@ -14,9 +14,10 @@ import {
   isMainModule,
   loadConfig,
   projectPathKey,
+  resolveGlobalDir,
+  resolveHomeDir,
 } from '../core/config.mjs';
 import { describeEmbeddingStatus, formatEmbeddingStatus } from '../embeddings/resolve.mjs';
-import { resolveEffectiveHome } from '../revive/tracker.mjs';
 import { CLAUDE_PRE_TOOL_USE_MATCHER, LEGACY_MCP_SERVER_NAME, MCP_SERVER_NAME } from './tool-names.mjs';
 
 export const AGY_HOOK_KEY = 'herdr-cortex';
@@ -708,7 +709,7 @@ export function claudeMcpRemoveArgs(name) {
  * `legacyRegistered` - an entry of ours under the old name `cortex` is still there.
  */
 export function checkClaudeMcpRegistration({ homeDir, repoRoot = REPO_ROOT, nodePath = '' } = {}) {
-  const configPath = claudeJsonPath(resolveEffectiveHome(homeDir));
+  const configPath = claudeJsonPath(resolveHomeDir(homeDir));
   const result = {
     configPath,
     readable: true,
@@ -1035,7 +1036,7 @@ function summarizeHookEvent(found, { expectedScript, expectedArg, expectedMatche
  * script_missing | other_repo | other_event | matcher.
  */
 export function checkClaudeHooks({ homeDir, repoRoot = REPO_ROOT } = {}) {
-  const settingsPath = claudeSettingsPath(resolveEffectiveHome(homeDir));
+  const settingsPath = claudeSettingsPath(resolveHomeDir(homeDir));
   const result = { settingsPath, readable: true, error: '', ok: false, events: {} };
   let data;
   try {
@@ -1070,7 +1071,7 @@ export function checkClaudeHooks({ homeDir, repoRoot = REPO_ROOT } = {}) {
  * `~/.gemini` folder (nothing else is filled in then).
  */
 export function checkAntigravity({ homeDir, repoRoot = REPO_ROOT } = {}) {
-  const resolvedHome = resolveEffectiveHome(homeDir);
+  const resolvedHome = resolveHomeDir(homeDir);
   const agyPaths = antigravityPaths(resolvedHome);
   const result = {
     present: fs.existsSync(path.join(resolvedHome, '.gemini')),
@@ -1145,6 +1146,8 @@ function sleepSync(ms) {
  * A file is rewritten only when its content changes, after a copy `<file>.herdr-cortex.<stamp>.bak`.
  *
  * Options: `repoRoot`; `homeDir` (a home directory other than the real one; its files are edited directly);
+ * `globalDir` (the global store; default: `resolveGlobalDir`, i.e. `<homeDir>/.herdr-cortex` for a given
+ * `homeDir`, otherwise HERDR_CORTEX_HOME, the test home, the user's home, in that order);
  * `nodePath` (default: the Node running this; recorded as an absolute path in every hook and MCP entry);
  * `claudeCli` ({ path, viaCmd }, `null` = never use the CLI; default: located, but only when installing into
  * the real home); `runCli`; `antigravityPresent` (default: detected); `verifyDelayMs`; `sleep`; `now`; `env`.
@@ -1152,6 +1155,7 @@ function sleepSync(ms) {
 export function installCortex({
   repoRoot = REPO_ROOT,
   homeDir,
+  globalDir: globalDirOption,
   nodePath = process.execPath,
   claudeCli,
   runCli = runClaudeCli,
@@ -1162,9 +1166,9 @@ export function installCortex({
   env = process.env,
 } = {}) {
   const resolvedRoot = path.resolve(repoRoot);
-  const resolvedHome = resolveEffectiveHome(homeDir);
+  const resolvedHome = resolveHomeDir(homeDir);
   const realRun = isRealHomeRun(homeDir);
-  const globalDir = path.join(resolvedHome, '.herdr-cortex');
+  const globalDir = resolveGlobalDir({ globalDir: globalDirOption, homeDir });
   const agyPaths = antigravityPaths(resolvedHome);
   const context = { repoRoot: resolvedRoot, nodePath, isInstall: true };
   const base = { action: 'install', homeDir: resolvedHome, repoRoot: resolvedRoot, nodePath };
@@ -1292,15 +1296,16 @@ export function installCortex({
 export function uninstallCortex({
   repoRoot = REPO_ROOT,
   homeDir,
+  globalDir: globalDirOption,
   claudeCli,
   runCli = runClaudeCli,
   now = new Date(),
   env = process.env,
 } = {}) {
   const resolvedRoot = path.resolve(repoRoot);
-  const resolvedHome = resolveEffectiveHome(homeDir);
+  const resolvedHome = resolveHomeDir(homeDir);
   const realRun = isRealHomeRun(homeDir);
-  const globalDir = path.join(resolvedHome, '.herdr-cortex');
+  const globalDir = resolveGlobalDir({ globalDir: globalDirOption, homeDir });
   const agyPaths = antigravityPaths(resolvedHome);
   const context = { repoRoot: resolvedRoot, nodePath: '', isInstall: false };
 
@@ -1378,8 +1383,8 @@ export function uninstallCortex({
  * Every backup file this tool created for the configuration files of `homeDir`, plus those next to the
  * `extraFiles` (the PowerShell profiles, which the PowerShell scripts back up under the same naming).
  */
-export function listBackups({ homeDir, extraFiles = [] } = {}) {
-  const resolvedHome = resolveEffectiveHome(homeDir);
+export function listBackups({ homeDir, globalDir, extraFiles = [] } = {}) {
+  const resolvedHome = resolveHomeDir(homeDir);
   const agyPaths = antigravityPaths(resolvedHome);
   const files = [
     claudeSettingsPath(resolvedHome),
@@ -1387,7 +1392,7 @@ export function listBackups({ homeDir, extraFiles = [] } = {}) {
     agyPaths.hooks,
     agyPaths.mcpPrimary,
     agyPaths.mcpSecondary,
-    path.join(resolvedHome, '.herdr-cortex', 'config.json'),
+    path.join(resolveGlobalDir({ globalDir, homeDir }), 'config.json'),
     ...extraFiles.map((file) => path.resolve(file)),
   ];
   return [...new Set(files.flatMap((file) => findBackups(file)))];
@@ -1409,8 +1414,8 @@ export function removeBackups(options = {}) {
 }
 
 /** The embedding status lines of the global configuration (where documents would be sent, or that it is off). */
-export function describeInstalledEmbedding({ homeDir } = {}) {
-  const globalDir = path.join(resolveEffectiveHome(homeDir), '.herdr-cortex');
+export function describeInstalledEmbedding({ homeDir, globalDir: globalDirOption } = {}) {
+  const globalDir = resolveGlobalDir({ globalDir: globalDirOption, homeDir });
   return withoutConsoleWarnings(() => formatEmbeddingStatus(describeEmbeddingStatus(loadConfig({ globalDir }))));
 }
 

@@ -25,6 +25,7 @@ import {
 } from '../revive/tracker.mjs';
 import { deliverInboxForHook } from '../relay/inbox.mjs';
 import { formatUnindexedNotice, loadHookOverview, resolveHookSyncOptions } from './overview.mjs';
+import { checkApprovalsForSession, pruneApprovalCheckRecords } from './approvals-watch.mjs';
 import {
   DEFAULT_MAX_TAIL_BYTES,
   extractAntigravityState,
@@ -86,6 +87,17 @@ function trimLinesToBudget(text, budget) {
 // Notice injected with the startup context when the folder has a .memory/ directory that was not loaded.
 function resolveNotApprovedNotice(projectDir, projectTrusted) {
   return !projectTrusted && hasProjectMemoryDir(projectDir) ? formatProjectNotApprovedNotice(projectDir) : '';
+}
+
+/**
+ * The "approvals changed without the confirmation dialog" warning for this conversation, or ''. Checked on
+ * every hook call (cheap, see `approvals-watch.mjs`) and announced once per conversation and change.
+ * Antigravity hooks have one output channel, `injectSteps`, which the model reads; no field is known that
+ * is shown to the user directly, so the warning asks the model to pass it on.
+ */
+function resolveApprovalsWarning(globalDir, convId) {
+  const notice = checkApprovalsForSession({ globalDir, sessionId: convId });
+  return notice ? notice.contextText : '';
 }
 
 /**
@@ -317,6 +329,9 @@ export function handleAntigravitySessionStart(
     }
   };
 
+  pruneApprovalCheckRecords(effectiveGlobalDir);
+  pushSection(resolveApprovalsWarning(effectiveGlobalDir, convId));
+
   const headCore = readHeadCore(promptsDir, config);
   if (headCore) {
     pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
@@ -455,6 +470,9 @@ export function handleAntigravityPreInvocation(
     }
     return false;
   };
+
+  // 0. Approvals changed without the confirmation dialog (first, so it always fits)
+  pushSection(resolveApprovalsWarning(effectiveGlobalDir, convId));
 
   // 1. Detect /compact command (with or without trailing arguments)
   // The softened instruction: what is saved in memory need not be restated, what is not saved must be kept.

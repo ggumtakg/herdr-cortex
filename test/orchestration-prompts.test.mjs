@@ -7,7 +7,7 @@ import path from 'node:path';
 import { REPO_ROOT } from '../src/core/config.mjs';
 import { CortexStore } from '../src/core/store.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
-import { approveProject } from '../src/core/trust.mjs';
+import { approveAsUser } from './support/approve.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-orch-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -16,7 +16,7 @@ function makeTempEnv(prefix = 'herdr-cortex-orch-') {
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
   // The project folder of every test environment is approved, as a user would do with cortex-trust.
-  approveProject(projectDir, { globalDir });
+  approveAsUser(projectDir, { globalDir });
   return {
     root,
     projectDir,

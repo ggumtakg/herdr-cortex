@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { DEFAULT_CONFIG, REPO_ROOT, atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
 import { DEFERRED_INDEX_FILE } from '../src/core/db.mjs';
 import { CortexStore } from '../src/core/store.mjs';
-import { approveProject } from '../src/core/trust.mjs';
+import { approveAsUser } from './support/approve.mjs';
 import { MAX_EMBED_ATTEMPTS } from '../src/embeddings/failed.mjs';
 import { installCortex, isOwnHook } from '../src/hooks/installer.mjs';
 import { deliverInboxForHook, enqueueMessage } from '../src/relay/inbox.mjs';
@@ -224,7 +224,7 @@ test('cortex-status: approval, per-tier embedding status with given-up documents
   const env = makeTempEnv('herdr-cortex-status-data-');
   try {
     installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, antigravityPresent: false });
-    approveProject(env.projectDir, { globalDir: env.globalDir });
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
     // Project tier: ollama on this machine; global tier: gemini (key from the environment)
     atomicWriteJson(path.join(env.globalDir, 'config.json'), {
       ...JSON.parse(JSON.stringify(DEFAULT_CONFIG)),
@@ -329,7 +329,7 @@ test('cortex-status command line: prints the layout for the folder given with --
     assert.equal(lines[0], '=== herdr-cortex status ===');
     assert.deepEqual(lines.map((line) => line.split(':')[0].trimEnd()).filter((name) => !name.startsWith(' ')), [
       '=== herdr-cortex status ===', 'Repo', 'Global store', 'Node', 'sqlite-vec', 'Claude hooks', 'Claude MCP', 'Antigravity',
-      'This folder', 'Embedding', 'Index', 'Index', 'Relay inbox', 'Config', 'Result',
+      'This folder', 'Approvals', 'Embedding', 'Index', 'Index', 'Relay inbox', 'Config', 'Result',
     ]);
     assert.ok(lines.includes(`This folder  : ${env.projectDir}`));
     assert.ok(lines.includes('Relay inbox  : tab t4: pending=0, held=0, broken=0'));

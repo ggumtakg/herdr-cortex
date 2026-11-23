@@ -34,6 +34,48 @@ export const VALID_TYPES = new Set(['decision', 'worklog', 'knowledge', 'todo', 
 export const VALID_STATUSES = new Set(['active', 'done', 'superseded', 'archived']);
 const VALID_GLOBAL_CATEGORIES = new Set(['preferences', 'knowledge']);
 
+/**
+ * Limits of the index sync a tool call runs inline in a long-lived process (the MCP server), so that a tool
+ * call never waits for large or many changed documents. What does not fit is deferred to the background
+ * index catch-up (never excluded), and the tool answers from what is indexed.
+ * - TOOL_SYNC_BUDGET_MS: the most time one tool call spends on indexing changed documents, estimated from
+ *   file sizes before anything is read.
+ * - TOOL_SYNC_MAX_FILE_BYTES: a changed document larger than this is always left to the background.
+ * - TOOL_SYNC_BYTES_PER_MS / TOOL_SYNC_PER_FILE_MS: the throughput the estimate assumes. Measured on the
+ *   development machine the sync takes about 2 ms per file plus 1 ms per 18 KB; the estimate assumes a
+ *   machine four times slower.
+ * With these values a handful of ordinary edited documents (a few KB each, about 6 ms estimated apiece) is
+ * indexed inside the call as before; a document over 256 KiB, or what is left once about 200 ms of estimated
+ * work is used up (for example hundreds of files after a restore), waits for the background.
+ */
+export const TOOL_SYNC_BUDGET_MS = 200;
+export const TOOL_SYNC_MAX_FILE_BYTES = 256 * 1024;
+export const TOOL_SYNC_BYTES_PER_MS = 4096;
+export const TOOL_SYNC_PER_FILE_MS = 5;
+
+export const DEFAULT_TOOL_SYNC_LIMITS = Object.freeze({
+  budgetMs: TOOL_SYNC_BUDGET_MS,
+  maxFileBytes: TOOL_SYNC_MAX_FILE_BYTES,
+  bytesPerMs: TOOL_SYNC_BYTES_PER_MS,
+  perFileMs: TOOL_SYNC_PER_FILE_MS,
+});
+
+function numberOr(value, fallback) {
+  return value !== undefined && value !== null && Number.isFinite(Number(value)) ? Number(value) : fallback;
+}
+
+// `limits` with every missing value filled in from the defaults, or null when no limits were asked for.
+function normalizeToolSyncLimits(limits) {
+  if (!limits || typeof limits !== 'object') return null;
+  return {
+    budgetMs: numberOr(limits.budgetMs, TOOL_SYNC_BUDGET_MS),
+    maxFileBytes: numberOr(limits.maxFileBytes, TOOL_SYNC_MAX_FILE_BYTES),
+    bytesPerMs: numberOr(limits.bytesPerMs, TOOL_SYNC_BYTES_PER_MS),
+    perFileMs: numberOr(limits.perFileMs, TOOL_SYNC_PER_FILE_MS),
+    now: typeof limits.now === 'function' ? limits.now : Date.now,
+  };
+}
+
 function parseTagsJson(raw) {
   try {
     const parsed = JSON.parse(raw || '[]');
@@ -138,11 +180,20 @@ export class CortexStore {
     disableVec = false,
     onWrite = null,
     syncOptions = null,
+    toolSyncLimits = null,
+    onSyncDeferred = null,
   } = {}) {
     // Limits for every index sync this store runs (`deadline`, `maxFileBytes`, `bytesPerMs`, `perFileMs`,
     // `now`; see `syncFromDisk`). The hooks set them so one slow document cannot use up the hook's time;
     // without them every sync indexes everything that changed.
     this.syncOptions = syncOptions && typeof syncOptions === 'object' ? { ...syncOptions } : null;
+    // Limits per tool call for a long-lived process ({ budgetMs, maxFileBytes, bytesPerMs, perFileMs, now };
+    // see DEFAULT_TOOL_SYNC_LIMITS). Unlike `syncOptions`, the time budget starts anew with every tool call
+    // (`beginSyncWindow`). `onSyncDeferred({ scope, tierDir, projectRoot, deferred })` is told when such a
+    // sync left documents out, so the owner can index them in the background.
+    this.toolSyncLimits = normalizeToolSyncLimits(toolSyncLimits);
+    this.onSyncDeferred = typeof onSyncDeferred === 'function' ? onSyncDeferred : null;
+    this._syncWindowDeadline = null;
     this._lastSync = new Map(); // scope -> result of the most recent sync of that tier
     this.projectRoot = path.resolve(projectDir);
     this.projectDir = getProjectMemoryDir(this.projectRoot);
@@ -213,7 +264,10 @@ export class CortexStore {
 
     ensureTierDirs(dir);
     // With sync limits, a rebuilt index is filled by the next (limited) sync instead of a full one here.
-    const opened = openTierDb(dir, { disableVec: this.disableVec, autoSyncOnRecover: !this.syncOptions });
+    const opened = openTierDb(dir, {
+      disableVec: this.disableVec,
+      autoSyncOnRecover: !this.syncOptions && !this.toolSyncLimits,
+    });
     const tier = {
       scope,
       dir,
@@ -244,10 +298,58 @@ export class CortexStore {
     return results;
   }
 
-  // One index sync of an open tier, under this store's sync limits (if any).
+  /**
+   * Start of one tool call: the time budget of `toolSyncLimits` counts from here for every sync the call
+   * runs, and `getUnindexedDocs()` afterwards reports what this call's syncs left out (nothing older).
+   */
+  beginSyncWindow() {
+    this._lastSync.clear();
+    this._syncWindowDeadline = this.toolSyncLimits
+      ? this.toolSyncLimits.now() + this.toolSyncLimits.budgetMs
+      : null;
+  }
+
+  endSyncWindow() {
+    this._syncWindowDeadline = null;
+  }
+
+  // The limits of the next sync: the fixed ones of a hook, else the per-call ones of a tool, else none.
+  _resolveSyncOptions() {
+    if (this.syncOptions) return this.syncOptions;
+    const limits = this.toolSyncLimits;
+    if (!limits) return undefined;
+    return {
+      deadline: this._syncWindowDeadline ?? limits.now() + limits.budgetMs,
+      maxFileBytes: limits.maxFileBytes,
+      bytesPerMs: limits.bytesPerMs,
+      perFileMs: limits.perFileMs,
+      now: limits.now,
+    };
+  }
+
+  /**
+   * One index sync of an open tier, under this store's sync limits (if any). Readers outside the store
+   * (search) call this instead of syncing the tier themselves, so the same limits apply to them.
+   */
+  syncTier(tier) {
+    return this._syncTier(tier);
+  }
+
   _syncTier(tier) {
-    const result = syncFromDisk(tier.db, tier.dir, this.syncOptions || undefined);
+    const result = syncFromDisk(tier.db, tier.dir, this._resolveSyncOptions());
     this._lastSync.set(tier.scope, result);
+    if (this.toolSyncLimits && this.onSyncDeferred && (result.deferred?.length || 0) > 0) {
+      try {
+        this.onSyncDeferred({
+          scope: tier.scope,
+          tierDir: tier.dir,
+          projectRoot: this.projectRoot,
+          deferred: result.deferred,
+        });
+      } catch {
+        // telling the background worker is best effort; the documents stay listed as not indexed
+      }
+    }
     return result;
   }
 

@@ -25,6 +25,8 @@ export const HOOK_INDEX_MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 /** Most document names the "not indexed yet" notice lists. */
 export const UNINDEXED_NOTICE_MAX_FILES = 5;
+/** Most document names the one-line notice for the user's screen lists. */
+export const UNINDEXED_USER_NOTICE_MAX_FILES = 3;
 const UNINDEXED_NOTICE_MAX_NAME_CHARS = 120;
 
 /**
@@ -199,4 +201,19 @@ export function formatUnindexedNotice(
     if (text.length <= maxChars) return text;
   }
   return head.length <= maxChars ? head : '';
+}
+
+/**
+ * The same fact as one compact line for the user's own screen (the hooks' `systemMessage`): how many
+ * documents are not indexed yet and the first few names. '' when nothing was left out.
+ */
+export function formatUnindexedUserNotice(unindexed, { maxFiles = UNINDEXED_USER_NOTICE_MAX_FILES } = {}) {
+  const items = Array.isArray(unindexed) ? unindexed.filter((item) => item && typeof item.path === 'string') : [];
+  const total = items.length;
+  if (total === 0) return '';
+  const shown = items.slice(0, Math.max(0, Number(maxFiles) || 0)).map(formatUnindexedEntry);
+  if (total > shown.length && shown.length > 0) shown.push(`+${total - shown.length} more`);
+  return `[herdr-cortex] ${total === 1 ? '1 memory document is' : `${total} memory documents are`} not indexed yet, `
+    + 'so the memory overview and search may be incomplete until the MCP server has indexed them'
+    + `${shown.length > 0 ? `: ${shown.join('; ')}` : ''}.`;
 }

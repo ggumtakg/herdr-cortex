@@ -2,9 +2,11 @@ import path from 'node:path';
 import { isProjectEnabled, loadConfig, projectPathKey } from '../core/config.mjs';
 import { createHcClient, parseTerminalAddress, sanitizeSingleLineTrigger } from './hc.mjs';
 import {
+  INBOX_DELIVERED_RETENTION_MS,
   ackMessage,
   countInboxMessages,
   deleteHeldMessages,
+  describeRetention,
   drainInbox,
   enqueueMessage,
   peekInbox,
@@ -22,6 +24,21 @@ const NEVER_WAKE_REASONS = Object.freeze({
   shell: 'target_is_bare_shell',
   error: 'target_error',
 });
+
+/**
+ * `wakeReason` of a wake trigger that `hc send` refused, keyed by the code the hc client reports (see
+ * `HC_TARGET_ERROR_CODES` in hc.mjs). These describe the target tab, not a failure of hc; every other
+ * failure is `hc_send_failed`.
+ */
+export const SEND_REFUSED_WAKE_REASONS = Object.freeze({
+  HC_TARGET_BLOCKED: 'target_blocked', // the tab waits on a dialog (typing would answer it)
+  HC_STATUS_MISMATCH: 'target_status_changed', // `--if idle` no longer matched: the status changed after it was read
+  HC_TARGET_FINISHED: 'target_not_live', // the terminal ended
+  HC_TARGET_NOT_FOUND: 'target_not_live', // there is no such terminal (any more)
+});
+
+// "24 hours": how long a message a hook injected is kept, in the words the tool descriptions use.
+const RETENTION_TEXT = describeRetention(INBOX_DELIVERED_RETENTION_MS);
 
 // Comparison key of a folder: its real path (junctions and symlinks resolved, lower-cased on Windows),
 // so a tab that reached the same folder through a junction is the same project.
@@ -110,8 +127,9 @@ export function createRelayTools({
   const relayTabsTool = {
     name: 'relay_tabs',
     description: 'List live Herdr terminals combined with saved revive sessions and project memory session mapping. '
-      + 'activity is idle | working | blocked | error | unknown | shell | not_live; tabs on another machine are listed with remote: true and cannot receive relay messages. '
-      + 'pendingInboxCount = messages waiting to be injected, heldInboxCount = messages already injected and kept for 24 hours.',
+      + 'activity is idle | working | done | blocked | error | unknown | shell | not_live (the status words of hc; blockedKind says why a blocked tab waits: permission, question or auth); '
+      + 'tabs on another machine are listed with remote: true and cannot receive relay messages. '
+      + `pendingInboxCount = messages waiting to be injected, heldInboxCount = messages already injected and kept for ${RETENTION_TEXT}.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -158,6 +176,18 @@ export function createRelayTools({
             }
           }
 
+          // Why a blocked tab waits (hc: permission, question or auth). `hc ls` prints only the status word,
+          // so a blocked tab of this machine is asked for once more with `hc get`; null when hc does not say.
+          let blockedKind = t.blocked && t.blockedKind ? t.blockedKind : null;
+          if (t.blocked && !blockedKind && relayCapable) {
+            try {
+              const got = hc.getTerminal(tid);
+              if (got.ok && got.status?.blocked && got.status.blockedKind) blockedKind = got.status.blockedKind;
+            } catch {
+              blockedKind = null;
+            }
+          }
+
           tabs.push({
             terminalId: tid,
             isCurrent: Boolean(currentTerminalId) && tid === currentTerminalId,
@@ -169,6 +199,8 @@ export function createRelayTools({
             activity: t.activity,
             idle: t.idle,
             busy: t.busy,
+            done: Boolean(t.done),
+            blockedKind,
             statusUnknown: Boolean(t.unknown),
             agent: t.agentName || saved?.agent || '',
             isBareShell: t.isBareShell,
@@ -230,7 +262,7 @@ export function createRelayTools({
           type: 'string',
           enum: ['auto', 'always', 'never'],
           default: 'auto',
-          description: 'Wake policy via hc send: auto (only when the target agent is idle), always (also while it is working; never into a bare shell, a tab that is not live, or one in an error state), or never',
+          description: 'Wake policy via hc send: auto (only when the target agent is idle or done), always (also while it is working; never into a bare shell, a tab that is not live, or one in an error state), or never',
         },
         from_terminal_id: { type: 'string', description: 'Optional sender terminal ID override' },
       },
@@ -322,9 +354,10 @@ export function createRelayTools({
           wakeReason = sentReason;
           triggerSent = sendRes.sent;
         } else {
-          // hc refuses to type into a tab that is waiting on a dialog (typing would answer the dialog);
-          // that is the tab's state, not a failure of hc.
-          wakeReason = sendRes.code === 'HC_TARGET_BLOCKED' ? 'target_blocked' : 'hc_send_failed';
+          // hc refuses to type into a tab that is waiting on a dialog (typing would answer the dialog), whose
+          // status no longer is what `--if` asked for, or that has ended: that is the tab's state, not a
+          // failure of hc.
+          wakeReason = SEND_REFUSED_WAKE_REASONS[sendRes.code] || 'hc_send_failed';
           wakeError = sendRes.error;
         }
       };
@@ -344,11 +377,16 @@ export function createRelayTools({
           wakeReason = 'target_blocked';
         } else if (target.busy) {
           wakeReason = 'target_busy';
-        } else if (!target.idle) {
+        } else if (target.idle) {
+          // `--if idle`: hc types only if the status still is exactly "idle" when the text goes in.
+          sendTrigger({ ifIdle: true }, 'sent_auto_idle');
+        } else if (target.done) {
+          // "done": the agent finished and waits. `--if` knows only "idle" and "working" and matches the
+          // word exactly, so this send carries no condition (hc itself still refuses a blocked tab).
+          sendTrigger({}, 'sent_auto_done');
+        } else {
           // The status could not be interpreted: unknown is neither busy nor idle.
           wakeReason = 'target_status_unknown';
-        } else {
-          sendTrigger({ ifIdle: true }, 'sent_auto_idle');
         }
       }
 
@@ -371,7 +409,7 @@ export function createRelayTools({
   const relayInboxTool = {
     name: 'relay_inbox',
     description: 'Inspect (peek: full message bodies, announced/delivered flags) or acknowledge (ack) incoming Herdr relay messages for the current HC_TERMINAL_ID. '
-      + 'A message a hook injected is kept for 24 hours as delivered; it is listed only with include_delivered=true.',
+      + `A message a hook injected is kept for ${RETENTION_TEXT} as delivered; it is listed only with include_delivered=true.`,
     inputSchema: {
       type: 'object',
       properties: {

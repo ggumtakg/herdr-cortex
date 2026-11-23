@@ -27,6 +27,7 @@ import {
   revokeProject,
 } from '../src/core/trust.mjs';
 import { TRUST_CLI_USAGE, runTrustCli } from '../src/core/trust-cli.mjs';
+import { approveAsUser } from './support/approve.mjs';
 import { createEmbeddingBreaker } from '../src/embeddings/index.mjs';
 import { runEmbedCli } from '../src/embeddings/cli.mjs';
 import { handleClaudeSessionStart, handleClaudeUserPrompt } from '../src/hooks/claude.mjs';
@@ -299,10 +300,16 @@ test('trust CLI: approve / status / list / revoke, default folder = cwd, one ins
   try {
     const other = path.join(env.root, 'other');
     fs.mkdirSync(path.join(other, '.memory'), { recursive: true });
+    // The confirmation is always injected: a test never shows the real dialog.
+    const asked = [];
+    const sayYes = (request) => {
+      asked.push(request);
+      return { confirmed: true, via: 'dialog', detail: '' };
+    };
     const run = (argv, cwd = env.projectDir) => {
       const stdout = makeSink();
       const stderr = makeSink();
-      const code = runTrustCli(argv, { cwd, globalDir: env.globalDir, stdout, stderr });
+      const code = runTrustCli(argv, { cwd, globalDir: env.globalDir, stdout, stderr, confirm: sayYes });
       return { code, out: stdout.text, err: stderr.text };
     };
     const realProject = fs.realpathSync.native(env.projectDir);
@@ -380,13 +387,20 @@ test('trust CLI: approve / status / list / revoke, default folder = cwd, one ins
       ['--no-warnings', path.join(REPO_ROOT, 'src', 'core', 'trust-cli.mjs'), ...args],
       { cwd: other, env: childEnv, encoding: 'utf8', timeout: 30000 },
     );
-    const childApprove = spawnCli(['approve']);
-    assert.equal(childApprove.status, 0, childApprove.stderr);
-    assert.ok(childApprove.stdout.includes(`Approved: ${realOther}`));
-    assert.equal(isProjectTrusted(other, { globalDir: env.globalDir }), true);
+    // (a child process never runs `approve` for a folder that is not approved yet: that would show the
+    // real confirmation dialog. The approval is made in-process; the child reads and revokes it.)
+    assert.equal(run(['approve', other]).code, 0);
     assert.equal(spawnCli(['status']).status, 0);
+    const childApproveAgain = spawnCli(['approve']);
+    assert.equal(childApproveAgain.status, 0, childApproveAgain.stderr);
+    assert.match(childApproveAgain.stdout, /^Already approved: /, 'an approved folder is reported without a dialog');
+    assert.match(spawnCli(['list']).stdout, /other/);
     assert.equal(spawnCli(['revoke']).status, 0);
     assert.equal(spawnCli(['status']).status, 1);
+    assert.equal(isProjectTrusted(other, { globalDir: env.globalDir }), false);
+
+    // Every approval above was asked for once, with the real path of exactly that folder
+    assert.deepEqual(asked.map((request) => request.paths), [[realProject], [realOther], [realOther]]);
   } finally {
     env.cleanup();
   }
@@ -427,7 +441,7 @@ test('trust: the store never opens, and the config loader never reads, the .memo
       assert.deepEqual(snapshotTree(memoryDir), before, 'nothing was created or changed in the unapproved .memory/');
 
       // Approval takes effect on the next operation of the same store object; so does revoking it
-      approveProject(env.projectDir, { globalDir: env.globalDir });
+      approveAsUser(env.projectDir, { globalDir: env.globalDir });
       assert.equal(store.readDoc({ id: 'planted-p0' }).title.startsWith('PLANTED-BASELINE-TITLE'), true);
       revokeProject(env.projectDir, { globalDir: env.globalDir });
       assert.equal(store.readDoc({ id: 'planted-p0' }), null);
@@ -436,7 +450,7 @@ test('trust: the store never opens, and the config loader never reads, the .memo
     }
 
     // Once approved, the project file is read again (still reduced to its whitelisted keys)
-    approveProject(env.projectDir, { globalDir: env.globalDir });
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
     const approvedCfg = loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir });
     assert.equal(approvedCfg.headCoreEnabled, false);
     assert.equal(approvedCfg.hookBudget, 512);
@@ -513,14 +527,14 @@ test('trust / Claude hooks: an unapproved .memory/ is neither injected nor touch
     fs.mkdirSync(nested, { recursive: true });
     const nestedMemory = plantMemory(nested);
     const nestedBefore = snapshotTree(nestedMemory);
-    approveProject(parent, { globalDir: env.globalDir });
+    approveAsUser(parent, { globalDir: env.globalDir });
     const nestedCtx = claudeStart(env, nested);
     assert.doesNotMatch(nestedCtx, PLANTED);
     assert.equal(countOccurrences(nestedCtx, formatProjectNotApprovedNotice(nested)), 1);
     assert.deepEqual(snapshotTree(nestedMemory), nestedBefore);
 
     // --- approved: the folder's memory is loaded like the user's own, also when reached through a junction ---
-    approveProject(env.projectDir, { globalDir: env.globalDir });
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
     const junction = path.join(env.root, 'project-link');
     fs.symlinkSync(env.projectDir, junction, 'junction');
     const viaJunction = claudeStart(env, junction);
@@ -572,7 +586,7 @@ test('trust / relay inbox: the old per-project inbox is read only for an approve
     assert.deepEqual(snapshotTree(memoryDir), before);
 
     // --- approved but excluded by the configuration: still not read, and nothing is delivered there ---
-    approveProject(env.projectDir, { globalDir: env.globalDir });
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
     atomicWriteJson(path.join(env.globalDir, 'config.json'), { excludedProjects: [env.projectDir] });
     enqueueMessage('tab-1', { from_terminal_id: 'tab-5', message: 'WAITS-WHILE-EXCLUDED' }, { globalDir: env.globalDir });
     assert.equal(promptContext(), '');
@@ -643,7 +657,7 @@ test('trust / Antigravity hooks: SessionStart and PreInvocation skip an unapprov
     assert.equal(fs.existsSync(path.join(bare, '.memory')), false);
 
     // Approved: the project memory and its inbox are used, and the conversation state moves into the project
-    approveProject(env.projectDir, { globalDir: env.globalDir });
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
     const approved = agySteps(handleAntigravitySessionStart(
       { conversationId: 'conv-4', rootConversationId: 'conv-4', cwd: env.projectDir },
       hookOpts,
@@ -776,7 +790,7 @@ test('trust / MCP tools: project-tier calls on an unapproved default project fai
     assert.deepEqual(toolNames.filter((name) => /trust|approve/i.test(name)), []);
 
     // Approving while the server runs takes effect on the next call; revoking does too
-    approveProject(env.projectDir, { globalDir: env.globalDir });
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
     const readApproved = await registry.callTool('memory_read', { id: 'planted-p0', scope: 'project' });
     assert.equal(readApproved.isError, false);
     assert.match(readApproved.data.content, /PLANTED-BODY/);
@@ -796,7 +810,7 @@ test('trust / MCP tools: project-tier calls on an unapproved default project fai
 test('trust / MCP tools: project_dir may only point at an approved folder', async () => {
   const env = makeTempEnv('cortex-trust-projectdir-');
   saveGlobalNote(env);
-  approveProject(env.projectDir, { globalDir: env.globalDir });
+  approveAsUser(env.projectDir, { globalDir: env.globalDir });
 
   const cloned = path.join(env.root, 'cloned-repo');
   const fresh = path.join(env.root, 'fresh-folder');
@@ -853,7 +867,7 @@ test('trust / MCP tools: project_dir may only point at an approved folder', asyn
     assert.equal(fs.existsSync(path.join(fresh, '.memory')), false);
 
     // After the user approves that folder, project_dir reaches it (also through a junction)
-    approveProject(cloned, { globalDir: env.globalDir });
+    approveAsUser(cloned, { globalDir: env.globalDir });
     const read = await registry.callTool('memory_read', { id: 'planted-p0', scope: 'project', project_dir: cloned });
     assert.equal(read.isError, false);
     const junction = path.join(env.root, 'cloned-link');
@@ -944,7 +958,7 @@ test('trust / embeddings: npm run embed and the server queue skip an unapproved 
     assert.deepEqual(snapshotTree(memoryDir), before);
 
     // Approved: the project's documents are embedded
-    approveProject(env.projectDir, { globalDir: env.globalDir });
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
     const approvedProvider = makeProvider();
     const approved = await runEmbedCli(
       ['--project', env.projectDir, '--global', env.globalDir, '--scope', 'project'],
@@ -975,7 +989,7 @@ test('exclusion policy: a junction or another spelling of the path does not bypa
   fs.symlinkSync(openDir, openAlias, 'junction');
 
   // The folders are approved, so only the exclusion policy can be what blocks them
-  for (const dir of [env.projectDir, realDir, insideReal, openDir]) approveProject(dir, { globalDir: env.globalDir });
+  for (const dir of [env.projectDir, realDir, insideReal, openDir]) approveAsUser(dir, { globalDir: env.globalDir });
 
   const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
   try {
@@ -1057,7 +1071,7 @@ test('exclusion policy: a junction or another spelling of the path does not bypa
 test('.memory/.gitignore: created by the first write, never overwritten, never created by a read', async () => {
   const env = makeTempEnv('cortex-gitignore-');
   try {
-    approveProject(env.projectDir, { globalDir: env.globalDir });
+    approveAsUser(env.projectDir, { globalDir: env.globalDir });
     const memoryDir = path.join(env.projectDir, '.memory');
     const gitignorePath = path.join(memoryDir, '.gitignore');
     const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
@@ -1094,7 +1108,7 @@ test('.memory/.gitignore: created by the first write, never overwritten, never c
     const preset = path.join(env.root, 'preset-project');
     fs.mkdirSync(path.join(preset, '.memory'), { recursive: true });
     fs.writeFileSync(path.join(preset, '.memory', '.gitignore'), 'index.sqlite*\n');
-    approveProject(preset, { globalDir: env.globalDir });
+    approveAsUser(preset, { globalDir: env.globalDir });
     const presetStore = new CortexStore({ projectDir: preset, globalDir: env.globalDir, disableVec: true });
     try {
       presetStore.saveDoc({ id: 'p-1', type: 'decision', title: 'P', summary: 'S' });
@@ -1109,7 +1123,7 @@ test('.memory/.gitignore: created by the first write, never overwritten, never c
       path.join(legacy, '.memory', 'docs', '2026-11', 'old-1.md'),
       '---\nid: old-1\ntype: decision\nstatus: active\ntitle: Old decision\nsummary: Written by hand\n---\n\nBody\n',
     );
-    approveProject(legacy, { globalDir: env.globalDir });
+    approveAsUser(legacy, { globalDir: env.globalDir });
     const legacyGitignore = path.join(legacy, '.memory', '.gitignore');
     const legacyStore = new CortexStore({ projectDir: legacy, globalDir: env.globalDir, disableVec: true });
     try {

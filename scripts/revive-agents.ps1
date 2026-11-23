@@ -23,20 +23,11 @@ param(
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "revive-common.ps1")
+. (Join-Path $PSScriptRoot "store-location.ps1")
 
-$EffectiveHome = if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_TEST_HOME)) {
-    $env:HERDR_CORTEX_TEST_HOME
-} elseif (-not [string]::IsNullOrWhiteSpace($env:HERDR_REVIVE_TEST_HOME)) {
-    $env:HERDR_REVIVE_TEST_HOME
-} else {
-    $env:USERPROFILE
-}
-
-$CortexDir = if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_HOME)) {
-    $env:HERDR_CORTEX_HOME
-} else {
-    Join-Path $EffectiveHome ".herdr-cortex"
-}
+# Home directory and global store: decided in store-location.ps1.
+$EffectiveHome = Get-HerdrEffectiveHome
+$CortexDir = Get-HerdrCortexGlobalDir
 
 $SessionDirs = @((Join-Path $CortexDir "sessions"), (Join-Path $EffectiveHome ".herdr-revive\sessions"))
 $ConfigPaths = @((Join-Path $CortexDir "config.json"), (Join-Path $EffectiveHome ".herdr-revive\config.json"))

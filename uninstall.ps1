@@ -30,16 +30,12 @@ $RepoRoot = $PSScriptRoot
 $InstallerScript = Join-Path $RepoRoot "src\hooks\installer.mjs"
 
 . (Join-Path $RepoRoot "scripts\install-tools.ps1")
+. (Join-Path $RepoRoot "scripts\store-location.ps1")
 
-$TestHome = if (-not [string]::IsNullOrWhiteSpace($env:HERDR_CORTEX_TEST_HOME)) {
-    $env:HERDR_CORTEX_TEST_HOME
-} elseif (-not [string]::IsNullOrWhiteSpace($env:HERDR_REVIVE_TEST_HOME)) {
-    $env:HERDR_REVIVE_TEST_HOME
-} else {
-    $null
-}
-$EffectiveHome = if ($TestHome) { $TestHome } else { $env:USERPROFILE }
-$GlobalCortexDir = Join-Path $EffectiveHome ".herdr-cortex"
+# Home directory and global store: decided in scripts\store-location.ps1 (the Node installer applies the same order).
+$TestHome = Get-HerdrTestHome
+$EffectiveHome = Get-HerdrEffectiveHome
+$GlobalCortexDir = Get-HerdrCortexGlobalDir
 $LegacyStoreDir = Join-Path $EffectiveHome ".herdr-revive"
 
 Write-Host "=== herdr-cortex Uninstaller ===" -ForegroundColor Cyan
