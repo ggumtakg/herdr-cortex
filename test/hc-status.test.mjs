@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { CortexStore } from '../src/core/store.mjs';
-import { createMcpServer } from '../src/mcp/server.mjs';
+import { SERVER_INSTRUCTIONS, createMcpServer, describeRetentionKorean } from '../src/mcp/server.mjs';
 import {
   HC_BLOCKED_KINDS,
   HC_STATUS_STATES,
@@ -347,4 +347,20 @@ test('relay tool descriptions take the retention time of delivered messages from
   const source = fs.readFileSync(new URL('../src/relay/tools.mjs', import.meta.url), 'utf8');
   const withoutComments = source.split('\n').filter((line) => !line.trim().startsWith('//') && !line.trim().startsWith('*')).join('\n');
   assert.equal(/\b24\b/.test(withoutComments), false, 'no hard-coded "24" in src/relay/tools.mjs');
+});
+
+test('the server instructions take the retention time of delivered messages from INBOX_DELIVERED_RETENTION_MS', () => {
+  assert.equal(describeRetentionKorean(INBOX_DELIVERED_RETENTION_MS), '24시간');
+  assert.equal(describeRetentionKorean(), '24시간');
+  assert.equal(describeRetentionKorean(60 * 60 * 1000), '1시간');
+  assert.equal(describeRetentionKorean(48 * 60 * 60 * 1000), '48시간');
+  assert.equal(describeRetentionKorean(90 * 60 * 1000), '90분');
+  assert.equal(describeRetentionKorean(60 * 1000), '1분');
+
+  const text = describeRetentionKorean(INBOX_DELIVERED_RETENTION_MS);
+  assert.ok(SERVER_INSTRUCTIONS.includes(`훅이 이미 주입한 메시지는 ${text} 보관되며 include_delivered: true로 다시 조회`));
+  // The number appears nowhere in the source of the server as a literal
+  const source = fs.readFileSync(new URL('../src/mcp/server.mjs', import.meta.url), 'utf8');
+  const withoutComments = source.split('\n').filter((line) => !line.trim().startsWith('//') && !line.trim().startsWith('*')).join('\n');
+  assert.equal(/\b24\b/.test(withoutComments), false, 'no hard-coded "24" in src/mcp/server.mjs');
 });

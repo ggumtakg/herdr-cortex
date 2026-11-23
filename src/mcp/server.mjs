@@ -9,6 +9,7 @@ import {
   getSharedEmbeddingBreaker,
   resolveEmbeddingProvider,
 } from '../embeddings/index.mjs';
+import { INBOX_DELIVERED_RETENTION_MS } from '../relay/inbox.mjs';
 import { createRelayTools } from '../relay/tools.mjs';
 import { createToolRegistry } from './tools.mjs';
 
@@ -204,12 +205,24 @@ export function startIndexCatchUp(
   };
 }
 
+/**
+ * A retention time in Korean words ("24시간", "1시간", "90분"), for the Korean server instructions. Derived
+ * from the constant so the text cannot drift from the behavior (the English tool descriptions use
+ * `describeRetention` of the inbox module the same way).
+ */
+export function describeRetentionKorean(retentionMs = INBOX_DELIVERED_RETENTION_MS) {
+  const ms = Math.max(0, Number(retentionMs) || 0);
+  const hours = ms / (60 * 60 * 1000);
+  if (hours >= 1 && Number.isInteger(hours)) return `${hours}시간`;
+  return `${Math.round(ms / (60 * 1000))}분`;
+}
+
 export const SERVER_INSTRUCTIONS = `herdr-cortex MCP 도구 안내 (서버 이름: herdr-cortex, 도구 전체 이름: mcp__herdr-cortex__<도구>):
 - 기억 조회: memory_overview(활성 세션·결정·할 일), memory_search(하이브리드 1단계 요약), memory_read(전문), memory_graph(1~10홉 계보·파일 영향).
 - 기억 저장(메인 HEAD 전용, 서브에이전트 읽기 전용): memory_save(type: decision|worklog|knowledge|todo|baseline, supersedes, derived_from, files, scope: project|global, global 선호는 category: "preferences") 및 memory_update(status: active|done|superseded|archived, supersedes: 대체할 문서 ID — memory_save와 같은 전이).
 - 멀티 워크스페이스: 필요 시 memory_* 도구에 project_dir 지정 가능.
 - 색인 대기: memory_* 결과에 indexing { pending, documents }가 있으면 그 문서들은 아직 색인 중이라(백그라운드에서 처리) 결과에 빠져 있을 수 있음.
-- Herdr 탭 협업: relay_tabs(탭 조회), relay_send(context_docs 첨부, HEAD 전용), relay_inbox(action: peek|ack; 훅이 이미 주입한 메시지는 24시간 보관되며 include_delivered: true로 다시 조회).
+- Herdr 탭 협업: relay_tabs(탭 조회), relay_send(context_docs 첨부, HEAD 전용), relay_inbox(action: peek|ack; 훅이 이미 주입한 메시지는 ${describeRetentionKorean()} 보관되며 include_delivered: true로 다시 조회).
 - 프롬프트 로드: cortex_prompt로 start-job, product-planning, delegate, independent-review, plan-run(kind: "skill"), DEVELOPMENT_STANDARD(kind: "standard"), coder/developer/reviewer(kind: "agent") 로드.`;
 
 export const EXCLUDED_SERVER_INSTRUCTIONS = `herdr-cortex MCP 안내: 현재 프로젝트는 herdr-cortex 설정(excludedProjects/opt-in)에 의해 제외되어 있습니다. 프로젝트 기억 쓰기·relay_tabs/relay_send/relay_inbox 및 .memory/ 생성이 차단되며, scope: "global" 조회와 cortex_prompt만 사용할 수 있습니다.`;
