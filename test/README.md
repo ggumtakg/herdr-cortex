@@ -25,6 +25,17 @@ node --no-warnings --import ./test/support/isolate-home.mjs --test test/store-an
 - `node`가 PATH에 없으면 `node` 자리에 Node 실행 파일의 전체 경로를 씁니다. PowerShell에서는 `& "<Node 설치 폴더>\node.exe" --no-warnings --import ...` 형태입니다. 테스트가 띄우는 자식 프로세스는 `process.execPath`(테스트를 실행 중인 Node)로 시작하므로 테스트 자체는 PATH의 `node`에 의존하지 않습니다.
 - `--import`를 빼고 실행하면 아래의 홈 격리가 적용되지 않습니다. 이 경우 `home-isolation.test.mjs`의 첫 테스트가 `HERDR_CORTEX_TEST_GUARD_DIR is not set: run the suite through "npm test" ...` 메시지로 실패하고, 디렉터리를 직접 넘기지 않는 코드 경로가 실제 홈을 향할 수 있습니다. 파일 하나만 실행할 때도 반드시 `--import`를 붙입니다.
 
+`package.json`에는 테스트 말고 세 개의 스크립트가 더 있습니다.
+
+```powershell
+npm test               # 자동 테스트 전체 (18개 파일, 182개)
+npm run embed          # 임베딩을 기다리는 문서를 한꺼번에 처리
+npm run mcp            # MCP 서버를 직접 실행
+npm run trust -- list  # cortex-trust와 같은 명령 (프로필 없이)
+```
+
+각각의 옵션은 [`src/embeddings/README.md`](../src/embeddings/README.md#cli-npm-run-embed), [`src/mcp/README.md`](../src/mcp/README.md#직접-실행-옵션과-환경변수), [`src/core/README.md`](../src/core/README.md#명령줄-trust-climjs)에 있습니다.
+
 ---
 
 ## 실제 홈 격리
@@ -124,6 +135,24 @@ node --no-warnings --import ./test/support/isolate-home.mjs --test test/store-an
 | 셸 (`installer.test.mjs`의 Antigravity 훅 명령 테스트) | Windows에서는 `cmd.exe`와 이름으로 찾은 `powershell.exe`로 명령을 실행하고, `%ProgramFiles%\Git\bin\bash.exe`가 있으면 Git Bash로도 실행합니다. 다른 운영체제에서는 `/bin/bash`가 있을 때 실행합니다. | 건너뛰기 옵션이 없습니다. Windows에서 `powershell.exe`를 실행하지 못하거나 어느 셸도 실행하지 못하면 실패합니다. bash가 없으면 bash 부분만 생략됩니다. |
 | 정션 생성 (`fs.symlinkSync(..., 'junction')`) | `core-robustness`, `config-and-embeddings`, `hook-hardening`, `injection-guards`, `project-trust`, `relay-inbox`, `trust-confirm`의 경로 별칭 테스트 | 건너뛰기 옵션이 없습니다. 링크를 만들지 못하면 그 테스트가 실패합니다. |
 | 네트워크, 실제 `hc`·`claude`·`agy`·Herdr | 필요 없습니다. | 해당 없음 |
+
+---
+
+## 확인 상태
+
+자동 테스트는 가짜 `hc`, 가짜 임베딩 서버, 가짜 `claude` 명령, 격리된 홈 폴더를 씁니다(위 [실물과 대역](#실물과-대역)). 그래서 테스트가 통과한다는 것과 실제 환경에서 직접 보았다는 것은 다릅니다. 실제 환경에서 직접 본 것과 그렇지 못한 것은 모듈마다 그 모듈의 README에 "확인 상태" 절로 적었고, 전체 목록은 [루트 README](../README.md#확인-상태와-알려진-한계)에 있습니다. 거기서 말하는 "개발 PC"는 Windows 11, Node 26.13.1, `hc` 0.1.21, Claude Code 2.1.330이 설치된 한 대이며, 이 PC에 `install.ps1`로 실제 설치해 본 결과도 함께 적혀 있습니다.
+
+테스트 실행 환경에 대해 확인하지 못한 것은 다음 하나입니다. 무엇을 확인하지 못했는지, 왜 못 했는지, 지금 무엇을 근거로 삼고 있는지, 어떻게 확인하면 되는지, 가정이 틀렸을 때 어떤 증상이 나오는지를 적었습니다.
+
+### Node 22
+
+| | |
+| :--- | :--- |
+| **무엇을** | 최소 지원 버전인 Node 22.13에서의 동작 |
+| **왜 못 했나** | 모든 실행과 자동 테스트를 Node 26.13.1에서만 했습니다. |
+| **지금의 근거** | `package.json`의 `engines`와 설치 스크립트의 버전 검사가 22.13.0 이상을 요구한다는 것뿐입니다. |
+| **확인 방법** | Node 22.13에서 `npm test`를 실행합니다. |
+| **틀렸을 때 증상** | 테스트 실패나 실행 오류. 받은편지함의 이름 바꾸기 문제(두 프로세스가 같은 파일의 이름을 동시에 바꾸면 둘 다 성공으로 보고될 수 있음, [`src/relay/README.md`](../src/relay/README.md#확인-상태))가 Node 22에도 있는지는 모르지만, 잠금 파일 방식이라 어느 쪽이든 안전합니다. |
 
 ---
 

@@ -16,16 +16,90 @@ Windows PowerShell 5.1과 PowerShell 7 이상에서 동작하도록 작성되어
 | **`revive-agents.ps1`** | 직접 실행(`revive-agents` 명령이 호출) | `hc ls --json`으로 탭 목록을 읽고, 빈 셸 탭마다 복구 명령을 `hc send`로 입력합니다. | 매개변수 `-DryRun`, `-Status`, `-DelayMs <밀리초>`(기본 300) |
 | **`revive-common.ps1`** | 점으로 불러옴 | 위 두 스크립트가 함께 쓰는 판정 함수입니다. 탭 하나에 무엇을 할지는 여기서만 정합니다. | `Test-HerdrTerminalId`, `Test-HerdrSessionId`, `ConvertTo-HerdrPathKey`, `Test-HerdrBareShell`, `Get-HerdrTerminalMeta`, `Read-HerdrSavedSession`, `Read-HerdrReviveConfig`, `Get-HerdrTitleAgent`, `Get-HerdrRunningAgent`, `Get-HerdrAgentExe`, `Format-HerdrSetLocation`, `Resolve-HerdrRevivePlans` |
 | **`store-location.ps1`** | 점으로 불러옴 | 홈 폴더와 전역 저장소 위치를 정하는 한 곳입니다. Node 쪽의 `resolveHomeDir`·`resolveGlobalDir`([`src/core/config.mjs`](../src/core/README.md))와 같은 순서를 씁니다. | `Get-HerdrTestHome`, `Get-HerdrEffectiveHome`, `Get-HerdrCortexGlobalDir` |
-| **`install-tools.ps1`** | 점으로 불러옴. `-Action`을 주면 한 가지 작업을 하고 결과를 JSON 한 줄로 출력 | 프로필 블록을 파일의 원래 인코딩 그대로 넣고 빼는 함수와 실행 정책 기록 함수입니다. | `Get-HerdrBackupStamp`, `New-HerdrDatedBackup`, `Get-HerdrAnsiEncoding`, `Get-HerdrTextEncoding`, `Test-HerdrBytesEqual`, `ConvertTo-HerdrFileBytes`, `Read-HerdrProfile`, `Find-HerdrBlockSpans`, `Remove-HerdrSpans`, `Get-HerdrLineBreak`, `Set-HerdrBlockInText`, `Remove-HerdrBlockFromText`, `Set-HerdrProfileBlock`, `Remove-HerdrProfileBlock`, `ConvertTo-HerdrPathExpression`, `Get-HerdrProfileBlockLines`, `Get-HerdrPolicyState`, `Set-HerdrCurrentUserPolicy`, `Test-HerdrPolicyBlocksProfile`, `Get-HerdrPolicyRecordPath`, `Read-HerdrPolicyRecord`, `Write-HerdrPolicyRecord` |
+| **`install-tools.ps1`** | 점으로 불러옴. `-Action`을 주면 한 가지 작업을 하고 결과를 JSON 한 줄로 출력 | 프로필 블록을 파일의 원래 인코딩 그대로 넣고 빼는 함수와 실행 정책 기록 함수입니다. | `Get-HerdrBackupStamp`, `New-HerdrDatedBackup`, `Get-HerdrAnsiEncoding`, `Get-HerdrTextEncoding`, `Test-HerdrBytesEqual`, `ConvertTo-HerdrFileBytes`, `Read-HerdrProfile`, `Find-HerdrBlockSpans`, `Remove-HerdrSpans`, `Get-HerdrLineBreak`, `Set-HerdrBlockInText`, `Remove-HerdrBlockFromText`, `Set-HerdrProfileBlock`, `Remove-HerdrProfileBlock`, `ConvertTo-HerdrPathExpression`, `Get-HerdrProfileBlockLines`, `Get-HerdrPolicyState`, `Invoke-HerdrPolicyChange`, `Set-HerdrCurrentUserPolicy`, `Test-HerdrPolicyBlocksProfile`, `Get-HerdrPolicyRecordPath`, `Read-HerdrPolicyRecord`, `Write-HerdrPolicyRecord` |
 | **`cortex-status.mjs`** | `node --no-warnings scripts/cortex-status.mjs [--cwd <폴더>] [--json]` | `cortex-status` 명령의 본체입니다. 설정 파일과 로컬 색인만 읽고 네트워크 요청은 하지 않습니다. | Export: `collectStatus`, `formatStatus` |
 | **`merge-hooks.mjs`** | `node scripts/merge-hooks.mjs <install\|uninstall> [repoRoot]` | [`src/hooks/installer.mjs`](../src/hooks/README.md)의 `installCortex`·`uninstallCortex`를 그대로 부르는 래퍼입니다. 인자가 `install`도 `uninstall`도 아니면 사용법을 출력하고 종료 코드 1로 끝납니다. | Export 없음(불러오는 즉시 실행됨) |
 | **`record-session.mjs`** | `node scripts/record-session.mjs <antigravity\|claude>` (표준 입력으로 훅 JSON) | [`src/revive/tracker.mjs`](../src/revive/README.md)의 `recordSession`을 부르는 래퍼입니다. 오류가 나도 항상 종료 코드 0으로 끝나며, `antigravity`일 때는 `{}`를 출력합니다. | Export 없음(불러오는 즉시 실행됨) |
 
 ---
 
+## 설치와 제거
+
+저장소 루트의 [`install.ps1`](../install.ps1)과 [`uninstall.ps1`](../uninstall.ps1)이 설치와 제거의 진입점입니다. 두 스크립트는 Node로 설치기 [`src/hooks/installer.mjs`](../src/hooks/README.md#설치기-installermjs)를 실행해 훅(에이전트가 세션 시작 같은 시점에 실행해 주는 외부 명령)·MCP 서버·스킬·전역 저장소를 다루고, PowerShell 실행 정책과 프로필은 이 폴더의 `install-tools.ps1`로 직접 다룹니다. 전역 저장소는 모든 프로젝트가 함께 쓰는 사용자 단위의 저장 폴더이며 기본 위치는 `%USERPROFILE%\.herdr-cortex\`입니다. 아래에서 `<전역 저장소>`로 줄여 씁니다.
+
+### 요구 사항
+
+- **Windows 11**과 PowerShell(Windows PowerShell 5.1 또는 PowerShell 7 이상). Windows 11 전용이며 다른 운영체제는 지원하지 않습니다.
+- **Node.js 22.13.0 이상**. 내장 SQLite 모듈(`node:sqlite`)을 씁니다. `install.ps1`이 버전을 확인하고, 낮으면 아무것도 바꾸지 않고 끝납니다(종료 코드 1). `node`를 PATH에서 찾지 못했을 때도 같습니다.
+- **Claude Code**(`claude`). Antigravity CLI(`agy`)는 있으면 함께 설정됩니다.
+- **Herdr의 `hc.exe`**(선택). Herdr는 탭마다 에이전트를 띄우는 터미널 앱이고 `hc`는 그 명령줄 도구입니다. 탭 릴레이와 탭 복구에만 필요하며 PATH에 있어야 합니다. 없으면 설치 중 경고만 나옵니다.
+- **`sqlite-vec` 패키지**(선택). 저장소 루트에서 실행하는 `npm install`은 벡터 검색에 쓰는 이 패키지 하나를 받습니다. 받지 않아도 설치는 되지만 경고가 나오고 벡터 검색은 꺼집니다.
+
+### 설치: `install.ps1`
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+설치가 끝나면 **Claude Code와 Antigravity 탭을 다시 시작**하고, 기억을 쓸 프로젝트 폴더마다 `cortex-trust approve`를 한 번 실행합니다. 승인하기 전에는 그 폴더의 기억을 읽지도 쓰지도 않습니다([`src/core/README.md`](../src/core/README.md#3-프로젝트-승인-trustmjs-trust-climjs-confirmmjs)).
+
+`install.ps1`은 바꿀 파일을 먼저 모두 읽어 검사합니다. JSON으로 읽을 수 없는 파일이 있거나, 구조가 예상과 다르거나, 이 도구의 것이 아닌 `herdr-cortex`라는 MCP 서버가 이미 등록되어 있으면 **아무것도 바꾸지 않고** 무엇이 문제인지 출력한 뒤 종료 코드 1로 끝납니다. 이때는 실행 정책과 프로필도 건드리지 않습니다.
+
+기존 파일을 바꿀 때는 항상 먼저 `<파일>.herdr-cortex.<연월일-시분초>.bak`으로 복사합니다(예: `settings.json.herdr-cortex.20261123-141500.bak`). 같은 이름이 있으면 `-2`, `-3`을 붙이므로 백업끼리 덮어쓰지 않습니다. 내용이 달라지지 않는 파일은 다시 쓰지 않고 백업도 만들지 않습니다.
+
+설치가 묻는 것과 바꾸는 것은 다음과 같습니다. 위의 다섯 줄은 Node 설치기가 하는 일이며 검사 항목, 적용 순서, 훅 명령의 형식은 [`src/hooks/README.md`](../src/hooks/README.md#설치기-installermjs)에 있습니다. 아래 두 줄은 `install.ps1`이 직접 합니다.
+
+| 대상 | 하는 일 |
+| :--- | :--- |
+| **전역 저장소** `%USERPROFILE%\.herdr-cortex\` | `docs\`, `sessions\`, `config.json`을 만듭니다. `config.json`이 이미 있으면 그대로 두되, 이전 버전 설치기가 쓴 기본값과 완전히 같으면(임베딩 `auto`, 사용자가 고친 적 없음) 백업 후 현재 기본값(임베딩 꺼짐)으로 바꿉니다. 사용자가 고친 파일은 건드리지 않고 문제만 경고합니다. 설치에 쓴 Node 경로는 `state\install.json`에 기록합니다. |
+| **Claude Code 훅** `~\.claude\settings.json` | `SessionStart`, `SessionEnd`, `PreCompact`, `UserPromptSubmit`, `PreToolUse`에 훅을 하나씩 추가합니다. 각 훅은 `command`에 **Node 실행 파일의 절대 경로**, `args`에 인자 목록을 적는 형식이어서 셸을 거치지 않고 실행되며 `node`가 PATH에 없어도 됩니다. 이 도구의 훅은 인자 끝의 `--id herdr-cortex`로 구분하고, 다시 설치하면 그 표시가 있는 훅만 바꿉니다. 사용자가 등록한 다른 훅은 그대로 둡니다. |
+| **Claude Code MCP 서버** `~\.claude.json` | `claude` 명령을 찾으면 `claude mcp add --scope user --transport stdio herdr-cortex -- <node 경로> --no-warnings <저장소>\src\mcp\server.mjs`로 등록합니다. `claude`를 찾지 못했거나 그 명령이 실패하면 파일을 직접 고치고 그렇게 했다고 알립니다. 예전 이름 `cortex`로 등록된 항목은 이 도구의 것일 때만 지웁니다. 등록 뒤 1.5초를 기다렸다가 다시 읽어, 실행 중인 Claude Code가 파일을 덮어써 등록이 사라졌으면 경고합니다. |
+| **Claude Code 스킬** `~\.claude\skills\cortex-*` | `prompts\skills\`의 스킬 5개를 `cortex-<이름>`으로 복사합니다. 이 도구가 만든 폴더(표시 파일 `.herdr-cortex-managed`가 있음)만 바꿉니다. |
+| **Antigravity** `~\.gemini\` | `agy`가 PATH에 있거나 `~\.gemini` 폴더가 이미 있을 때만 건드립니다. `config\hooks.json`에 `SessionStart`와 `PreInvocation` 훅을, `antigravity-cli\mcp_config.json`에 MCP 서버를 등록합니다. `config\mcp_config.json`은 이미 있을 때만 갱신합니다. |
+| **PowerShell 실행 정책** | 현재 정책으로는 프로필이 불러와지지 않을 때만 `Set the ExecutionPolicy of the current user to RemoteSigned? [Y/N]`이라고 **묻습니다**. 프로필이 불러와지지 않는 경우는 현재 사용자 범위의 정책이 `Restricted`일 때와, 현재 사용자 범위의 정책이 정해져 있지 않으면서(`Undefined`) 컴퓨터 범위의 정책도 정해져 있지 않거나 `Restricted`일 때입니다. `y`나 `yes`라고 답해야 현재 사용자 범위의 정책을 `RemoteSigned`로 바꾸고, 이전 값을 `<전역 저장소>\state\execution-policy.json`에 적어 둡니다. 물을 수 없는 환경(대화형 콘솔이 아님)에서는 바꾸지 않고 직접 실행할 명령(`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`)을 알려 줍니다. |
+| **PowerShell 프로필** | `문서\WindowsPowerShell\Microsoft.PowerShell_profile.ps1`에, PowerShell 7이 있으면(`문서\PowerShell` 폴더가 있거나 `pwsh`가 PATH에 있으면) `문서\PowerShell\Microsoft.PowerShell_profile.ps1`에도, 설치를 실행한 셸의 `$PROFILE`이 이 둘과 다르면 그 파일에도 `# >>> herdr-cortex >>>`와 `# <<< herdr-cortex <<<` 사이의 블록을 넣습니다. 블록은 `scripts\auto-revive.ps1`을 불러오는 한 줄입니다(`-NoAutoResume`로 설치하면 자동 복구를 끄는 한 줄이 앞에 더 들어갑니다). 파일의 원래 인코딩(UTF-8, UTF-16, 시스템 코드 페이지)을 감지해 그대로 읽고 쓰며, 블록 밖의 바이트는 바꾸지 않습니다. 그렇게 할 수 없는 파일이면 건드리지 않고 직접 넣을 줄을 보여 줍니다. 프로필이 없으면 새로 만듭니다. 인코딩 처리의 세부는 아래 [설치 보조 함수](#설치-보조-함수-install-toolsps1)에 있습니다. |
+
+설치 끝에는 임베딩(문서를 숫자 벡터로 바꿔 뜻이 비슷한 문서를 찾게 하는 기능, 기본값은 꺼짐)이 지금 어디로 무엇을 보내는지 한 줄로 출력합니다. 기본값이면 "꺼져 있고 아무것도 보내지 않음"(`embedding: off (provider is "none"); nothing is sent anywhere.`)입니다.
+
+`install.ps1`의 스위치는 네 개입니다.
+
+| 스위치 | 뜻 |
+| :--- | :--- |
+| `-NoAutoResume` | 셸 명령은 설치하되, 셸이 시작될 때 탭을 자동으로 복구하지는 않습니다. |
+| `-SetExecutionPolicy` | 실행 정책이 프로필을 막고 있으면 묻지 않고 `RemoteSigned`로 바꿉니다. |
+| `-SkipExecutionPolicy` | 실행 정책을 묻지도 바꾸지도 않습니다. |
+| `-NodePath <node.exe 전체 경로>` | `node`가 PATH에 없을 때 쓸 Node를 지정합니다. 이 경로가 훅과 MCP 등록에 기록됩니다. |
+
+실행 정책을 바꾸지 않으면 프로필이 불러와지지 않으므로 아래의 셸 명령과 자동 탭 복구는 쓸 수 없습니다. 훅과 MCP 서버는 프로필과 무관하게 동작합니다.
+
+Node를 다른 위치에 다시 설치하면 훅과 MCP 등록에 적힌 경로가 맞지 않게 됩니다. `cortex-status`가 이를 알려 주며, `install.ps1`을 다시 실행하면 고쳐집니다.
+
+### 제거: `uninstall.ps1`
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
+```
+
+제거는 설치가 등록한 것만 지웁니다.
+
+- `--id herdr-cortex` 표시가 있는 훅, 이 도구를 실행하는 MCP 항목, 표시 파일이 있는 스킬 폴더, 설치 기록을 지웁니다. 사용자의 다른 훅과 설정은 남습니다. Claude Code의 MCP 항목은 `claude`를 찾으면 `claude mcp remove`로 지웁니다.
+- PowerShell 프로필에서 herdr-cortex 블록만 지웁니다(인코딩 유지, 백업 후).
+- 설치가 실행 정책을 바꿨고 그 뒤로 값이 그대로이면 이전 값으로 되돌립니다. 그사이 다른 값으로 바뀌었으면 그대로 둡니다.
+- 끝에 **남아 있는 것**을 출력합니다: 백업 파일 목록, 전역 저장소, 이전 도구(herdr-revive)의 저장소, 실행 정책 상태.
+
+| 스위치 | 뜻 |
+| :--- | :--- |
+| `-RemoveBackups` | 이 도구가 만든 백업 파일(`<파일>.herdr-cortex.<날짜>.bak`과 이전 버전의 `<파일>.herdr-cortex.bak`)도 지웁니다. |
+| `-PurgeData` | 전역 저장소 `%USERPROFILE%\.herdr-cortex\`(전역 기억 문서, 저장된 세션, 설정, 승인 목록, 받은편지함)와 이전 도구의 `%USERPROFILE%\.herdr-revive\` 폴더도 지웁니다. `-PurgeSessions`는 같은 뜻의 옛 이름입니다. |
+| `-NodePath <경로>` | `node`가 PATH에 없을 때 쓸 Node를 지정합니다. 주지 않으면 PATH, 그다음 설치할 때 기록된 경로를 씁니다. |
+
+각 프로젝트의 `.memory\` 폴더(그 프로젝트의 기억 문서가 들어 있는 폴더)는 사용자의 데이터이므로 어떤 스위치로도 지우지 않습니다. Node를 찾지 못하면 훅·MCP 항목·스킬은 지우지 못하고 그 사실을 경고합니다.
+
+---
+
 ## 셸 명령
 
-프로필이 불러와진 PowerShell 창에서는 어느 폴더에서나 아래 명령을 쓸 수 있습니다.
+프로필이 불러와진 PowerShell 창에서는 어느 폴더에서나 아래 명령을 쓸 수 있습니다. 설치한 뒤 새 PowerShell 창을 열고 `cortex-status`를 실행하면 설치가 제대로 되었는지 확인할 수 있습니다.
 
 | 명령 | 하는 일 |
 | :--- | :--- |
@@ -42,7 +116,7 @@ Windows PowerShell 5.1과 PowerShell 7 이상에서 동작하도록 작성되어
 
 `cortex-trust`와 `cortex-status`는 `node`를 PATH에서 찾지 않습니다. 설치할 때 기록된 Node 경로(`<전역 저장소>\state\install.json`의 `nodePath`)가 있으면 그것으로 실행하고, 그 파일이 없거나 경로가 사라졌을 때만 PATH의 `node`를 씁니다. 둘 다 없으면 무엇이 없는지와 "Node.js 22.13 이상을 설치하고 `install.ps1`을 다시 실행하라"는 안내를 출력합니다.
 
-`cortex-trust`에 폴더를 주지 않으면 이 셸의 현재 폴더가 대상입니다. 승인의 뜻과 대화상자의 동작은 [`src/core/README.md`](../src/core/README.md)에 있습니다.
+`cortex-trust`에 폴더를 주지 않으면 이 셸의 현재 폴더가 대상입니다. 승인의 뜻과 대화상자의 동작은 [`src/core/README.md`](../src/core/README.md#3-프로젝트-승인-trustmjs-trust-climjs-confirmmjs)에 있습니다. 프로필 없이 쓰려면 `node <저장소>\src\core\trust-cli.mjs <명령> [폴더]`로 실행합니다.
 
 ### `cortex-status` 진단 항목
 
@@ -95,7 +169,11 @@ Herdr는 재부팅하거나 코어를 다시 시작하면 에이전트가 돌던
 | 위와 같지만 같은 폴더에 같은 에이전트의 살아 있는 탭이 하나 더 있음(실행 중이거나 함께 복구될 탭) | 건너뜁니다. `-c`로는 두 탭의 대화를 구분할 수 없기 때문이며, 서로 겹치는 탭은 양쪽 모두 건너뜁니다. 이유와 함께 `claude --resume`으로 직접 고르라는 안내가 출력됩니다. |
 | 기록도 없고 제목에도 에이전트 이름이 없음 | 일반 셸로 보고 아무것도 하지 않습니다. |
 
-전역 `config.json`(없으면 `~\.herdr-revive\config.json`)에 `claudeExtraArgs`나 `agyExtraArgs` 배열이 있으면, 위에서 만든 명령의 뒤에 그대로 덧붙입니다. 예: `"claudeExtraArgs": ["--dangerously-skip-permissions"]`.
+전역 `config.json`(없으면 `~\.herdr-revive\config.json`)에 `claudeExtraArgs`나 `agyExtraArgs` 배열이 있으면, 위에서 만든 명령의 뒤에 그대로 덧붙입니다.
+
+```json
+{ "claudeExtraArgs": ["--dangerously-skip-permissions"], "agyExtraArgs": [] }
+```
 
 같은 폴더인지는 경로 문자열을 소문자로 바꾸고 `/`를 `\`로 바꾼 뒤 비교합니다. 정션이나 심볼릭 링크는 풀지 않으므로, 같은 폴더를 다른 경로로 연 탭은 다른 폴더로 봅니다. 탭의 폴더를 알 수 없으면(빈 값) 같은 폴더의 다른 탭을 찾는 검사는 하지 않습니다.
 
@@ -145,11 +223,56 @@ Herdr는 재부팅하거나 코어를 다시 시작하면 에이전트가 돌던
 
 ---
 
-## 알아 둘 한계
+## 한계
 
-- 탭 복구가 실제 Herdr 탭에 입력하는 동작은 자동 테스트에서 가짜 `hc`로만 실행했습니다. 처음에는 `revive-agents -DryRun`으로 계획을 확인하세요.
+**탭 복구**
+
+- 탭 복구가 실제 Herdr 탭에 입력하는 동작은 자동 테스트에서 가짜 `hc`로만 실행했습니다. 처음에는 `revive-agents -DryRun`으로 계획을 확인하세요(아래 [확인 상태](#확인-상태)).
 - `revive-agents`는 빈 셸의 종류를 가리지 않고 명령을 입력합니다. 폴더 이동이 필요한 경우에만 PowerShell인지 확인합니다.
 - `hc send`가 실패한 탭(`[FAILED]`)에는 아무것도 입력되지 않았으므로 그 탭에서 직접 명령을 실행해야 합니다.
+- 탭 복구는 폴더가 같은지를 경로 문자열로 비교하므로, 같은 폴더를 정션으로 연 탭은 다른 폴더로 봅니다.
+- 탭 제목으로 추측하는 복구(`-c`)는 그 폴더의 가장 최근 대화를 여는 것이어서, 그 탭에서 하던 대화가 아닐 수 있습니다.
+
+**설치**
+
+- Windows 11 전용입니다.
+- Node 설치 위치가 바뀌면 `install.ps1`을 다시 실행해야 합니다(`cortex-status`가 알려 줍니다).
+- Claude Code가 실행 중일 때 설치하면 MCP 등록이 덮어써져 사라질 수 있습니다. 설치기가 이를 확인해 경고하며, 그때는 Claude Code 창을 모두 닫고 다시 설치합니다.
+- 실행 정책을 바꾸지 않으면 셸 명령과 자동 탭 복구를 쓸 수 없습니다.
+
+---
+
+## 확인 상태
+
+자동 테스트는 가짜 `hc`, 격리된 홈 폴더, 흉내 낸 실행 정책을 씁니다([`test/README.md`](../test/README.md#실물과-대역)). 이 폴더의 스크립트에 대해 실제 환경에서 직접 본 것과 그렇지 못한 것을 구분해 적습니다. 아래의 "개발 PC"는 Windows 11, Node 26.13.1, `hc` 0.1.21, Claude Code 2.1.330이 설치된 한 대이며, 이 PC에 `install.ps1`로 실제 설치해 보았습니다. 다른 모듈의 항목까지 모은 목록은 [루트 README](../README.md#확인-상태와-알려진-한계)에 있습니다.
+
+### 실제로 확인한 것
+
+- **실행 정책 변경과 프로필**: `install.ps1 -SetExecutionPolicy`가 현재 사용자의 정책을 `Undefined`에서 `RemoteSigned`로 바꾸고 이전 값을 기록했으며, 새로 만든 프로필이 새 PowerShell 창에서 불러와져 `cortex-status`, `cortex-trust`, `revive-agents`가 잡혔습니다. 이 설치에서 알게 된 것이 하나 있습니다. `powershell -ExecutionPolicy Bypass -File install.ps1`로 실행하면 `Set-ExecutionPolicy`가 값을 저장한 뒤에도 "더 구체적인 범위가 이 값을 덮어쓴다"는 보안 오류를 던집니다. 그래서 설치기는 오류 여부가 아니라 저장된 값을 다시 읽어 성공을 판정합니다(`Invoke-HerdrPolicyChange`).
+
+### 확인하지 못한 것
+
+항목마다 무엇을 확인하지 못했는지, 왜 못 했는지, 지금 무엇을 근거로 삼고 있는지, 어떻게 확인하면 되는지, 가정이 틀렸을 때 어떤 증상이 나오는지를 적었습니다.
+
+#### 실행 정책을 묻는 화면, 제거할 때의 복원, 이미 있는 프로필에 대한 동작
+
+| | |
+| :--- | :--- |
+| **무엇을** | `install.ps1`이 실제 콘솔에서 `[Y/N]`으로 실행 정책을 묻는 모습, `uninstall.ps1`이 실제 정책을 기록해 둔 이전 값으로 되돌리는 것, 내용이 이미 들어 있는 실제 `$PROFILE` 파일에 블록을 넣고 빼는 것 |
+| **왜 못 했나** | 실제 설치는 `-SetExecutionPolicy` 스위치로 묻는 단계를 건너뛰었고, 프로필 파일이 없던 PC라 새로 만드는 경우만 지나갔으며, 제거는 실행하지 않았습니다. |
+| **지금의 근거** | 실제 설치에서 정책 변경과 이전 값 기록, 새 프로필 생성과 불러오기는 확인했습니다. 묻는 화면과 복원, 여러 인코딩의 기존 프로필은 격리된 테스트 홈에서의 실행과 바이트 단위 자동 테스트가 근거입니다. |
+| **확인 방법** | 스위치 없이 설치해 화면을 보고, 제거한 뒤 `Get-ExecutionPolicy -Scope CurrentUser`가 설치 전 값인지, 프로필 파일이 블록만 빠진 원래 내용인지, 옆에 백업 파일이 있는지 확인합니다. |
+| **틀렸을 때 증상** | 복원이 안 되면 제거한 뒤에도 정책이 `RemoteSigned`로 남습니다(`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Undefined`로 직접 되돌릴 수 있습니다). 기존 프로필 처리가 틀리면 설치기는 그 프로필을 건드리지 않고 사유를 출력하도록 되어 있으며, 어떤 경우에도 날짜가 붙은 백업이 먼저 만들어집니다. |
+
+#### 재부팅 뒤 자동 복구와 `revive-agents`의 실제 실행, `hc send`로 탭을 실제로 깨우는 것
+
+| | |
+| :--- | :--- |
+| **무엇을** | 실제 Herdr 탭에서 프로필이 탭을 스스로 복구하는 것, `revive-agents`가 실제 탭에 명령을 입력하는 것, `relay_send`(다른 탭으로 메시지를 보내는 MCP 도구, [`src/relay/README.md`](../src/relay/README.md))가 쉬고 있는 실제 탭을 깨우는 것 |
+| **왜 못 했나** | 사용 중인 터미널에 글자가 입력되는 동작이라 가짜 `hc`로만 실행했습니다. |
+| **지금의 근거** | 실제 `hc ls`·`hc get` 출력 모양을 그대로 쓴 자동 테스트, 그리고 판정 결과를 확인하는 `-DryRun` |
+| **확인 방법** | `revive-agents -DryRun`으로 계획을 먼저 보고, 탭 하나에서 실제로 실행해 봅니다. 릴레이는 쉬고 있는 탭 하나에 `relay_send`를 보내 봅니다. |
+| **틀렸을 때 증상** | 탭이 복구되지 않거나 명령이 다른 모습으로 입력됩니다. `hc send`가 실패하면 `[FAILED]`로 표시되고 그 탭에는 아무것도 입력되지 않습니다. |
 
 ---
 

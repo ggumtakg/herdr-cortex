@@ -1212,9 +1212,10 @@ test('memory_overview: budget is kept within MEMORY_OVERVIEW_BUDGET_MIN..MAX, a 
       store.close();
     }
 
-    // READMEs: the constants by name, with their values
+    // README: the constants by name, with their values. The tool reference lives in src/mcp/README.md only
+    // (the front-page README no longer repeats it).
     const range = `${MIN.toLocaleString('en-US')}~${MAX.toLocaleString('en-US')}`;
-    for (const rel of ['README.md', path.join('src', 'mcp', 'README.md')]) {
+    for (const rel of [path.join('src', 'mcp', 'README.md')]) {
       const readme = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
       assert.ok(readme.includes(range), `${rel} states ${range}`);
       assert.ok(readme.includes('MEMORY_OVERVIEW_BUDGET_MIN') && readme.includes('MEMORY_OVERVIEW_BUDGET_MAX'), `${rel} names the constants`);

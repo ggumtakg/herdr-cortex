@@ -46,6 +46,42 @@
 
 홈 폴더(Claude Code와 Antigravity의 설정, 이전 도구의 `.herdr-revive` 저장소, 전역 저장소의 기본 위치를 찾는 기준)는 `resolveHomeDir(homeDir, { env })`가 정합니다. 순서는 인자 `homeDir`, 환경변수 `HERDR_CORTEX_TEST_HOME`(또는 `HERDR_REVIVE_TEST_HOME`), 운영체제의 사용자 홈입니다. 비어 있거나 공백뿐인 환경변수 값은 없는 것으로 봅니다. 폴더 이름 `.herdr-cortex`는 상수 `GLOBAL_DIR_NAME`입니다. `getGlobalDir(overrideGlobalDir)`는 인자가 있으면 그 경로를, 없으면 `resolveGlobalDir`의 결과를 돌려줍니다.
 
+### 전역 저장소의 구조
+
+전역 저장소에는 전역 계층의 문서와 색인 말고도, 프로젝트 폴더 안에 두지 않는 상태 파일이 모두 들어 있습니다. 승인 목록과 받은편지함을 프로젝트 폴더가 아니라 여기에 두는 까닭은, 받아 온 저장소가 그 내용을 담아 올 수 없게 하기 위해서입니다.
+
+```text
+<전역 저장소>/                              기본 위치 %USERPROFILE%\.herdr-cortex\
+  config.json                              전역 설정
+  docs/preferences/, docs/knowledge/       전역 기억 문서
+  index.sqlite                             전역 계층의 색인
+  sessions/<탭 ID>.json                    탭별 세션 기록(탭 복구용)
+  state/trusted-projects.json              승인된 폴더 목록
+  state/trusted-projects.acknowledged.json 대화상자에서 확인한 승인 목록
+  state/approval-checks/                   세션별로 승인 목록을 마지막으로 확인한 기록
+  state/inbox/<탭 ID>/                     릴레이 받은편지함
+  state/cleared-sessions/                  /clear로 끝난 세션의 기록(10분 뒤 정리)
+  state/checkpoints/                       Antigravity 대화별 상태(승인되지 않았거나 .memory/가 없는 프로젝트의 것)
+  state/deferred-index.json                색인을 미룬 문서의 기록
+  state/install.json                       설치 기록(Node 경로)
+  state/execution-policy.json              설치가 바꾼 실행 정책의 이전 값
+```
+
+탭 ID는 Herdr(탭마다 에이전트를 띄우는 터미널 앱)가 탭마다 주는 이름입니다. 각 파일을 쓰는 쪽의 설명은 [`../revive/README.md`](../revive/README.md)(세션 기록), [`../relay/README.md`](../relay/README.md)(받은편지함), [`../hooks/README.md`](../hooks/README.md)(승인 점검 기록, `/clear` 기록, 대화별 상태, 설치 기록), [`../../scripts/README.md`](../../scripts/README.md)(실행 정책 기록)에 있습니다.
+
+### 환경변수
+
+| 변수 | 뜻 |
+| :--- | :--- |
+| `HC_TERMINAL_ID` | Herdr가 탭마다 넣어 주는 탭 ID. 세션 기록, 받은편지함, 탭 복구의 기준입니다. |
+| `HERDR_CORTEX_HOME` | 전역 저장소 폴더를 다른 곳으로 지정합니다. |
+| `HERDR_CORTEX_PROJECT` | MCP 서버를 직접 실행할 때 프로젝트 폴더를 지정합니다([`../mcp/README.md`](../mcp/README.md#직접-실행-옵션과-환경변수)). |
+| `HERDR_CORTEX_TEST_HOME`, `HERDR_REVIVE_TEST_HOME` | 홈 폴더를 다른 폴더로 바꿉니다(테스트용). |
+| `HERDR_REVIVE_DISABLE` | `1`이면 자동 탭 복구를 끕니다([`../../scripts/README.md`](../../scripts/README.md#환경변수)). |
+| `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_HOST` | 임베딩 프로바이더가 읽습니다([`../embeddings/README.md`](../embeddings/README.md#프로바이더)). |
+
+전역 저장소 위치는 위에 적은 대로 명령줄의 `--global`(코드에서는 인자 `globalDir`), `HERDR_CORTEX_HOME`, 테스트용 홈 폴더 아래의 `.herdr-cortex`, 사용자 폴더 아래의 `.herdr-cortex` 순으로 정합니다. 이 밖에 확인 대화상자가 읽는 `SystemRoot`·`windir`와 `npm run trust`가 읽는 `INIT_CWD`는 아래 [3. 프로젝트 승인](#3-프로젝트-승인-trustmjs-trust-climjs-confirmmjs)에, 탭 복구 스크립트만 읽는 변수는 [`../../scripts/README.md`](../../scripts/README.md#환경변수)에 있습니다.
+
 ### 계층 폴더 구조
 
 `getProjectMemoryDir(projectDir)`는 `<projectDir>/.memory`를 돌려주고, 인자가 이미 `.memory` 폴더이면 그대로 돌려줍니다. `resolveProjectRoot(projectDir)`는 그 반대로, `.memory` 폴더를 받으면 그 부모(프로젝트 루트)를 돌려줍니다.
@@ -64,15 +100,25 @@
 | `sessionsDir` | `sessions/` | 탭별 세션 기록(전역 저장소에서 사용, [`../revive/README.md`](../revive/README.md)) |
 | `configPath` | `config.json` | 설정 파일 |
 
-`ensureTierDirs(tierDir)`는 이 가운데 `docs/`와 `state/`만 만듭니다. 문서 파일은 프로젝트 계층에서는 `docs/<YYYY-MM>/<id>.md`, 전역 계층에서는 `docs/preferences/<id>.md` 또는 `docs/knowledge/<id>.md`에 놓입니다(저장할 때의 규칙은 [6. 저장소](#6-저장소-storemjs)).
+`ensureTierDirs(tierDir)`는 이 가운데 `docs/`와 `state/`만 만듭니다. 문서 파일은 프로젝트 계층에서는 `docs/<YYYY-MM>/<id>.md`, 전역 계층에서는 `docs/preferences/<id>.md` 또는 `docs/knowledge/<id>.md`에 놓입니다(저장할 때의 규칙은 [6. 저장소](#6-저장소-storemjs)). 두 계층이 담는 것은 다음과 같습니다.
+
+| 계층 | 위치 | 담는 것 |
+| :--- | :--- | :--- |
+| **프로젝트** | `<프로젝트>\.memory\docs\<연-월>\<문서 ID>.md` | 그 프로젝트의 결정(`decision`), 작업 기록(`worklog`), 지식(`knowledge`), 할 일(`todo`), 기준선(`baseline`) |
+| **전역** | `%USERPROFILE%\.herdr-cortex\docs\preferences\`, `…\docs\knowledge\` | 모든 프로젝트에 걸친 사용자 선호(`preferences`)와 일반 지식(`knowledge`) |
 
 ### `.memory/.gitignore`
 
-기억 문서는 프로젝트의 산출물이 아니므로 `.memory/` 전체를 git에서 제외합니다. `ensureMemoryGitignore(memoryDir)`는 `<memoryDir>/.gitignore`를 내용 `*` 한 줄(`MEMORY_GITIGNORE_CONTENT`, 정확히는 `"*\n"`)로 만듭니다.
+기억 문서는 프로젝트의 산출물이 아니므로 `.memory/` 전체를 기본적으로 git에서 제외합니다. 기억 문서는 결과물을 만드는 과정의 기록이고, 과정의 기록은 커밋으로 충분하다고 보기 때문에 기본값을 이렇게 두었습니다. `ensureMemoryGitignore(memoryDir)`는 `<memoryDir>/.gitignore`를 내용 `*` 한 줄(`MEMORY_GITIGNORE_CONTENT`, 정확히는 `"*\n"`)로 만듭니다.
 
 - 파일을 "없을 때만 만들기" 방식(`wx`)으로 쓰므로 이미 있는 `.gitignore`는 내용이 무엇이든 건드리지 않습니다. 만들었으면 `true`, 이미 있거나 쓸 수 없으면 `false`를 돌려주며 예외를 던지지 않습니다.
 - `CortexStore`가 프로젝트 계층에 문서를 쓰는 경로(`saveDoc`, `updateDoc`)에서만 호출합니다. 읽기·검색·개요 조회는 아무것도 만들지 않습니다.
-- 기억 문서를 git으로 관리하려면 `.memory/.gitignore`를 직접 다른 내용(빈 파일 포함)으로 두면 됩니다. 파일을 지우면 다음 쓰기 때 `*`로 다시 만들어집니다.
+- 기억 문서를 git으로 관리하려면 `.memory/.gitignore`를 직접 다른 내용(빈 파일 포함)으로 두면 됩니다. 파일을 지우면 다음 쓰기 때 `*`로 다시 만들어집니다. 예를 들어 아래처럼 쓰면 문서만 추적하고 색인과 상태 파일은 제외합니다. 이렇게 하면 그 저장소를 받은 사람의 폴더에도 `.memory/`가 생기지만, 그 사람이 폴더를 승인하기 전에는 읽히지 않습니다([3. 프로젝트 승인](#3-프로젝트-승인-trustmjs-trust-climjs-confirmmjs)).
+
+  ```gitignore
+  index.sqlite*
+  state/
+  ```
 
 ### 그 밖의 공용 함수
 
@@ -131,7 +177,11 @@
 | `embedding.openai` | `{ model: '', dimensions: 0, apiKeyEnv: '', apiKey: '', baseUrl: '' }` | OpenAI 전용 설정 묶음 |
 | `embedding.ollama` | `{ baseUrl: '', model: '', dimensions: 0 }` | Ollama 전용 설정 묶음 |
 | `embedding.onnx` | `{ enabled: false, model: '' }` | ONNX 전용 설정 묶음 |
-| `projects` | `{}` | 프로젝트별 설정. 키는 프로젝트의 절대 경로입니다. |
+| `projects` | `{}` | 프로젝트별 설정. 키는 프로젝트의 절대 경로입니다. 지금은 `embedding`만 읽습니다. |
+| `enabled` | 없음(기본값 객체에 없는 키) | `false`로 두면 전체를 끕니다. |
+| `claudeExtraArgs`, `agyExtraArgs` | 없음(기본값 객체에 없는 키) | 탭 복구 명령 뒤에 붙일 인자 배열. 이 폴더의 코드는 읽지 않고 탭 복구 스크립트가 읽습니다([`../../scripts/README.md`](../../scripts/README.md#탭-하나에-대한-판정)). |
+
+설치기가 만드는 전역 설정 파일 `%USERPROFILE%\.herdr-cortex\config.json`은 `DEFAULT_CONFIG`를 JSON으로 그대로 적은 것입니다.
 
 프로바이더는 공통 키(`provider`, `chunkMaxChars`, `chunkOverlap`, `timeoutMs`, `queryTimeoutMs`, `circuitBreakMs`)와 자기 이름의 묶음만 읽습니다. 묶음 이름 목록은 `EMBEDDING_PROVIDER_NAMES`(`gemini`, `openai`, `ollama`, `onnx`)입니다. 각 값의 쓰임은 [`../embeddings/README.md`](../embeddings/README.md)에 있습니다.
 
@@ -208,13 +258,23 @@
 규칙은 두 종류입니다. 모두 대소문자를 가리지 않고 `\`와 `/`를 같게 봅니다.
 
 - **경로 규칙**(`/`나 `\`가 들어 있거나 `C:`처럼 드라이브 문자로 시작): 프로젝트가 그 경로 자체이거나 그 경로 아래에 있으면 맞습니다.
-- **이름 규칙**(그 밖): 프로젝트 경로의 어느 한 폴더 이름이 규칙과 같으면 맞습니다. 예를 들어 `secret`은 `D:\work\secret\app`에도 맞습니다.
+- **이름 규칙**(그 밖): 프로젝트 경로의 어느 한 폴더 이름이 규칙과 같으면 맞습니다. 예를 들어 `secret`은 `D:\work\secret\app`에도 맞습니다. 경로 어디에든 그 이름의 폴더가 있으면 적용되므로, 흔한 이름을 쓰면 의도보다 넓게 제외됩니다.
 
 프로젝트 경로는 적힌 그대로의 형태와 실제 경로(정션·심볼릭 링크를 푼 것) 두 가지로 비교하고, 절대 경로 규칙도 적힌 그대로와 실제 경로 두 가지로 비교합니다. 그래서 프로젝트나 규칙 가운데 어느 쪽을 정션, 심볼릭 링크, 8.3 짧은 이름으로 가리켜도 같은 폴더로 판정합니다.
 
 한계: 실제 경로는 운영체제가 하나로 풀어 주는 범위까지만 같아집니다. 네트워크 드라이브처럼 그 밖의 별칭은 완전히 풀리지 않을 수 있습니다. 상대 경로로 적은 규칙은 실제 경로로 바꾸지 않고 적힌 그대로만 비교합니다.
 
 이 판정은 승인과 별개입니다. 프로젝트 계층을 열려면 두 검사를 모두 통과해야 합니다. 꺼진 프로젝트에서도 세션 ID 추적(재부팅 뒤 탭 복구용)은 따로 동작합니다.
+
+### 제외된 프로젝트에서 일어나는 일
+
+이 판정으로 꺼진 프로젝트(제외된 프로젝트)에서 다른 모듈이 하는 일을 한곳에 모으면 다음과 같습니다.
+
+- 훅이 대화에 아무것도 넣지 않습니다([`../hooks/README.md`](../hooks/README.md#모든-처리기에-공통인-규칙)).
+- 프로젝트 계층을 읽거나 쓰는 도구 호출과 릴레이 도구가 거부됩니다(`PROJECT_EXCLUDED`). `.memory/`를 만들지 않고, `npm run embed`도 그 프로젝트를 건너뜁니다.
+- 전역 기억(`scope: "global"`의 조회·저장·갱신)과 `cortex_prompt`, 탭의 세션 기록(탭 복구용)은 그대로 동작합니다.
+- 이런 프로젝트에서 시작한 MCP 서버는 무엇이 막히고 무엇이 되는지를 시작 안내문으로 에이전트에게 알리고, 프로젝트 계층을 빼고 답한 검색·그래프 결과에는 `projectExcluded: true`를 붙입니다([`../mcp/README.md`](../mcp/README.md#project_dir와-제외승인)).
+- 설정을 바꾼 뒤에는 에이전트 탭을 다시 시작해야 합니다. MCP 서버는 자기 프로젝트가 제외되었는지를 시작할 때 한 번만 판단합니다(승인 여부는 호출할 때마다 다시 읽습니다).
 
 ---
 
@@ -248,7 +308,15 @@
 | `listTrustedProjects({ globalDir })` | 승인한 순서대로 `[{ path, approvedAt }]` |
 | `describeProjectTrust(projectDir, { globalDir })` | `{ path, approved, approvedAt, hasMemoryDir }` |
 
-승인은 사용자의 결정이므로 MCP 도구로는 제공하지 않고 명령줄로만 할 수 있습니다.
+승인은 사용자의 결정이므로 MCP 도구로는 제공하지 않고 명령줄로만 할 수 있습니다. 에이전트에게 승인을 부탁하지 말고 직접 실행하세요. 에이전트가 셸 도구로 승인 명령을 실행하더라도 확인 대화상자는 사용자의 화면에 뜨고 사람이 "예"를 눌러야 합니다.
+
+### 승인하지 않은 폴더에서 일어나는 일
+
+- 그 폴더의 `.memory/`에서는 아무것도 읽지 않고 대화에 넣지 않으며, `.memory/` 폴더를 만들지도 않습니다.
+- 폴더에 `.memory/`가 있으면 세션 시작 때 한 줄 알림이 나옵니다. 사용자 화면에는 아래 "승인되지 않았을 때의 문구"의 사용자용 한 줄이 보이고, 에이전트에게는 승인이 사용자의 결정이니 대신 실행하지 말고 사용자에게 물으라는 안내가 함께 들어갑니다([`../hooks/README.md`](../hooks/README.md#sessionstart-무엇을-어떤-순서로-주입하는가)).
+- 프로젝트 기억을 쓰거나 지정해서 읽는 도구 호출은 `PROJECT_NOT_APPROVED` 오류를 돌려줍니다. 검색처럼 두 계층을 함께 보는 호출은 전역 기억만으로 답하고 결과에 `projectNotApproved: true`를 붙입니다([`../mcp/README.md`](../mcp/README.md#project_dir와-제외승인)).
+- **전역 기억, `HEAD_CORE.md` 주입, 탭 릴레이, 탭 복구는 그대로 동작합니다.**
+- 그 폴더의 `.memory/config.json`도 읽지 않습니다. 따라서 그 파일에 적힌 `enabled: false`는 승인하기 전에는 적용되지 않습니다. 승인하지 않은 폴더를 완전히 끄려면 전역 설정의 `excludedProjects`에 넣으세요.
 
 ### 사람이 확인한 목록과 변경 감지
 
@@ -257,7 +325,8 @@
 - 위치: `<전역 저장소>/state/trusted-projects.acknowledged.json`(`ACKNOWLEDGED_APPROVALS_FILE`, `getAcknowledgedApprovalsPath`)
 - 형식: `{ "version": 1, "updatedAt": "<시각>", "projects": [ { "path": "...", "approvedAt": "..." } ] }`
 - 쓰는 것은 명령줄뿐이고, 사람이 본 것만 기록합니다. 확인을 거친 `approve`는 그 폴더 하나를 더하고(`acknowledgeApproval`), `revoke`는 그 폴더 하나를 빼고(`acknowledgeRevocation`), 확인을 거친 `acknowledge`는 지금의 승인 목록 전체를 복사합니다(`acknowledgeCurrentApprovals`).
-- 파일이 없으면 "확인한 것이 없음"입니다. 그래서 이 파일이 생기기 전에 한 승인은 사용자가 `cortex-trust acknowledge`를 한 번 실행할 때까지 변경으로 보고됩니다.
+- 파일이 없으면 "확인한 것이 없음"입니다. 그래서 이 파일이 생기기 전에 한 승인은 사용자가 `cortex-trust acknowledge`를 한 번 실행할 때까지 변경("대화상자 없이 추가됨")으로 보고됩니다.
+- 훅은 세션이 시작될 때와 사용자가 프롬프트를 보낼 때마다 두 파일을 비교합니다(평소에는 두 파일의 수정 시각과 크기만 확인합니다). 차이가 있으면 사용자 화면에 경고가 나오며, 같은 변경은 한 세션에 한 번만 알리고 받아들이거나 되돌릴 때까지 새 세션마다 다시 알립니다([`../hooks/README.md`](../hooks/README.md#userpromptsubmit-받은편지함-전달과-승인-목록-변경-경고)). `cortex-status`와 `cortex-trust list`에도 표시됩니다.
 
 `describeApprovalsChange({ globalDir })`는 두 목록의 차이를 `{ changed, added, removed, key }`로 돌려줍니다. `added`는 승인돼 있는데 아무도 확인하지 않은 폴더, `removed`는 확인했는데 지금은 승인돼 있지 않은 폴더입니다. `key`는 이 차이를 가리키는 16자 값(차이가 없으면 빈 문자열)이어서, 같은 변경에 대한 안내를 한 번만 보이는 데 씁니다. 훅과 `cortex-status`가 이 결과로 사용자에게 알립니다.
 
@@ -324,6 +393,8 @@ Without the shell command: node <herdr-cortex>/src/core/trust-cli.mjs <command> 
   Memory tools use it right away; the memory overview is injected from the next session start.
   ```
 
+  출력의 뜻대로, 기억 도구는 바로 그 폴더를 쓰기 시작하며 기억 개요는 다음 세션 시작부터 들어갑니다.
+
   "아니오"이면 `Not approved: <경로> (the confirmation dialog was answered No (or closed)). Nothing was changed.`를 출력하고 1로 끝납니다. 물어볼 수 없으면 표준 오류에 `Cannot ask for confirmation: <이유>. Nothing was changed. Run "cortex-trust approve" yourself in a terminal window.`를 남기고 2로 끝납니다.
 - **`revoke [folder]`**: 묻지 않습니다. `Revoked: <경로>` 또는 `Was not approved: <경로>`를 출력하고 0으로 끝납니다. 사람이 확인한 목록에서도 그 폴더를 뺍니다.
 - **`status [folder]`**: 승인됐으면 `Approved: <경로> (since <시각>)`과 코드 0. 아니면 `Not approved: <경로>`, `.memory/`가 있는지에 따른 설명 한 줄, 승인 방법 문장을 출력하고 코드 1.
@@ -378,10 +449,23 @@ If you did not ask for this yourself, choose No.
 
 ### 이 장치의 한계
 
-- 대화상자는 "사람이 눌렀는지"를 화면으로만 가립니다. 화면을 조작할 수 있는 프로그램이 "예"를 누르는 것은 막지 못합니다.
-- 승인 목록 파일을 직접 고치는 것은 막지 못합니다. 대신 사람이 확인한 목록과의 차이로 드러나며, 사용자는 그 뒤에 알게 됩니다.
-- PowerShell의 위치를 환경변수(`SystemRoot`, `windir`)에서 읽으므로, 명령의 환경을 바꿀 수 있는 쪽은 다른 프로그램을 가리키게 할 수 있습니다.
+확인 대화상자, 사람이 확인한 목록, 훅의 검사는 함께 에이전트가 스스로 승인하는 것을 어렵게 하는 장치입니다. 하는 일은 다음과 같습니다.
+
+- 승인은 MCP 도구로 제공하지 않습니다.
+- `cortex-trust approve`와 `acknowledge`는 누가 어디서 실행하든 사용자 화면의 확인 대화상자에서 사람이 "예"를 눌러야 합니다. 기본 선택은 "아니오"이고, 건너뛰는 옵션은 없습니다.
+- 승인 목록 파일이나 전역 저장소의 `state/` 폴더를 고치려는 호출에는 Claude Code가 사용자에게 확인을 요청하고, 서브에이전트(메인 대화가 띄운 하위 에이전트)의 그런 호출은 거부합니다([`../hooks/README.md`](../hooks/README.md#pretooluse-도구-호출-직전의-검사)).
+- 승인 목록이 대화상자를 거치지 않고 바뀌면 바로 다음 프롬프트에 사용자 화면에 경고가 나옵니다.
+
+한계는 다음과 같습니다.
+
+- **화면 조작**: 대화상자는 "사람이 눌렀는지"를 화면으로만 가립니다. 화면을 조작할 수 있는 프로그램은 대화상자의 "예"를 누를 수 있습니다.
+- **파일 직접 수정**: 승인 목록 파일은 사용자 권한으로 쓸 수 있는 보통 파일입니다. 직접 고치면 승인이 곧바로 효력을 갖고, 사용자는 사람이 확인한 목록과의 차이로 나오는 다음 프롬프트의 경고로 알게 됩니다. 그 사이의 한 턴 동안은 노출됩니다. 확인 목록 파일까지 함께 고치면 경고도 나오지 않습니다.
+- **글자 판정**: 훅의 셸 명령 검사는 파일 이름과 명령 이름을 글자로 찾습니다. 이름을 실행 중에 조립하면 잡지 못합니다. 또 셸 명령으로 `state/` 폴더의 다른 파일(승인 목록 두 파일이 아닌 것)을 쓰는 것은 검사하지 않습니다. 파일 도구로 쓰는 것만 검사합니다.
+- **환경변수**: 대화상자를 띄우는 Windows PowerShell의 위치는 `SystemRoot`(없으면 `windir`) 환경변수로 정합니다. 이 변수를 바꾼 채 명령을 실행할 수 있는 쪽은 다른 프로그램이 대신 답하게 할 수 있습니다.
+- **Antigravity**에는 확인 요청과 서브에이전트 거부가 적용되지 않습니다. 경고는 에이전트에게 "사용자에게 전하라"는 요청으로만 들어갑니다.
 - Windows가 아닌 곳에서는 대화상자가 없어 터미널 질문만 남습니다.
+
+이 한계들을 사실상 없애려면 승인 목록을 관리자만 쓸 수 있는 곳에 두고 권한 상승 창을 거쳐야 합니다. 그렇게 하면 승인할 때마다 권한 상승 창이 뜨므로 지금은 채택하지 않았습니다(아래 [향후 개선안](#향후-개선안)).
 
 ---
 
@@ -511,6 +595,18 @@ UNSAFE_UPDATE: "<경로>" was not modified because <이유>. Fix the file by han
 
 시간 한도가 있는 동기화(세션 시작 훅, MCP 도구 호출)는 바뀐 파일을 전부 색인하지 않고, 지금 못 끝낼 파일을 **미룹니다**. 미룬 파일은 제외되는 것이 아닙니다. 가지고 있던 줄을 그대로 유지하고(지워진 파일로 오인하지 않음), 한도 없는 다음 동기화(MCP 서버의 뒤쪽 작업)가 색인합니다.
 
+누가 어떤 한도로 동기화하는지는 다음과 같습니다.
+
+| 누가 | 색인에 쓰는 시간 | 이 크기를 넘는 문서는 항상 미룸 |
+| :--- | :--- | :--- |
+| 세션 시작 훅 | 훅 프로세스 시작부터 4,000ms(훅의 제한 시간은 10초) | 2MiB |
+| MCP 도구 호출 한 번 | 약 200ms(파일 크기로 미리 어림) | 256KiB |
+| MCP 서버의 뒤 작업 | 제한 없음. 서버 시작 250ms 뒤와, 도구 호출이 문서를 미룬 직후에 실행 | 없음 |
+
+- 훅이 문서를 미루면 대화에 "기억이 불완전할 수 있다"는 알림과 미룬 문서 이름(최대 5개)이 들어가고, 사용자 화면에도 한 줄(이름 최대 3개)이 보입니다([`../hooks/README.md`](../hooks/README.md#색인이-느리거나-큰-문서는-미룸-overviewmjs)).
+- 도구 호출이 문서를 미루면 결과에 `indexing: { pending, documents }`가 붙습니다. 그 문서들은 아직 결과에 없을 수 있다는 뜻입니다([`../mcp/README.md`](../mcp/README.md#색인-대기-표시-indexing)).
+- MCP 서버가 실행 중이 아니면(에이전트 탭이 하나도 없으면) 미룬 문서는 다음에 서버가 시작될 때 색인됩니다. `cortex-status`도 열 수 있는 계층을 한 번 동기화합니다.
+
 옵션(모두 선택 사항이며, `deadline`과 `maxFileBytes`가 둘 다 없으면 바뀐 파일을 전부 색인):
 
 | 옵션 | 뜻 |
@@ -547,7 +643,7 @@ UNSAFE_UPDATE: "<경로>" was not modified because <이유>. Fix the file by han
 
 `indexSingleFile(db, tierDir, absFilePath)`는 Markdown 파일 하나를 **호출한 쪽이 이미 잡은 트랜잭션 안에서** 색인합니다. `CortexStore`가 파일을 읽고 고쳐 쓰는 일과 색인 갱신을 한 쓰기 잠금 아래 묶는 데 씁니다. `syncSingleFile(db, tierDir, absFilePath)`는 그것을 자기 트랜잭션으로 감싼 것입니다.
 
-한계: 양보는 파일과 파일 사이에서만 일어납니다. 파일 하나는 한 번에 색인하므로, 아주 큰 문서를 색인하는 동안에는 같은 프로세스의 다른 요청이 그만큼 기다립니다. 개발 PC에서 잰 색인 속도는 파일당 약 2ms에 18KB당 약 1ms입니다(`store.mjs`의 주석).
+한계: 양보는 파일과 파일 사이에서만 일어납니다. 파일 하나는 한 번에 색인하므로, 아주 큰 문서를 색인하는 동안에는 같은 프로세스의 다른 요청이 그만큼 기다립니다. 개발에 쓴 PC에서 잰 색인 속도는 파일당 약 2ms에 18KB당 약 1ms, 곧 1MB당 55ms 안팎입니다(`store.mjs`의 주석). 색인을 별도 작업 스레드로 옮기는 개선안은 [`../mcp/README.md`](../mcp/README.md#향후-개선안)에 있습니다.
 
 ### 같은 ID를 가진 문서
 
@@ -643,6 +739,8 @@ UNSAFE_UPDATE: "<경로>" was not modified because <이유>. Fix the file by han
 한계: 잠금은 이 도구의 쓰는 쪽끼리만 지킵니다. 편집기로 기억 문서를 열어 둔 채 도구가 같은 문서를 갱신하면, 편집기의 저장이 그 갱신을 덮어쓸 수 있습니다.
 
 ### `supersedes`: 옛 문서를 대체하기
+
+결정이나 기준선이 바뀌면 옛 문서를 지우거나 덮어쓰지 않고 대체합니다. 대체된 옛 문서는 `superseded` 상태가 되어 기본 검색에서 빠지고, 두 문서는 `supersedes` 연결로 이어져 `memory_graph` 도구로 변경의 흐름을 따라갈 수 있습니다.
 
 `saveDoc`과 `updateDoc` 모두 `supersedes`에 옛 문서의 ID를 받고 같은 일을 합니다. 새 문서의 머리말에 `supersedes`를 적고, **같은 계층**에 있는 옛 문서의 `status`를 `superseded`로, `updated_at`을 지금으로 바꿉니다. 옛 문서도 원문을 보존하는 방식으로 고쳐 쓰며, 안전하게 고쳐 쓸 수 없으면 전체를 거부합니다.
 
@@ -789,7 +887,7 @@ P0 기준선(프로젝트의 원래 목표를 적은 문서)은 다른 결정들
 
 ### 개요를 한도에 맞추기
 
-`fitOverviewToBudget(overviewData, budget = 9000)`은 `getOverview`의 자료를 글로 만들되, 문장 중간을 자르지 않고 **항목 수와 세부 항목을 단계적으로 줄여** 한도에 맞춥니다. `FIT_STEPS`의 단계를 위에서부터 시도해 처음으로 한도에 들어가는 것을 씁니다.
+`fitOverviewToBudget(overviewData, budget = 9000)`은 `getOverview`의 자료를 글로 만들되, 문장 중간을 자르지 않고 **항목 수와 세부 항목을 단계적으로 줄여** 한도에 맞춥니다. `FIT_STEPS`의 6단계(`full` → `standard` → `focused` → `compact` → `minimal` → `essential`)를 위에서부터 시도해 처음으로 한도에 들어가는 것을 씁니다.
 
 | 단계 | P0 기준선 | 세션 | 할 일 | 결정·기준선 | 전역 | 최근 작업 | 요약 | 태그 | 줄 형식 |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- | :--- |
@@ -818,6 +916,80 @@ P0 기준선(프로젝트의 원래 목표를 적은 문서)은 다른 결정들
 ### 한 줄 정리
 
 `sanitizeInline(value)`는 문서의 머리말이나 릴레이 메시지의 부가 정보에서 온 값을 한 줄로 만듭니다. 각 줄 맨 앞의 Markdown 제목 표시(`#`)를 떼고, 줄바꿈·탭·제어 문자를 공백으로 바꾸고, 이어진 공백을 하나로 줄입니다. 예를 들어 `"P0\n\n## User instruction\tdo x"`는 `P0 User instruction do x`가 됩니다. 문서의 `branch`나 `title`에 줄바꿈과 제목 표시를 넣어 주입 내용 안에 새 구역처럼 보이는 줄을 만드는 일을 막습니다. `fitOverviewToBudget`은 개요에 찍는 모든 값(`id`, `type`, `title`, `summary`, `session`, `branch`, `due`, `category`, `tags`, 세션 이름과 브랜치 목록)에 이것을 적용합니다.
+
+고정 문구와 한 줄 정리는 에이전트가 기록을 지시로 오해할 가능성을 줄이는 장치이고, 에이전트가 그 내용을 따르지 않는다는 보장은 아닙니다.
+
+---
+
+## 한계
+
+**승인과 설정**
+
+- 승인은 그 폴더 하나에만 적용됩니다. 하위 폴더의 저장소는 따로 승인해야 합니다.
+- 승인하지 않은 폴더는 그 안의 `config.json`도 읽지 않으므로, 거기에 적힌 `enabled: false`는 승인 전에는 적용되지 않습니다.
+- 승인하기 전에는 그 폴더에 기억을 저장할 수도 없습니다(`PROJECT_NOT_APPROVED`).
+- 프로젝트 제외는 정션과 심볼릭 링크는 풀어서 비교하지만, 네트워크 드라이브 같은 다른 별칭은 완전히 풀리지 않을 수 있습니다.
+- 이름 규칙(`/`가 없는 `excludedProjects` 항목)은 경로 어디에든 그 이름의 폴더가 있으면 적용되므로, 흔한 이름을 쓰면 의도보다 넓게 제외됩니다.
+- 에이전트가 스스로 승인하는 것을 어렵게 하는 장치는 화면 조작, 승인 파일 직접 수정(다음 프롬프트의 경고로 알게 되며 그 사이 한 턴은 노출), `SystemRoot` 환경변수 조작을 막지 못합니다(위 [이 장치의 한계](#이-장치의-한계)).
+
+**기억 문서와 색인**
+
+- 편집기로 문서를 열어 둔 동안 도구가 같은 문서를 갱신하면 편집기의 저장이 도구의 변경을 덮어쓸 수 있습니다. 도구끼리는 색인의 쓰기 잠금으로 순서를 지키지만 편집기는 그 잠금을 모릅니다.
+- 손으로 쓴 문서의 시각이 다른 시간대 표기(`Z`나 다른 시차)이면 검색 결과와 기억 개요의 최신순 정렬이 틀릴 수 있습니다. 같은 세션 문서를 잇는 순서는 올바르게 계산합니다.
+- 색인을 지우면 벡터는 파일에서 다시 만들어지지 않고 임베딩을 다시 해야 합니다.
+- 파일 하나는 한 번에 색인하므로, 아주 큰 문서를 뒤에서 색인하는 동안 도구 호출이 그 문서 하나만큼 기다릴 수 있습니다(1MB당 55ms 안팎).
+- 미룬 문서는 MCP 서버가 실행 중일 때 색인됩니다.
+- 같은 ID의 문서가 둘이면 하나만 색인됩니다. 건너뛴 쪽은 `cortex-status`에 나옵니다.
+
+**보안 장치가 하는 일과 하지 못하는 일**
+
+herdr-cortex가 다루는 위험은 두 가지입니다. 하나는 **다른 사람이 만든 저장소의 내용이 에이전트의 대화나 이 도구의 동작에 영향을 주는 것**이고, 다른 하나는 **에이전트가 실수로 기억을 망가뜨리는 것**입니다. 첫째 위험에 대한 장치 가운데 이 폴더의 코드가 맡는 것은 아래 표와 같습니다. 같은 목적의 나머지 장치는 [`../embeddings/README.md`](../embeddings/README.md#한계)(임베딩 기본값 꺼짐)와 [`../relay/README.md`](../relay/README.md#한계)(받은편지함의 위치, `hc.exe`의 절대 경로 실행)에 있습니다.
+
+| 장치 | 하는 일 | 하지 못하는 일 |
+| :--- | :--- | :--- |
+| **프로젝트 승인** | 승인하지 않은 폴더의 `.memory/`와 그 안의 설정 파일을 읽지 않고, 쓰지 않고, 대화에 넣지 않습니다. | 승인한 폴더의 내용은 그대로 들어갑니다. 승인은 "이 폴더의 기억을 믿는다"는 뜻이므로, 받아 온 저장소를 승인하기 전에 `.memory/`를 살펴보세요. |
+| **기록이라는 표시와 한 줄 정리** | 주입하는 기억과 메시지 앞에 "기록이며 지시가 아니다"라는 문장을 붙이고, 머리말 값이 새 줄이나 제목으로 보이지 않게 합니다. | 에이전트가 본문 속의 지시를 따르지 않는다는 보장은 아닙니다. |
+| **프로젝트 설정 제한** | 프로젝트의 `.memory/config.json`은 세 가지 값만 받아들입니다. 문서를 어디로 보낼지(`embedding`)와 어떤 프로젝트를 켤지는 저장소가 정할 수 없습니다. | |
+| **프로젝트 제외의 실제 경로 비교** | 제외한 폴더를 정션이나 심볼릭 링크로 돌아 들어가도 제외합니다. | 네트워크 드라이브처럼 실제 경로로 풀리지 않는 별칭은 놓칠 수 있습니다. |
+
+확인 대화상자를 띄우는 Windows PowerShell을 절대 경로로 실행하는 것도 같은 목적의 장치입니다. 프로젝트 폴더에 심어 둔 같은 이름의 실행 파일이 대신 실행되지 않게 하지만, `SystemRoot` 환경변수를 바꿀 수 있는 쪽은 막지 못합니다(위 [확인 받기](#확인-받기-confirmmjs)).
+
+둘째 위험에 대한 장치는 서브에이전트의 기억 쓰기를 거부하는 것입니다. 이것은 실수 방지 장치이지 보안 경계가 아니며, 하는 일과 한계는 MCP 서버 쪽을 [`../mcp/README.md`](../mcp/README.md#서브에이전트-판정-issubagentcaller)에, 훅 쪽을 [`../hooks/README.md`](../hooks/README.md#pretooluse-도구-호출-직전의-검사)에 적었습니다. 다른 프로젝트에 쓰려는 호출에 대한 확인도 그 두 문서에 있습니다.
+
+---
+
+## 확인 상태
+
+자동 테스트는 격리된 홈 폴더에서 실제 파일과 실제 SQLite로 동작하지만, 확인 대화상자는 화면에 띄우지 않습니다([`../../test/README.md`](../../test/README.md#실물과-대역)). 이 폴더의 코드에 대해 실제 환경에서 직접 본 것과 그렇지 못한 것을 구분해 적습니다. "개발 PC"는 Windows 11, Node 26.13.1, Claude Code 2.1.330이 설치된 한 대입니다. 다른 모듈의 항목까지 모은 목록은 [루트 README](../../README.md#확인-상태와-알려진-한계)에 있습니다.
+
+### 실제로 확인한 것
+
+- **승인 확인 대화상자**: `trust-cli.mjs approve`를 PowerShell에서 직접 실행했습니다. 대화상자가 다른 창들 위에 떴고, 기본 선택은 "아니오"였으며, "예"를 누르자 `Approved: <폴더>`가 출력되고 승인 목록과 확인 목록 두 파일에 기록되었습니다. 실제 대화상자에서 "아니오"를 눌렀을 때의 출력과 터미널에서 묻는 대체 경로는 자동 테스트로만 확인했습니다.
+- **Node의 `euc-kr` 디코더는 CP949 전체를 해석하지 못함**(2,350자만). 그래서 CP949 해석기를 직접 구현했고 Windows의 코드 페이지 949와 대조했습니다.
+
+### 확인하지 못한 것
+
+무엇을 확인하지 못했는지, 왜 못 했는지, 지금 무엇을 근거로 삼고 있는지, 어떻게 확인하면 되는지, 가정이 틀렸을 때 어떤 증상이 나오는지를 적었습니다.
+
+#### `sqlite-vec`의 미리 빌드된 실행 파일
+
+| | |
+| :--- | :--- |
+| **무엇을** | `npm install`이 받는 `sqlite-vec`의 Windows용 실행 파일(`vec0.dll`)의 내용 |
+| **왜 못 했나** | 소스가 아닌 바이너리라 검토 범위에 넣지 않았습니다. |
+| **지금의 근거** | `package-lock.json`이 공식 npm 레지스트리 주소와 무결성 해시를 고정하고 있다는 것만 확인했습니다. |
+| **확인 방법** | 필요하면 `sqlite-vec`의 소스에서 직접 빌드한 파일로 바꿉니다. 쓰지 않으려면 `npm install`을 하지 않으면 됩니다. |
+| **틀렸을 때 증상** | (동작이 아니라 신뢰의 문제입니다.) 이 파일은 MCP 서버 프로세스 안에 불러와집니다. `sqlite-vec`가 없으면 벡터 검색만 꺼지고 나머지는 그대로 동작합니다. |
+
+---
+
+## 향후 개선안
+
+구현하지 않고 기록으로만 남기는 것입니다.
+
+### 승인 목록을 관리자만 쓸 수 있는 곳에 두기
+
+승인 목록을 일반 사용자 권한으로는 쓸 수 없는 위치에 두고, 승인할 때 Windows의 권한 상승 창을 거치게 하는 방식입니다. 에이전트가 파일을 직접 고쳐 스스로 승인하는 길과 화면 조작으로 대화상자를 누르는 길을 사실상 막을 수 있습니다. 대신 승인할 때마다 권한 상승 창이 뜨고 관리자 권한이 없는 계정에서는 승인할 수 없게 되므로 지금은 채택하지 않았습니다.
 
 ---
 

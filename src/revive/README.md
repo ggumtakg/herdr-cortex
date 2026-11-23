@@ -123,6 +123,14 @@ Claude Code의 세션 시작 훅은 이 `previousSessionId`로 "방금 지운 �
 
 ---
 
+## 한계와 확인 상태
+
+- 이 기록으로 탭을 되살리는 쪽의 한계(폴더가 같은지를 경로 문자열로 비교함, 탭 제목으로 추측하는 복구는 그 탭의 대화가 아닐 수 있음)는 [`scripts/README.md`의 "한계"](../../scripts/README.md#한계)에 있습니다.
+- Claude Code 2.1.330의 실제 세션에서 훅이 이 기록 파일(`sessions/<탭 ID>.json`)을 쓰는 것은 확인했습니다([`src/hooks/README.md`의 "확인 상태"](../hooks/README.md#확인-상태)). 재부팅 뒤 실제 Herdr 탭에서 이 기록으로 대화가 복구되는 것은 확인하지 못했으며, 그 항목은 [`scripts/README.md`의 "확인 상태"](../../scripts/README.md#확인-상태)에 있습니다.
+- Antigravity 쪽의 동작은 개발에 쓴 PC에 Antigravity가 설치되어 있지 않아 코드와 자동 테스트로만 확인했습니다([`src/hooks/README.md`의 "확인 상태"](../hooks/README.md#확인-상태)의 "Antigravity CLI 전반").
+
+---
+
 ## 관련 테스트
 
 이 폴더의 모듈을 직접 불러 쓰는 테스트 파일입니다.

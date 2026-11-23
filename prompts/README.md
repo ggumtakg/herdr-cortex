@@ -14,6 +14,20 @@
 
 ---
 
+## 설계 원리
+
+이 자산들과 herdr-cortex의 기억 기능은 아래 네 가지 생각 위에 서 있습니다. 기억 문서는 결정·작업 기록·지식·할 일·기준선 하나를 담은 마크다운 파일 하나를 말합니다.
+
+**컨텍스트는 기억이 아닙니다.** 에이전트는 매 턴 주어진 대화만 보고 다음 행동을 정합니다. 대화가 길어지면 지금 판단과 무관한 낡은 내용이 섞이고, 요약을 다시 요약하는 일이 거듭되면 처음 합의한 내용에서 조금씩 멀어집니다. 그래서 합의한 결정·기준선·할 일은 대화 밖의 마크다운 파일에 고정하고, 대화가 압축되거나 새로 시작될 때 그 요약과 직전 대화의 원문을 다시 넣습니다.
+
+**HEAD는 판단에, 세부는 워커에.** 메인 대화(HEAD)는 목적 합의, 계획 확정, 결과 통합, 최종 판정에 머뭅니다. 세부 조사와 구현은 서브에이전트나 다른 탭에서 하고, 결과와 제약, 근거의 위치만 돌려받습니다. 구현 세부가 쌓여 판단이 좁아지는 것을 막기 위해서입니다.
+
+**만든 쪽이 검수하지 않습니다.** 직접 만든 결과물은 만든 맥락을 모르는 새 컨텍스트(`independent-review`, `reviewer`)에서 검수하고, HEAD가 처음의 합의를 기준으로 받아들일지 정합니다. 완료는 보고가 아니라 실제 실행으로 증명합니다.
+
+**지우지 않고 잇습니다.** 결정이 바뀌면 옛 문서를 지우지 않고 새 문서의 `supersedes`로 대체해 이력을 남깁니다([`src/core/README.md`](../src/core/README.md#supersedes-옛-문서를-대체하기)).
+
+---
+
 ## 파일 구성
 
 | 경로 | `cortex_prompt` 호출 | 역할 |
@@ -29,13 +43,15 @@
 | **`agents/developer.md`** | `kind: "agent", name: "developer"` | 정해진 경계 안에서 구현하고 실제 실행으로 증명하는 워커 |
 | **`agents/reviewer.md`** | `kind: "agent", name: "reviewer"` | 파일을 고치지 않는 독립 검수자 |
 
+스킬은 5개(`start-job`, `product-planning`, `delegate`, `independent-review`, `plan-run`), 워커 역할은 3개(`coder`, `developer`, `reviewer`)입니다. `HEAD_CORE.md` 외의 자산은 필요할 때 `cortex_prompt` 도구로 읽으며, Claude Code에는 설치할 때 스킬로도 복사됩니다.
+
 `cortex_prompt`는 `kind`에 따라 파일을 찾습니다. `skill`은 `skills/<name>/SKILL.md`, 없으면 `skills/<name>.md`를 읽고, `agent`는 `agents/<name>.md`를, `standard`와 `core`는 이 폴더 바로 아래의 `<name>.md`를 읽습니다(`name`을 생략하면 각각 `DEVELOPMENT_STANDARD`, `HEAD_CORE`). `name`에 `..`이 들어 있거나 결과 경로가 이 폴더를 벗어나면 오류를 돌려줍니다.
 
 ---
 
 ## 기억 쓰기 규칙에 대한 표현
 
-`HEAD_CORE.md`와 `skills/delegate/SKILL.md`는 "정본 기억 쓰기(`memory_save`, `memory_update`)는 HEAD만 한다"고 적습니다. 이것은 에이전트가 따라야 할 작업 규칙입니다. 서브에이전트의 쓰기 호출을 도구와 훅이 거부하기는 하지만, 그 거부는 실수를 막는 장치이지 보안 경계가 아닙니다. 호스트가 호출자 정보를 넘겨줄 때만 동작하고, 훅이 실패하면 호출이 그대로 통과하기 때문입니다. 두 파일에도 그렇게 적혀 있으며, 한계의 전체 목록은 루트 README의 "보안 모델" 절에 있습니다.
+`HEAD_CORE.md`와 `skills/delegate/SKILL.md`는 "정본 기억 쓰기(`memory_save`, `memory_update`)는 HEAD만 한다"고 적습니다. 이것은 에이전트가 따라야 할 작업 규칙입니다. 서브에이전트의 쓰기 호출을 도구와 훅이 거부하기는 하지만, 그 거부는 실수를 막는 장치이지 보안 경계가 아닙니다. 호스트가 호출자 정보를 넘겨줄 때만 동작하고, 훅이 실패하면 호출이 그대로 통과하기 때문입니다. 두 파일에도 그렇게 적혀 있으며, 한계의 전체 목록은 서버 쪽 검사를 다루는 [`src/mcp/README.md`의 "서브에이전트 판정"](../src/mcp/README.md#서브에이전트-판정-issubagentcaller)과 훅 쪽 검사를 다루는 [`src/hooks/README.md`의 "PreToolUse: 도구 호출 직전의 검사"](../src/hooks/README.md#pretooluse-도구-호출-직전의-검사)에 있습니다.
 
 ---
 

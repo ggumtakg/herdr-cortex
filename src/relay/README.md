@@ -119,9 +119,7 @@ Windows에서 프로그램을 이름만으로 실행하면 PATH보다 현재 폴
 [relay] Message <메시지 ID> from <보낸 탭 ID 또는 peer> (2 docs) — check hook context or run relay_inbox(action="peek") if not shown
 ```
 
-### 실제 `hc`로 확인된 범위
-
-`hc` 0.1.21의 실제 출력으로 확인된 것은 `idle`, `working`, `blocked`(`kind: "permission"`), 빈 셸 탭, 끝난 터미널, 그리고 대화상자에서 기다리는 탭에 `hc send`를 보냈을 때의 거부(종료 코드 9)입니다. `done`과 `error` 상태, `status_mismatch`·`finished`·`not_found` 오류는 `hc schema`의 정의에 따른 것이고 실제 탭에서 본 적은 없습니다. 이 부분이 실제와 다르면 해당 상태의 탭을 깨우지 못하거나 이유가 `hc_send_failed`로 나옵니다.
+이 절의 내용 가운데 실제 `hc`의 출력으로 확인한 것과 `hc schema`의 정의에만 기대고 있는 것은 아래 [확인 상태](#확인-상태)에 나누어 적었습니다.
 
 ---
 
@@ -228,7 +226,7 @@ Context docs: [[decision-20261123-api]]
 | Claude Code 세션 시작 | 기억 개요나 최근 대화 복원이 함께 있으면 남은 자리의 35%(300~2,000자), 없으면 남은 자리 전체 | 훅 예산 |
 | Antigravity 세션 시작·호출 전 | 2,500자와 남은 자리 중 작은 값 | 2,500자와 훅 예산 중 작은 값 |
 
-한계: 주입 글은 제목과 고정 안내문만으로 236자를 씁니다. 긴 메시지를 본문 앞부분 없이 알리는 데에도 보통 540자 정도가 필요합니다(제목·안내문 236자, 머리 줄 약 65자, 안내문 약 237자. 메시지 ID나 보낸 탭 이름이 길거나 `context_docs`가 있으면 더 필요합니다). `hookBudget`을 그보다 작게 잡으면 긴 메시지는 주입도 알림도 되지 않고 대기 상태로 남아, `relay_inbox(action="peek")`로 직접 읽어야 합니다. `relay_tabs`의 `pendingInboxCount`로 남아 있는 것을 알 수 있습니다.
+한계: 주입 글은 제목과 고정 안내문만으로 236자를 씁니다. 긴 메시지를 본문 앞부분 없이 알리는 데에도 보통 540자 정도가 필요합니다(제목·안내문 236자, 머리 줄 약 65자, 안내문 약 237자. 메시지 ID나 보낸 탭 이름이 길거나 `context_docs`가 있으면 더 필요합니다). `hookBudget`을 그보다 작게(약 550자보다 작게) 잡으면 긴 메시지는 주입도 알림도 되지 않고 대기 상태로 남아, `relay_inbox(action="peek")`로 직접 읽어야 합니다. `relay_tabs`의 `pendingInboxCount`로 남아 있는 것을 알 수 있습니다.
 
 ### 꺼내기·조회·확인 처리 함수
 
@@ -400,6 +398,54 @@ Another process is delivering this terminal's messages right now; nothing was ac
 | `TOOL_EXECUTION_ERROR` | 셋 모두 | 그 밖의 예외. 예: 형식에 맞지 않는 탭 ID(`Invalid terminalId "...": must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ and not be a reserved name`)나 메시지 ID(`Invalid messageId "..."`) |
 
 `PROJECT_NOT_APPROVED`는 릴레이 도구에서 나오지 않습니다(위 "공통 검사"의 승인 항목).
+
+---
+
+## 한계
+
+- 릴레이는 같은 PC의 탭끼리만 됩니다(위 [제약: 같은 PC의 탭끼리만](#제약-같은-pc의-탭끼리만)).
+- `hookBudget`이 약 550자보다 작으면 긴 메시지의 알림도 들어가지 못합니다(위 [글자 수 예산과의 관계](#글자-수-예산과의-관계)). 이때 메시지는 받은편지함에 남아 있으므로 `relay_inbox`로 읽을 수 있습니다.
+- `relay_inbox`의 `terminal_id` 인자로 같은 PC의 다른 탭 받은편지함도 읽고 확인 처리할 수 있습니다. 받은편지함은 같은 PC의 탭들이 서로 믿는다는 전제로 만든 것입니다.
+- `relay_send`는 받는 탭이 실제로 있는지 확인하지 않습니다. 없는 탭 ID로 보내도 메시지는 저장되고, 깨우기 결과만 `hc_unavailable`로 나옵니다.
+- `wake: "always"`도 `hc get`이 실패하면 입력하지 않습니다. 메시지는 저장되어 있으므로 받는 탭의 다음 프롬프트 때 전달됩니다.
+- 훅이 제한 시간에 걸려 중단되면 그 훅은 아무것도 넣지 못합니다. 이때 전달 중이던 메시지는 `.delivered/` 보관함에서 되찾을 수 있습니다(위 [전달된 메시지의 보관](#전달된-메시지의-보관-inbox_delivered_retention_ms)).
+
+릴레이에는 다른 사람이 만든 저장소의 내용이 에이전트의 대화나 이 도구의 동작에 영향을 주지 못하게 하는 장치가 둘 있습니다. 각 장치가 하는 일과 하지 못하는 일은 다음과 같습니다. 같은 목적의 다른 장치(프로젝트 승인, 주입 내용의 표시, 프로젝트 설정 제한, 프로젝트 제외)는 [`src/core/README.md`](../core/README.md#한계)에, 임베딩 기본값은 [`src/embeddings/README.md`](../embeddings/README.md#한계)에 있습니다.
+
+| 장치 | 하는 일 | 하지 못하는 일 |
+| :--- | :--- | :--- |
+| **받은편지함의 위치** | 메시지를 전역 저장소에 두므로 저장소가 가짜 메시지를 담아 올 수 없습니다. | 같은 PC에서 사용자 권한으로 도는 프로그램은 받은편지함에 파일을 쓸 수 있습니다. |
+| **`hc.exe`와 PowerShell의 절대 경로 실행** | 프로젝트 폴더에 심어 둔 같은 이름의 실행 파일이 대신 실행되지 않게 합니다. `hc.exe`는 이 폴더의 `hc.mjs`가, 승인 확인 대화상자를 띄우는 Windows PowerShell은 [`src/core/confirm.mjs`](../core/README.md#확인-받기-confirmmjs)가 절대 경로로 실행합니다. | PATH 자체나 `SystemRoot` 환경변수를 바꿀 수 있는 쪽은 막지 못합니다. |
+
+---
+
+## 확인 상태
+
+자동 테스트는 `hc`를 실행하지 않고 가짜 `hc`를 씁니다([`test/README.md`](../../test/README.md#실물과-대역)). 이 폴더가 기대는 `hc`의 동작 가운데 실제 환경에서 직접 본 것과 그렇지 못한 것을 구분해 적습니다. 아래의 "개발 PC"는 Windows 11, Node 26.13.1, `hc` 0.1.21, Claude Code 2.1.330이 설치된 한 대입니다. 다른 모듈의 항목까지 모은 목록은 [루트 README](../../README.md#확인-상태와-알려진-한계)에 있습니다.
+
+### 실제로 확인한 것
+
+- **`hc`의 출력 모양**(개발 PC의 `hc` 0.1.21): `hc ls`의 줄에서 `status`는 낱말 하나로 된 문자열이고, `hc get`에서는 `{app, state, msg, kind}` 객체입니다. 실제 탭에서 본 상태는 `idle`, `working`, `blocked`(`kind: "permission"`)입니다. 빈 셸 탭은 `agent`가 `powershell.exe`이고 `status`가 없습니다. 끝난 터미널도 실제 출력으로 보았습니다. 다른 PC의 탭은 `pc2/t3` 같은 주소로 나옵니다.
+- **`hc`의 상태 정의**(`hc schema`): `state`는 `idle`, `working`, `done`, `blocked`, `error` 다섯 가지, `kind`는 `permission`, `question`, `auth`, 탭의 `state`는 `live` 또는 `finished`, `hc send --if`는 `idle`과 `working`만 받습니다. `done`과 `error` 상태, `status_mismatch`·`finished`·`not_found` 오류는 이 정의에 따른 것이고 실제 탭에서 본 적은 없습니다(아래 "확인하지 못한 것").
+- **확인 창이 뜬 탭에 대한 `hc send`**: `--force` 없이 실제로 보냈을 때 종료 코드 9와 `{"error":{"kind":"blocked",…}}`가 돌아오고 탭 상태는 그대로였습니다. `--if idle`을 붙여도 같았습니다.
+- **같은 파일을 두 프로세스가 동시에 이름 바꾸기 하면 둘 다 성공으로 보고될 수 있음**(Node 26.13.1): 파일 3,000개에 대해 성공 보고가 5,558번 나왔습니다. 받은편지함이 이름 바꾸기 대신 잠금 파일을 쓰는 이유입니다.
+- **이름만으로 프로그램을 실행하면 작업 폴더의 것이 먼저 실행됨**: 작업 폴더에 `hc.exe`를 두고 실험해 확인했고, 작업 폴더를 다른 폴더로 지정하면 PATH의 것이 실행되는 것도 확인했습니다.
+
+### 확인하지 못한 것
+
+항목마다 무엇을 확인하지 못했는지, 왜 못 했는지, 지금 무엇을 근거로 삼고 있는지, 어떻게 확인하면 되는지, 가정이 틀렸을 때 어떤 증상이 나오는지를 적었습니다.
+
+#### `hc`의 `error`·`done` 상태와 몇 가지 오류 출력의 실물
+
+| | |
+| :--- | :--- |
+| **무엇을** | `error`나 `done` 상태인 실제 탭, 그리고 `hc send`가 `status_mismatch`, `finished`, `not_found`로 거부할 때의 실제 출력 |
+| **왜 못 했나** | 개발 PC의 탭에서 이 상태들을 만들지 못했습니다. 탭에서 명령이 실패한 것은 에이전트의 `error` 상태와 다른 것으로 보였습니다. |
+| **지금의 근거** | `hc schema`에 적힌 정의 |
+| **확인 방법** | 그런 상태의 탭이 생겼을 때 `hc get <탭>`의 출력과 `relay_tabs`의 `activity`를 비교합니다. |
+| **틀렸을 때 증상** | 그 상태의 탭이 `activity: "unknown"`으로 나와 `auto`로는 깨워지지 않거나(`target_status_unknown`), 거부 이유가 `hc_send_failed`로 뭉뚱그려져 나옵니다. 메시지는 받은편지함에 저장되어 있으므로 잃지 않습니다. |
+
+`relay_send`가 쉬고 있는 실제 탭을 `hc send`로 깨우는 것도 가짜 `hc`로만 실행했습니다. 이 항목은 탭 복구의 실제 실행과 함께 [`scripts/README.md`의 "확인 상태"](../../scripts/README.md#확인-상태)에 적었습니다.
 
 ---
 

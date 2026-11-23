@@ -71,6 +71,17 @@
 | | `model` | 모델 이름 |
 | | `dimensions`, `dtype` | 기본값 객체에는 없지만 코드가 읽는 키입니다. `dtype`의 기본값은 `"q8"`입니다. |
 
+예를 들어 이 PC의 Ollama로 `bge-m3` 모델을 쓰려면 전역 `config.json`에 다음과 같이 적습니다.
+
+```json
+{
+  "embedding": {
+    "provider": "ollama",
+    "ollama": { "baseUrl": "http://127.0.0.1:11434", "model": "bge-m3" }
+  }
+}
+```
+
 ### `provider` 값의 해석
 
 - 값이 없거나, 빈 문자열이거나, `none` / `off` / `disabled`(대소문자 무시)이면 임베딩을 하지 않습니다.
@@ -131,7 +142,7 @@
 
 **호출별 제한**(`resolveCallLimits`): `embed`를 부르는 쪽이 `timeoutMs`(0보다 큰 수)와 `maxRetries`(0 이상의 정수)를 넘기면 그 호출에만 적용됩니다. 검색은 `{ taskType: 'query', timeoutMs: <queryTimeoutMs>, maxRetries: 0 }`으로 부릅니다.
 
-**ONNX**: `createOnnxProvider`는 `@huggingface/transformers`를 동적으로 불러오며, 설치되어 있지 않으면 `null`을 돌려줍니다. 이 패키지는 `package.json`의 의존성에 들어 있지 않으므로 ONNX를 쓰려면 따로 설치해야 합니다. 모델은 프로바이더를 만들 때가 아니라 `embed`가 처음 불릴 때 읽으며, 읽기에 실패하면 서비스 쪽 실패로 표시하고 다음 호출에서 다시 읽습니다. `timeoutMs`와 `maxRetries`를 쓰지 않으므로 검색어 임베딩의 시간 제한은 검색 쪽의 타이머가 맡습니다. 제약이 두 가지 있습니다. 첫째, 상태 함수는 패키지 설치 여부를 확인하지 않으므로 패키지가 없어도 `onnx`가 선택된 것으로 표시되며, 실제로는 아무것도 임베딩되지 않습니다(`npm run embed`의 요약은 `provider: null`, `reason: "no_provider"`이고 종료 코드는 0). 둘째, 라이브러리가 모델을 처음 쓸 때 내려받는지는 이 저장소에서 확인하지 않았습니다.
+**ONNX**: `createOnnxProvider`는 `@huggingface/transformers`를 동적으로 불러오며, 설치되어 있지 않으면 `null`을 돌려줍니다. 이 패키지는 `package.json`의 의존성에 들어 있지 않으므로 ONNX를 쓰려면 저장소 루트에서 `npm install @huggingface/transformers`로 따로 설치해야 합니다. 모델은 프로바이더를 만들 때가 아니라 `embed`가 처음 불릴 때 읽으며, 읽기에 실패하면 서비스 쪽 실패로 표시하고 다음 호출에서 다시 읽습니다. `timeoutMs`와 `maxRetries`를 쓰지 않으므로 검색어 임베딩의 시간 제한은 검색 쪽의 타이머가 맡습니다. 제약이 두 가지 있습니다. 첫째, 상태 함수는 패키지 설치 여부를 확인하지 않으므로 패키지가 없어도 `onnx`가 선택된 것으로 표시되며, 실제로는 아무것도 임베딩되지 않습니다(`npm run embed`의 요약은 `provider: null`, `reason: "no_provider"`이고 종료 코드는 0). 둘째, 라이브러리가 모델을 처음 쓸 때 내려받는지는 이 저장소에서 확인하지 않았습니다.
 
 ### `auto`가 고르는 순서
 
@@ -315,7 +326,12 @@ MCP 서버(`src/mcp/server.mjs`의 `createServerRuntime`)는 대기열을 하나
 
 ## CLI: `npm run embed`
 
-`npm run embed`는 `node --no-warnings src/embeddings/cli.mjs`를 실행합니다. MCP 서버가 떠 있지 않아도 대기 중인 문서를 한꺼번에 처리할 때, 프로바이더를 처음 켠 뒤 기존 문서를 임베딩할 때, 포기한 문서를 되살릴 때 씁니다.
+`npm run embed`는 `node --no-warnings src/embeddings/cli.mjs`를 실행합니다. MCP 서버가 떠 있지 않아도 대기 중인 문서를 한꺼번에 처리할 때, 프로바이더를 처음 켠 뒤 기존 문서를 임베딩할 때, 포기한 문서를 되살릴 때 씁니다. 남은 문서가 없을 때까지 반복합니다.
+
+```powershell
+npm run embed -- [--project <폴더>] [--global <폴더>] [--scope all|project|global]
+                 [--provider <이름>] [--model <이름>] [--max-docs <개수>] [--retry-failed]
+```
 
 ```powershell
 npm run embed
@@ -415,6 +431,40 @@ npm run embed -- --project <프로젝트 폴더> --global <전역 저장소 폴�
 **종료 코드**: 문서 처리가 한 번이라도 실패했거나(`errors > 0`), 요약에 `error`가 있거나(쓸 수 없는 스위치 값, 알 수 없는 프로바이더 이름, 키 없는 프로바이더, 프로바이더 없이 준 `--model`), 예외가 나면(`embed cli error: ...`가 표준 오류에 출력됨) 1입니다. 그 밖에는 0입니다. 프로바이더가 `none`이어서 할 일이 없는 경우, `auto`가 아무것도 고르지 못한 경우, 프로젝트를 건너뛴 경우도 0입니다.
 
 `--model`을 프로바이더 없이 주었을 때의 문구는 `--model was given but no embedding provider is in effect; add --provider <gemini|openai|ollama|onnx> or set embedding.provider in config.json.`이고 요약의 `reason`은 `invalid_arguments`입니다.
+
+---
+
+## 한계
+
+- 켜면 문서 내용과 검색어가 선택한 서비스로 전송됩니다(`onnx`와 이 PC의 `ollama`는 PC 밖으로 나가지 않음). 무엇이 나가는지는 위 [무엇이 어디로 나가는가](#무엇이-어디로-나가는가)에 있습니다.
+- 차단기는 프로세스마다 하나여서, 계층별로 다른 프로바이더를 쓰면 한쪽 장애가 다른 쪽도 쉬게 합니다(위 [차단기](#차단기)).
+- 대기 중인 문서가 하나뿐이고 장애가 약 45분에서 52분(실패 10번, 실패 사이마다 5분씩 쉼) 넘게 이어지면 그 문서는 포기되며, 회복한 뒤 `npm run embed -- --retry-failed`로 되살려야 합니다. 장애 중에 MCP 서버를 다시 시작하거나 `npm run embed`를 실행하면 그때마다 시도가 한 번 더해져 더 빨리 포기됩니다(위 [실패를 세는 규칙](#실패를-세는-규칙)).
+- 인증 실패(잘못된 API 키)는 차단기를 열지 않으므로 키를 고칠 때까지 검색마다 요청이 한 번씩 나가고 결과에 `embedding_error`가 붙습니다.
+- `onnx`에 필요한 `@huggingface/transformers` 패키지가 없으면 오류 없이 아무것도 임베딩되지 않습니다. 상태 표시는 `onnx`로 나옵니다.
+- 색인을 지우면 벡터는 파일에서 다시 만들어지지 않고 임베딩을 다시 해야 합니다.
+- `cortex-status`, 설치기, `npm run embed`의 상태 줄에는 실행 중인 MCP 서버의 차단기가 쉬고 있다는 사실이 나오지 않습니다(위 [상태 표시](#상태-표시-지금-어디로-보내는가)).
+
+임베딩의 기본값은 다른 사람이 만든 저장소나 사용자가 고르지 않은 설정 때문에 문서가 밖으로 나가는 일을 막는 장치이기도 합니다. 이 장치가 하는 일과 하지 못하는 일은 다음과 같습니다. 같은 목적의 다른 장치는 [`src/core/README.md`](../core/README.md#한계)와 [`src/relay/README.md`](../relay/README.md#한계)에 있습니다.
+
+| 장치 | 하는 일 | 하지 못하는 일 |
+| :--- | :--- | :--- |
+| **임베딩 기본값 꺼짐** | 사용자가 고르기 전에는 아무것도 전송하지 않습니다. 문서를 어디로 보낼지는 프로젝트의 `.memory/config.json`으로 정할 수 없고 사용자의 전역 설정으로만 정합니다. | 켠 뒤에는 문서 내용이 그 서비스로 전송됩니다. |
+
+---
+
+## 확인 상태
+
+자동 테스트는 외부로 요청을 보내지 않고 가짜 임베딩 서버와 가짜 프로바이더를 씁니다([`test/README.md`](../../test/README.md#실물과-대역)). 개발에 쓴 PC(Windows 11, Node 26.13.1)에서도 임베딩은 꺼 둔 채로 설치해 보았으므로, 이 폴더에서 실제 환경으로 확인하지 못한 것이 하나 있습니다. 무엇을 확인하지 못했는지, 왜 못 했는지, 지금 무엇을 근거로 삼고 있는지, 어떻게 확인하면 되는지, 가정이 틀렸을 때 어떤 증상이 나오는지를 적었습니다. 다른 모듈의 항목까지 모은 목록은 [루트 README](../../README.md#확인-상태와-알려진-한계)에 있습니다.
+
+### 임베딩 프로바이더 네 가지의 실제 호출
+
+| | |
+| :--- | :--- |
+| **무엇을** | Gemini, OpenAI, Ollama의 실제 서버에 요청했을 때의 응답, ONNX 모델의 실제 실행. ONNX는 처음 쓸 때 모델 파일을 인터넷에서 내려받을 수 있는데 이것도 확인하지 못했습니다. |
+| **왜 못 했나** | 개발 과정에서 외부로 요청을 보내지 않았습니다. |
+| **지금의 근거** | 가짜 서버로 요청의 모양(주소, 머리말, 본문)과 응답 처리를 확인하는 자동 테스트 |
+| **확인 방법** | 프로바이더를 켠 뒤 `npm run embed`를 실행해 요약의 처리 개수와 오류를 보고, `cortex-status`의 `Index` 줄에서 `embedded` 수가 늘었는지 확인합니다. |
+| **틀렸을 때 증상** | 임베딩이 실패해 문서가 `error`나 `pending`으로 남고, 검색은 `vectorSkipped`를 붙여 키워드만으로 답합니다. 기억의 저장과 키워드 검색에는 영향이 없습니다. ONNX가 모델을 내려받는다면 "PC 밖으로 나가는 것이 없다"는 설명은 첫 실행에는 맞지 않습니다(문서 내용이 나가는 것은 아니고 모델 파일을 받아 오는 것입니다). |
 
 ---
 
