@@ -10,7 +10,8 @@
   "scripts": {
     "test": "node --no-warnings --test test/*.test.mjs",
     "mcp": "node --no-warnings src/mcp/server.mjs",
-    "embed": "node --no-warnings src/embeddings/cli.mjs"
+    "embed": "node --no-warnings src/embeddings/cli.mjs",
+    "trust": "node --no-warnings src/core/trust-cli.mjs"
   },
   "dependencies": {
     "sqlite-vec": "^0.1.6"

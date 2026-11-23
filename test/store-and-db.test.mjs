@@ -26,6 +26,8 @@ import { CortexStore } from '../src/core/store.mjs';
 import { searchMemory } from '../src/core/search.mjs';
 import { fitOverviewToBudget } from '../src/core/budget.mjs';
 import { processPendingEmbeddings } from '../src/embeddings/index.mjs';
+import { approveProject } from '../src/core/trust.mjs';
+import { UNTRUSTED_MEMORY_PREAMBLE } from '../src/core/budget.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-test-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -33,6 +35,8 @@ function makeTempEnv(prefix = 'herdr-cortex-test-') {
   const globalDir = path.join(root, 'global');
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
+  // The project folder of every test environment is approved, as a user would do with cortex-trust.
+  approveProject(projectDir, { globalDir });
   return {
     root,
     projectDir,
@@ -410,8 +414,11 @@ test('FIT_STEPS budget fitting compresses progressively without mid-sentence tru
   assert.match(tight.text, /todo-0/);
   assert.match(tight.text, /dec-0/);
   assert.match(tight.text, /pref-0/);
-  // Every non-empty line is a complete markdown heading or bullet (no broken half-line)
-  for (const line of tight.text.split('\n').filter(Boolean)) {
+  // Every non-empty line is a complete markdown heading or bullet (no broken half-line); the one other
+  // line is the fixed preamble right under the title
+  const tightLines = tight.text.split('\n').filter(Boolean);
+  assert.equal(tightLines[1], UNTRUSTED_MEMORY_PREAMBLE);
+  for (const line of tightLines.filter((_, index) => index !== 1)) {
     assert.ok(line.startsWith('#') || line.startsWith('- '), `Unexpected broken line: ${line}`);
   }
 });
@@ -539,6 +546,8 @@ test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/ex
 
     const secretProj = path.join(env.root, 'secret-repo');
     fs.mkdirSync(secretProj, { recursive: true });
+    // Even for a folder the user approved, the project file can only set the whitelisted keys
+    approveProject(secretProj, { globalDir: env.globalDir });
 
     // Global config excludes secret-repo and uses a safe baseUrl/apiKeyEnv for its provider
     atomicWriteText(
@@ -604,6 +613,7 @@ test('P0-2 security: project .memory/config.json whitelist blocks SSRF/secret/ex
     // Project `enabled: false` IS honored to disable an otherwise allowed project
     const optOutProj = path.join(env.root, 'opt-out-repo');
     fs.mkdirSync(optOutProj, { recursive: true });
+    approveProject(optOutProj, { globalDir: env.globalDir });
     atomicWriteText(path.join(env.globalDir, 'config.json'), JSON.stringify({ mode: 'all', excludedProjects: [] }));
     atomicWriteText(path.join(optOutProj, '.memory', 'config.json'), JSON.stringify({ enabled: false }));
     const optOutCfg = loadConfig({ projectDir: optOutProj, globalDir: env.globalDir });
@@ -942,9 +952,11 @@ test('P1-10 + P1-11 + P2-1 + P2-2: in-project abs path normalization, supersedes
       globalPreferences: [],
       recentWork: [],
     };
-    const fittedLineBudget = fitOverviewToBudget(longFirstOverview, 120);
+    // (the budget leaves room for the fixed preamble line, which is never dropped)
+    const lineBudget = 120 + UNTRUSTED_MEMORY_PREAMBLE.length + 1;
+    const fittedLineBudget = fitOverviewToBudget(longFirstOverview, lineBudget);
     assert.equal(fittedLineBudget.step, 'line-budgeted');
-    assert.ok(fittedLineBudget.charCount <= 120);
+    assert.ok(fittedLineBudget.charCount <= lineBudget);
     assert.match(fittedLineBudget.text, /t-short/);
 
     // (c) budget: 0 is respected (not coerced to 9000)

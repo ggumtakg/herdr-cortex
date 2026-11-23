@@ -3,6 +3,7 @@ import path from 'node:path';
 import {
   assertInsideDir,
   atomicWriteText,
+  ensureMemoryGitignore,
   ensureTierDirs,
   formatIsoTimestamp,
   generateDocId,
@@ -10,10 +11,12 @@ import {
   getProjectMemoryDir,
   getTierPaths,
   isProjectEnabled as checkProjectEnabled,
+  isProjectTrusted as checkProjectTrusted,
   loadConfig,
   sanitizeRelFilePath,
   validateDocId,
 } from './config.mjs';
+import { ProjectNotApprovedError } from './trust.mjs';
 import { decodeDocBytes } from './encoding.mjs';
 import {
   UnsafeUpdateError,
@@ -25,7 +28,7 @@ import {
 import { indexSingleFile, openTierDb, readDocFile, syncFromDisk, withTransaction } from './db.mjs';
 import { exploreGraph, getNeighbors, normalizeGraphTarget } from './graph.mjs';
 
-export { UnsafeUpdateError };
+export { ProjectNotApprovedError, UnsafeUpdateError };
 
 export const VALID_TYPES = new Set(['decision', 'worklog', 'knowledge', 'todo', 'baseline']);
 export const VALID_STATUSES = new Set(['active', 'done', 'superseded', 'archived']);
@@ -147,6 +150,14 @@ export class CortexStore {
     return checkProjectEnabled(this.projectRoot, this.config);
   }
 
+  /**
+   * True when the user approved this project folder. Read from the approval list on every call, so an
+   * approval or a revocation made while this process runs takes effect on the next operation.
+   */
+  isProjectTrusted() {
+    return checkProjectTrusted(this.projectRoot, { globalDir: this.globalDir });
+  }
+
   getTierDir(scope = 'project') {
     if (scope === 'global') return this.globalDir;
     if (scope === 'project') return this.projectDir;
@@ -160,6 +171,12 @@ export class CortexStore {
     if (scope === 'project' && !this.isProjectEnabled()) {
       if (!create) return null;
       throw new Error(`Project memory is disabled for "${this.projectRoot}" by cortex config`);
+    }
+    // The project tier of a folder the user has not approved is never opened, read or created. This is the
+    // single choke point every reader and writer goes through (tools, hooks, search, embedding queue).
+    if (scope === 'project' && !this.isProjectTrusted()) {
+      if (!create) return null;
+      throw new ProjectNotApprovedError(this.projectRoot);
     }
     if (this._tiers.has(scope)) {
       return this._tiers.get(scope);
@@ -204,6 +221,11 @@ export class CortexStore {
       results[s] = syncFromDisk(tier.db, tier.dir);
     }
     return results;
+  }
+
+  // A write into the project tier keeps `.memory/` out of git unless the folder already has its own .gitignore.
+  _prepareTierForWrite(tier) {
+    if (tier.scope === 'project') ensureMemoryGitignore(tier.dir);
   }
 
   close() {
@@ -257,6 +279,7 @@ export class CortexStore {
     const id = params.id ? validateDocId(String(params.id).trim()) : generateDocId(type, title, now);
 
     const tier = this.getTier(scope, { create: true });
+    this._prepareTierForWrite(tier);
     syncFromDisk(tier.db, tier.dir);
 
     const existing = tier.db.prepare('SELECT id, path FROM docs WHERE id = ?').get(id);
@@ -466,6 +489,7 @@ export class CortexStore {
 
     const absPath = resolveDocAbsPath(foundTier.dir, foundRow.path);
     const nowIso = formatIsoTimestamp(nextTimestampDate());
+    this._prepareTierForWrite(foundTier);
 
     const applyUpdate = (parsed) => {
       const fm = { ...parsed.frontmatter, id: parsed.frontmatter.id || id };

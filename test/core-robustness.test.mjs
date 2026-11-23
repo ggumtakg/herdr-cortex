@@ -30,6 +30,7 @@ import { searchMemory } from '../src/core/search.mjs';
 import { createMcpServer } from '../src/mcp/server.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
 import { createRelayTools } from '../src/relay/tools.mjs';
+import { approveProject } from '../src/core/trust.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-robust-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -38,6 +39,8 @@ function makeTempEnv(prefix = 'herdr-cortex-robust-') {
   const homeDir = path.join(root, 'home');
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
+  // The project folder of every test environment is approved, as a user would do with cortex-trust.
+  approveProject(projectDir, { globalDir });
   fs.mkdirSync(homeDir, { recursive: true });
   return {
     root,

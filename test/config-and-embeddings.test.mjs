@@ -39,6 +39,7 @@ import { runEmbedCli } from '../src/embeddings/cli.mjs';
 import { installCortex } from '../src/hooks/installer.mjs';
 import { SERVER_INSTRUCTIONS, createMcpServer, createServerRuntime } from '../src/mcp/server.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
+import { approveProject } from '../src/core/trust.mjs';
 
 // ---------------------------------------------------------------------------------------------
 // Safety net: nothing in this file may reach a real network host. Requests to the local stub
@@ -72,6 +73,8 @@ function makeTempEnv(prefix = 'herdr-cortex-emb-') {
   const homeDir = path.join(root, 'home');
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
+  // The project folder of every test environment is approved, as a user would do with cortex-trust.
+  approveProject(projectDir, { globalDir });
   fs.mkdirSync(homeDir, { recursive: true });
   return {
     root,
@@ -626,6 +629,8 @@ test('per-project embedding settings come from the global projects map (exact re
     assert.deepEqual(sanitizeProjectConfig({ enabled: true, embedding: { provider: 'gemini' } }), {});
 
     writeConfig({ [projA]: projAEntry });
+    // A project's own file is only read once the user approved the folder
+    approveProject(projA, { globalDir: env.globalDir });
     writeProjectConfig(projA, {
       headCoreEnabled: false,
       hookBudget: 7000,
@@ -1678,6 +1683,7 @@ test('memory_save / memory_update with project_dir: the other project (or the gl
   const env = makeTempEnv('cortex-emb-projectdir-');
   const otherProject = path.join(env.root, 'other-project');
   fs.mkdirSync(otherProject, { recursive: true });
+  approveProject(otherProject, { globalDir: env.globalDir });
   const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir });
   const provider = makeProvider();
   let opened = 0;
@@ -1776,6 +1782,7 @@ test('memory_save with project_dir through the server runtime: embedded with a s
   const env = makeTempEnv('cortex-emb-runtime-dir-');
   const otherProject = path.join(env.root, 'other-project');
   fs.mkdirSync(otherProject, { recursive: true });
+  approveProject(otherProject, { globalDir: env.globalDir });
   const provider = makeProvider();
   const runtime = createServerRuntime({
     projectDir: env.projectDir,

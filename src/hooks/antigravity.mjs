@@ -7,12 +7,15 @@ import {
   atomicWriteJson,
   getProjectMemoryDir,
   getTierPaths,
+  hasProjectMemoryDir,
   isMainModule,
   isProjectEnabled,
+  isProjectTrusted,
   loadConfig,
 } from '../core/config.mjs';
 import { CortexStore } from '../core/store.mjs';
 import { fitOverviewToBudget } from '../core/budget.mjs';
+import { formatProjectNotApprovedNotice } from '../core/trust.mjs';
 import {
   extractCwd,
   extractSessionId,
@@ -82,8 +85,9 @@ function hasAnyOverviewItems(ov) {
   );
 }
 
-function loadOverviewSafely({ projectDir, globalDir, config }) {
-  const projectMemExists = fs.existsSync(getProjectMemoryDir(projectDir));
+// An unapproved project is treated like a folder without `.memory/`: only the global tier is read.
+function loadOverviewSafely({ projectDir, globalDir, config, projectTrusted }) {
+  const projectMemExists = projectTrusted && fs.existsSync(getProjectMemoryDir(projectDir));
   const globalDocsExists = fs.existsSync(path.join(globalDir, 'docs'));
   if (!projectMemExists && !globalDocsExists) {
     return null;
@@ -141,6 +145,11 @@ function loadOverviewSafely({ projectDir, globalDir, config }) {
   } finally {
     store.close();
   }
+}
+
+// Notice injected with the startup context when the folder has a .memory/ directory that was not loaded.
+function resolveNotApprovedNotice(projectDir, projectTrusted) {
+  return !projectTrusted && hasProjectMemoryDir(projectDir) ? formatProjectNotApprovedNotice(projectDir) : '';
 }
 
 /**
@@ -218,16 +227,17 @@ export function detectAntigravityTranscriptRole(transcriptPath) {
 
 /**
  * Resolve per-conversation state file path.
- * Uses <project>/.memory/state/checkpoints/<convId>.json when <project>/.memory exists,
- * otherwise stores under <globalDir>/state/checkpoints/<convId>.json so uninitialized
- * projects NEVER get a .memory/ folder created automatically.
+ * Uses <project>/.memory/state/checkpoints/<convId>.json when <project>/.memory exists and the user
+ * approved the project folder, otherwise stores under <globalDir>/state/checkpoints/<convId>.json so
+ * uninitialized projects NEVER get a .memory/ folder created automatically and nothing is read from or
+ * written into the .memory/ of an unapproved folder.
  */
-function resolveCheckpointFile(projectDir, globalDir, convId) {
+function resolveCheckpointFile(projectDir, globalDir, convId, projectTrusted) {
   const cleanConv = String(convId || '').trim();
   if (!SAFE_CONV_ID_RE.test(cleanConv) || cleanConv.includes('..')) return null;
 
   const projectMemDir = getProjectMemoryDir(projectDir);
-  const tierRoot = fs.existsSync(projectMemDir) ? projectMemDir : globalDir;
+  const tierRoot = projectTrusted && fs.existsSync(projectMemDir) ? projectMemDir : globalDir;
   const { checkpointsDir } = getTierPaths(tierRoot);
   return {
     jsonPath: assertInsideDir(checkpointsDir, `${cleanConv}.json`),
@@ -331,6 +341,10 @@ export function handleAntigravitySessionStart(
     return {};
   }
 
+  // Nothing from the project's .memory/ is read, injected or created until the user approved the folder.
+  const projectTrusted = isProjectTrusted(projectDir, { globalDir: effectiveGlobalDir });
+  const notApprovedNotice = resolveNotApprovedNotice(projectDir, projectTrusted);
+
   const sections = [];
   let used = 0;
 
@@ -345,10 +359,11 @@ export function handleAntigravitySessionStart(
 
   const headCore = readHeadCore(promptsDir, config);
   if (headCore) {
-    pushSection(trimLinesToBudget(headCore, budget - used));
+    pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
   }
+  pushSection(notApprovedNotice);
 
-  const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
+  const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config, projectTrusted });
   if (overview) {
     const remaining = budget - used;
     if (remaining >= 120) {
@@ -360,7 +375,7 @@ export function handleAntigravitySessionStart(
   }
 
   // Budget-first inbox drain + partial ACK
-  if (isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
+  if (projectTrusted && isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
     const remaining = budget - used;
     if (remaining >= 120) {
       try {
@@ -381,7 +396,7 @@ export function handleAntigravitySessionStart(
   }
 
   if (convId && sections.length > 0) {
-    const cpPaths = resolveCheckpointFile(projectDir, effectiveGlobalDir, convId);
+    const cpPaths = resolveCheckpointFile(projectDir, effectiveGlobalDir, convId, projectTrusted);
     if (cpPaths) {
       const existing = readCheckpointState(cpPaths);
       atomicWriteJson(cpPaths.jsonPath, {
@@ -459,7 +474,10 @@ export function handleAntigravityPreInvocation(
     return {};
   }
 
-  const cpPaths = convId ? resolveCheckpointFile(projectDir, effectiveGlobalDir, convId) : null;
+  const projectTrusted = isProjectTrusted(projectDir, { globalDir: effectiveGlobalDir });
+  const notApprovedNotice = resolveNotApprovedNotice(projectDir, projectTrusted);
+
+  const cpPaths = convId ? resolveCheckpointFile(projectDir, effectiveGlobalDir, convId, projectTrusted) : null;
   const cpState = readCheckpointState(cpPaths);
   let stateDirty = false;
 
@@ -487,9 +505,10 @@ export function handleAntigravityPreInvocation(
   if (!cpState.started) {
     const headCore = readHeadCore(promptsDir, config);
     if (headCore) {
-      pushSection(trimLinesToBudget(headCore, budget - used));
+      pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
     }
-    const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
+    pushSection(notApprovedNotice);
+    const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config, projectTrusted });
     if (overview) {
       const remaining = budget - used;
       if (remaining >= 120) {
@@ -542,10 +561,11 @@ export function handleAntigravityPreInvocation(
         if (!injectedStartupThisTurn) {
           const headCore = readHeadCore(promptsDir, config);
           if (headCore) {
-            pushSection(trimLinesToBudget(headCore, budget - used));
+            pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
           }
+          pushSection(notApprovedNotice);
 
-          const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
+          const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config, projectTrusted });
           if (overview) {
             const turnsReserve = state.text ? Math.min(state.text.length, Math.floor((budget - used) * 0.5)) : 0;
             const ovBudget = budget - used - turnsReserve;
@@ -584,7 +604,7 @@ export function handleAntigravityPreInvocation(
   }
 
   // 4. Budget-first relay inbox drain + partial ACK
-  if (isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
+  if (projectTrusted && isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
     const remaining = budget - used;
     if (remaining >= 120) {
       try {

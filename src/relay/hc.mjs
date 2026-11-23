@@ -1,4 +1,7 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { execFileSync as nodeExecFileSync } from 'node:child_process';
+import { projectPathKey } from '../core/config.mjs';
 import { validateTerminalId } from '../revive/tracker.mjs';
 
 const BARE_SHELLS = new Set([
@@ -156,17 +159,130 @@ function classifyExecError(err, hcBin) {
   };
 }
 
+// Extensions `execFile` can start on Windows without a shell (a .cmd/.bat file cannot be started that way).
+const WINDOWS_EXECUTABLE_EXTENSIONS = Object.freeze(['.exe', '.com']);
+
+function readPathVariable(env) {
+  if (!env || typeof env !== 'object') return '';
+  if (typeof env.PATH === 'string') return env.PATH;
+  // `process.env` is case-insensitive on Windows; a plain object (tests, copies) is not.
+  const key = Object.keys(env).find((name) => name.toUpperCase() === 'PATH');
+  return key && typeof env[key] === 'string' ? env[key] : '';
+}
+
+// A PATH entry is used only when it names one fixed directory: on Windows a drive-letter or UNC path
+// ("\dir" and "C:dir" depend on the current drive or directory and are skipped like relative entries).
+function isFullyQualifiedDir(entry, platform) {
+  if (platform === 'win32') {
+    return /^[a-zA-Z]:[\\/]/.test(entry) || /^[\\/]{2}[^\\/]/.test(entry);
+  }
+  return path.isAbsolute(entry);
+}
+
+function isExecutableFile(candidate, platform) {
+  try {
+    if (!fs.statSync(candidate).isFile()) return false;
+    if (platform !== 'win32') fs.accessSync(candidate, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Create a Herdr CLI (`hc`) client wrapper with injectable execFileSync for deterministic tests.
+ * Absolute path of the Herdr CLI found through PATH, or '' when there is none.
+ *
+ * Starting a program by bare name on Windows looks in the current directory before PATH, and the MCP
+ * server's current directory is the project folder, so a repository could ship its own `hc.exe`.
+ * This search therefore uses PATH only: entries that are relative, or that resolve to the current directory,
+ * are skipped, and on Windows only `.exe` / `.com` files are considered.
+ */
+export function resolveHcExecutable({
+  name = 'hc',
+  env = process.env,
+  cwd = process.cwd(),
+  platform = process.platform,
+} = {}) {
+  const cleanName = String(name || '').trim();
+  if (!cleanName || /[\\/]/.test(cleanName)) return '';
+
+  const extension = path.extname(cleanName).toLowerCase();
+  const fileNames = platform !== 'win32' || WINDOWS_EXECUTABLE_EXTENSIONS.includes(extension)
+    ? [cleanName]
+    : WINDOWS_EXECUTABLE_EXTENSIONS.map((ext) => `${cleanName}${ext}`);
+
+  let cwdKey = '';
+  try {
+    cwdKey = cwd ? projectPathKey(cwd) : '';
+  } catch {
+    cwdKey = '';
+  }
+
+  const delimiter = platform === 'win32' ? ';' : ':';
+  for (const rawEntry of readPathVariable(env).split(delimiter)) {
+    const entry = rawEntry.trim().replace(/^"(.*)"$/, '$1').trim();
+    if (!entry || !isFullyQualifiedDir(entry, platform)) continue;
+
+    let entryKey;
+    try {
+      entryKey = projectPathKey(entry);
+    } catch {
+      continue;
+    }
+    if (cwdKey && entryKey === cwdKey) continue;
+
+    for (const fileName of fileNames) {
+      const candidate = path.join(entry, fileName);
+      if (isExecutableFile(candidate, platform)) return candidate;
+    }
+  }
+  return '';
+}
+
+/**
+ * Create a Herdr CLI (`hc`) client wrapper.
+ * `hc` is located once through PATH (`resolveHcExecutable`) and always started by that absolute path, with
+ * the working directory set to the folder containing it (a folder that certainly exists), never by bare name
+ * and never from the caller's current directory. A located path that disappears is looked up again.
+ * An `hcBin` that already is an absolute path is used as is.
+ * `execFileSync`, `resolveHc` and `fileExists` are injectable for deterministic tests.
  */
 export function createHcClient({
   execFileSync = nodeExecFileSync,
   hcBin = 'hc',
   timeoutMs = 5000,
+  resolveHc = resolveHcExecutable,
+  fileExists = (filePath) => fs.existsSync(filePath),
 } = {}) {
-  function runHc(args) {
+  const explicitPath = typeof hcBin === 'string' && path.isAbsolute(hcBin) ? hcBin : '';
+  let locatedPath = '';
+
+  function locateHc() {
+    if (explicitPath) return explicitPath;
+    if (locatedPath && fileExists(locatedPath)) return locatedPath;
+    let found = '';
     try {
-      const stdout = execFileSync(hcBin, args, {
+      found = resolveHc({ name: hcBin });
+    } catch {
+      found = '';
+    }
+    // Only an absolute path is ever executed; anything else counts as "not found".
+    locatedPath = typeof found === 'string' && path.isAbsolute(found) ? found : '';
+    return locatedPath;
+  }
+
+  function runHc(args) {
+    const hcPath = locateHc();
+    if (!hcPath) {
+      return {
+        ok: false,
+        code: 'HC_NOT_FOUND',
+        error: `Herdr CLI "${hcBin}" was not found on PATH.`,
+      };
+    }
+    try {
+      const stdout = execFileSync(hcPath, args, {
+        cwd: path.dirname(hcPath),
         encoding: 'utf8',
         timeout: timeoutMs,
         windowsHide: true,
@@ -174,6 +290,7 @@ export function createHcClient({
       });
       return { ok: true, stdout: typeof stdout === 'string' ? stdout : String(stdout ?? '') };
     } catch (err) {
+      if (err && err.code === 'ENOENT') locatedPath = '';
       return classifyExecError(err, hcBin);
     }
   }

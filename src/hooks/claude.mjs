@@ -5,13 +5,24 @@ import {
   REPO_ROOT,
   assertInsideDir,
   getProjectMemoryDir,
+  hasProjectMemoryDir,
   isMainModule,
   isProjectEnabled,
+  isProjectTrusted,
   isValidId,
   loadConfig,
+  projectPathKey,
+  resolveProjectRoot,
 } from '../core/config.mjs';
 import { CortexStore } from '../core/store.mjs';
-import { fitOverviewToBudget } from '../core/budget.mjs';
+import { fitOverviewToBudget, sanitizeInline } from '../core/budget.mjs';
+import { formatProjectNotApprovedNotice } from '../core/trust.mjs';
+import {
+  FILE_WRITE_TOOL_NAMES,
+  SHELL_TOOL_NAMES,
+  cortexToolBaseName,
+  isCortexToolName,
+} from './tool-names.mjs';
 import {
   extractCwd,
   isSubagentPayload,
@@ -27,18 +38,12 @@ export const CLAUDE_HOOK_MAX_CHARS = 9000;
 export const COMPACT_POINTER_INSTRUCTION =
   '[herdr-cortex] Compaction pointer: do not write a long lossy summary; active decisions, todos, and the last 5 verbatim turns will be restored automatically on SessionStart via cortex memory.';
 
-const CORTEX_DIRECT_TOOLS = new Set([
-  'memory_search',
-  'memory_read',
-  'memory_save',
-  'memory_update',
-  'memory_graph',
-  'memory_overview',
-  'relay_tabs',
-  'relay_send',
-  'relay_inbox',
-  'cortex_prompt',
-]);
+export const SUBAGENT_CORTEX_WRITE_DENY_REASON =
+  'Canonical memory and relay write operations are restricted to the main HEAD conversation; subagents have read-only access.';
+
+export const SUBAGENT_MEMORY_DIR_DENY_REASON =
+  '[herdr-cortex] Subagents must not read or change files under a .memory/ folder directly. '
+  + 'Hand your results back to the main conversation; it records memory through the memory tools.';
 
 const WRITE_PROTECTED_CORTEX_TOOLS = new Set([
   'memory_save',
@@ -46,13 +51,17 @@ const WRITE_PROTECTED_CORTEX_TOOLS = new Set([
   'relay_send',
 ]);
 
-function extractBaseCortexToolName(toolName) {
-  if (typeof toolName !== 'string') return '';
-  return toolName.trim().replace(/^(?:mcp__)?cortex__/i, '').toLowerCase();
-}
+// Tools that write documents into a project tier and accept `project_dir`.
+const PROJECT_WRITE_CORTEX_TOOLS = new Set([
+  'memory_save',
+  'memory_update',
+]);
+
+const FILE_WRITE_TOOLS = new Set(FILE_WRITE_TOOL_NAMES);
+const SHELL_TOOLS = new Set(SHELL_TOOL_NAMES);
 
 function isWriteProtectedCortexCall(toolName, rawInput = {}) {
-  const base = extractBaseCortexToolName(toolName);
+  const base = cortexToolBaseName(toolName);
   if (WRITE_PROTECTED_CORTEX_TOOLS.has(base)) return true;
   if (base === 'relay_inbox') {
     const action = String(rawInput?.action || 'peek').trim().toLowerCase();
@@ -61,13 +70,44 @@ function isWriteProtectedCortexCall(toolName, rawInput = {}) {
   return false;
 }
 
-export function isCortexToolName(toolName) {
-  if (typeof toolName !== 'string') return false;
-  const trimmed = toolName.trim();
-  if (!trimmed) return false;
-  if (CORTEX_DIRECT_TOOLS.has(trimmed)) return true;
-  if (/^(mcp__)?cortex__/i.test(trimmed)) return true;
-  return false;
+export { isCortexToolName };
+
+// Windows ignores trailing dots and spaces in a file name, so ".memory." and ".memory " name the same folder.
+function isMemoryDirSegment(segment) {
+  return segment.replace(/[. ]+$/, '').toLowerCase() === '.memory';
+}
+
+function hasMemoryDirSegment(filePath) {
+  return String(filePath).split(/[\\/]+/).some((segment) => isMemoryDirSegment(segment));
+}
+
+/**
+ * True when `targetPath` (relative paths are resolved against `cwd`) lies in or under a folder named
+ * `.memory` (case-insensitive), in any project. Checked on the path as written and on its real path,
+ * so a junction or symlink pointing into `.memory/` counts as well.
+ */
+export function isPathInsideMemoryDir(targetPath, cwd = process.cwd()) {
+  if (typeof targetPath !== 'string' || !targetPath.trim()) return false;
+  const resolved = path.resolve(cwd || process.cwd(), targetPath.trim());
+  if (hasMemoryDirSegment(resolved)) return true;
+  try {
+    return hasMemoryDirSegment(projectPathKey(resolved));
+  } catch {
+    return false;
+  }
+}
+
+// `.memory` as a whole path segment: preceded by the start of the string, whitespace, a quote, a path
+// separator or shell punctuation, and followed by the end of the string or one of the same (trailing dots
+// are tolerated, see isMemoryDirSegment). "my.memory.txt" and "notes.memory.md" do not match.
+const SHELL_MEMORY_DIR_RE = /(?:^|[\s"'`\\/=:;|&<>(){}[\],])\.memory\.*(?=$|[\s"'`\\/:;|&<>(){}[\],*])/i;
+
+/**
+ * Heuristic: does a shell command line mention a `.memory` folder? It is a string match, so it cannot tell
+ * reading from writing and can be defeated by building the name at run time.
+ */
+export function commandReferencesMemoryDir(command) {
+  return typeof command === 'string' && SHELL_MEMORY_DIR_RE.test(command);
 }
 
 function readHeadCore(promptsDir, config) {
@@ -93,8 +133,9 @@ function hasAnyOverviewItems(ov) {
   );
 }
 
-function loadOverviewSafely({ projectDir, globalDir, config }) {
-  const projectMemExists = fs.existsSync(getProjectMemoryDir(projectDir));
+// An unapproved project is treated like a folder without `.memory/`: only the global tier is read.
+function loadOverviewSafely({ projectDir, globalDir, config, projectTrusted }) {
+  const projectMemExists = projectTrusted && fs.existsSync(getProjectMemoryDir(projectDir));
   const globalDocsExists = fs.existsSync(path.join(globalDir, 'docs'));
   if (!projectMemExists && !globalDocsExists) {
     return null;
@@ -209,6 +250,13 @@ export function handleClaudeSessionStart(
     return {};
   }
 
+  // Nothing from the project's .memory/ is read, injected or created until the user approved the folder.
+  // If such a folder is there, one short notice says so; global memory and HEAD_CORE are unaffected.
+  const projectTrusted = isProjectTrusted(projectDir, { globalDir: effectiveGlobalDir });
+  const notApprovedNotice = !projectTrusted && part !== 'core' && hasProjectMemoryDir(projectDir)
+    ? formatProjectNotApprovedNotice(projectDir)
+    : '';
+
   const sections = [];
   let used = 0;
 
@@ -224,7 +272,8 @@ export function handleClaudeSessionStart(
   if ((part === 'all' || part === 'core') && !skipDuplicateHeadCore) {
     const headCore = readHeadCore(promptsDir, config);
     if (headCore) {
-      pushSection(trimLinesToBudget(headCore, maxChars));
+      const noticeReserve = notApprovedNotice ? notApprovedNotice.length + 2 : 0;
+      pushSection(trimLinesToBudget(headCore, maxChars - noticeReserve));
     }
     if (part === 'core') {
       if (sections.length === 0) return {};
@@ -239,13 +288,17 @@ export function handleClaudeSessionStart(
     return {};
   }
 
+  if (notApprovedNotice) {
+    pushSection(notApprovedNotice);
+  }
+
   const wantsRecentTurns = (source === 'compact' || source === 'clear') && Boolean(payload.transcript_path || payload.transcriptPath);
-  const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config });
+  const overview = loadOverviewSafely({ projectDir, globalDir: effectiveGlobalDir, config, projectTrusted });
 
   const sepCost = (n) => (sections.length + n > 0 ? 2 : 0);
 
   // 2. Budget-first relay inbox drain + partial ACK (only ack fully delivered non-truncated messages)
-  if (isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
+  if (projectTrusted && isValidTerminalId(terminalId) && fs.existsSync(getProjectMemoryDir(projectDir))) {
     const remaining = maxChars - used - sepCost(0);
     if (remaining >= 120) {
       try {
@@ -432,8 +485,13 @@ export function handleClaudeUserPrompt(
     return {};
   }
 
-  const config = loadConfig({ projectDir, globalDir: resolveCortexGlobalDir(globalDir) });
+  const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+  const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   if (!isProjectEnabled(projectDir, config)) {
+    return {};
+  }
+  // The inbox is part of the project's .memory/: an unapproved folder's inbox is neither read nor changed.
+  if (!isProjectTrusted(projectDir, { globalDir: effectiveGlobalDir })) {
     return {};
   }
   const maxChars = Math.max(256, Math.min(Number(config.hookBudget) || CLAUDE_HOOK_MAX_CHARS, CLAUDE_HOOK_MAX_CHARS));
@@ -455,47 +513,100 @@ export function handleClaudeUserPrompt(
   };
 }
 
+function preToolUseDecision(permissionDecision, permissionDecisionReason, extra = {}) {
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision,
+      permissionDecisionReason,
+      ...extra,
+    },
+  };
+}
+
+// Does a file or shell tool call made by a subagent reach into a `.memory/` folder?
+function subagentTouchesMemoryDir(toolName, rawInput, cwd) {
+  const name = typeof toolName === 'string' ? toolName.trim() : '';
+  if (FILE_WRITE_TOOLS.has(name)) {
+    return [rawInput.file_path, rawInput.notebook_path].some((target) => isPathInsideMemoryDir(target, cwd));
+  }
+  if (SHELL_TOOLS.has(name)) {
+    return commandReferencesMemoryDir(rawInput.command);
+  }
+  return false;
+}
+
 /**
- * Claude Code PreToolUse handler:
+ * Folder a `memory_save` / `memory_update` call would write to when its `project_dir` names a different
+ * project than the one this session runs in (compared by real path), or '' when it stays in this project.
+ */
+function otherProjectWriteTarget(toolName, rawInput, cwd) {
+  if (!PROJECT_WRITE_CORTEX_TOOLS.has(cortexToolBaseName(toolName))) return '';
+  const requested = typeof rawInput.project_dir === 'string' ? rawInput.project_dir.trim() : '';
+  if (!requested) return '';
+  const currentRoot = resolveProjectRoot(path.resolve(cwd || process.cwd()));
+  const targetRoot = resolveProjectRoot(path.resolve(currentRoot, requested));
+  return projectPathKey(targetRoot) === projectPathKey(currentRoot) ? '' : targetRoot;
+}
+
+export function formatOtherProjectWriteReason(targetDir) {
+  return `[herdr-cortex] This call writes memory into a different project folder: "${sanitizeInline(targetDir)}". `
+    + 'Allow it only if you want that project\'s memory changed from this session.';
+}
+
+/**
+ * Claude Code PreToolUse handler. In order:
+ * - A subagent's Write / Edit / MultiEdit / NotebookEdit into a `.memory/` folder, or Bash / PowerShell
+ *   command that mentions one, is denied (subagents hand results back to the main conversation).
  * - For subagents calling write-protected cortex tools (memory_save, memory_update,
  *   relay_send, relay_inbox(action="ack")), directly return permissionDecision: 'deny'.
+ * - A memory_save / memory_update whose `project_dir` is another project returns permissionDecision: 'ask',
+ *   so the user confirms a write that leaves the current project.
  * - For subagents calling read-only cortex tools, inject real host agent_id via updatedInput
  *   and NEVER return permissionDecision: 'allow'.
  * - For HEAD, strip any LLM-spoofed `_caller_agent_id`.
+ * Any other tool call returns {} right away (the hook prints nothing).
  */
 export function handleClaudePreToolUse(payload = {}) {
   const toolName = payload.tool_name || payload.toolName || '';
-  if (!isCortexToolName(toolName)) {
-    return {};
-  }
-
   const rawInput = payload.tool_input && typeof payload.tool_input === 'object' && !Array.isArray(payload.tool_input)
     ? payload.tool_input
     : {};
 
-  const hadSpoofedKey = Object.prototype.hasOwnProperty.call(rawInput, '_caller_agent_id');
   const hostAgentId = String(payload.agent_id || payload.agentId || '').trim();
   const callerIsSubagent = Boolean(hostAgentId) || isSubagentPayload(payload);
 
-  if (callerIsSubagent && isWriteProtectedCortexCall(toolName, rawInput)) {
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: 'Canonical memory and relay write operations are restricted to the main HEAD conversation; subagents have read-only access.',
-      },
-    };
+  if (!isCortexToolName(toolName)) {
+    if (callerIsSubagent && subagentTouchesMemoryDir(toolName, rawInput, extractCwd(payload, process.cwd()))) {
+      return preToolUseDecision('deny', SUBAGENT_MEMORY_DIR_DENY_REASON);
+    }
+    return {};
   }
 
-  if (!hadSpoofedKey && !hostAgentId) {
-    return {};
+  const hadSpoofedKey = Object.prototype.hasOwnProperty.call(rawInput, '_caller_agent_id');
+
+  if (callerIsSubagent && isWriteProtectedCortexCall(toolName, rawInput)) {
+    return preToolUseDecision('deny', SUBAGENT_CORTEX_WRITE_DENY_REASON);
   }
 
   const updatedInput = { ...rawInput };
   delete updatedInput._caller_agent_id;
-
   if (hostAgentId) {
     updatedInput._caller_agent_id = hostAgentId;
+  }
+  const inputChanged = hadSpoofedKey || Boolean(hostAgentId);
+
+  const otherProjectDir = otherProjectWriteTarget(toolName, rawInput, extractCwd(payload, process.cwd()));
+  if (otherProjectDir) {
+    return preToolUseDecision(
+      'ask',
+      formatOtherProjectWriteReason(otherProjectDir),
+      inputChanged ? { updatedInput } : {},
+    );
+  }
+
+  if (!inputChanged) {
+    return {};
   }
 
   return {

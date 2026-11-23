@@ -132,6 +132,26 @@ export function ensureTierDirs(tierDir) {
   return paths;
 }
 
+export const MEMORY_GITIGNORE_CONTENT = '*\n';
+
+/**
+ * Keep a project's `.memory/` out of git: create `<memoryDir>/.gitignore` containing a single `*` line
+ * unless a `.gitignore` is already there (an existing file is never touched). Only write paths call this,
+ * so read-only operations still create nothing. Returns true when the file was created.
+ */
+export function ensureMemoryGitignore(memoryDir) {
+  try {
+    fs.writeFileSync(path.join(path.resolve(memoryDir), '.gitignore'), MEMORY_GITIGNORE_CONTENT, {
+      encoding: 'utf8',
+      flag: 'wx',
+    });
+    return true;
+  } catch {
+    // Already present (EEXIST) or not writable: never overwrite, and never fail the write that triggered this.
+    return false;
+  }
+}
+
 function readJsonSafe(filePath, { warnOnError = false } = {}) {
   try {
     if (!fs.existsSync(filePath)) return null;
@@ -264,23 +284,89 @@ function withCleanEmbedding(raw, context) {
  * lower-cased on Windows. A path that does not exist yet is resolved through its deepest existing ancestor.
  */
 export function projectPathKey(projectPath) {
-  const resolved = path.resolve(String(projectPath));
-  let real = resolved;
-  try {
-    real = fs.realpathSync.native(resolved);
-  } catch {
-    try {
-      real = resolveRealPathWithFallback(resolved);
-    } catch {
-      real = resolved;
-    }
-  }
+  const real = realPathLenient(projectPath);
   return process.platform === 'win32' ? real.toLowerCase() : real;
 }
 
-function resolveProjectRoot(projectDir) {
+// Real path of `targetPath`; a path that does not exist is resolved through its deepest existing ancestor.
+function realPathLenient(targetPath) {
+  const resolved = path.resolve(String(targetPath));
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    try {
+      return resolveRealPathWithFallback(resolved);
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+/**
+ * The project root a directory argument refers to: the directory itself, or its parent when the
+ * argument is the `.memory` folder (the same rule `getProjectMemoryDir` applies).
+ */
+export function resolveProjectRoot(projectDir) {
   const resolved = path.resolve(projectDir);
   return path.basename(resolved) === '.memory' ? path.dirname(resolved) : resolved;
+}
+
+/**
+ * State file listing the project folders the user approved (`src/core/trust.mjs` holds the write side).
+ * It lives in the user's global store, apart from the user-edited `config.json`:
+ *   { "version": 1, "projects": [ { "path": "<real path of the project root>", "approvedAt": "<timestamp>" } ] }
+ */
+export function getTrustedProjectsPath(globalDir) {
+  return path.join(getTierPaths(getGlobalDir(globalDir)).stateDir, 'trusted-projects.json');
+}
+
+/**
+ * Comparison key of a path stored in the approval list. The stored value already is a real path, so it is
+ * NOT resolved again: if that location later becomes a junction to some other folder, the other folder
+ * does not inherit the approval.
+ */
+export function trustedPathKey(storedPath) {
+  const resolved = path.resolve(String(storedPath));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/**
+ * Valid entries of the approval list: [{ path, approvedAt }]. A missing or unreadable file means no approvals.
+ */
+export function readTrustedProjects(globalDir) {
+  const data = readJsonSafe(getTrustedProjectsPath(globalDir));
+  if (!data || !Array.isArray(data.projects)) return [];
+  const entries = [];
+  for (const item of data.projects) {
+    if (!isPlainObject(item) || typeof item.path !== 'string') continue;
+    const storedPath = item.path.trim();
+    if (!storedPath || !path.isAbsolute(storedPath)) continue;
+    entries.push({ path: storedPath, approvedAt: typeof item.approvedAt === 'string' ? item.approvedAt : '' });
+  }
+  return entries;
+}
+
+/**
+ * True when the user approved exactly this project folder. Nothing in a project's `.memory/` is read,
+ * injected or written before that. The folder is compared by its real path (junctions and symlinks
+ * resolved, case-insensitive on Windows) and must match exactly: a parent folder, a subfolder or a folder
+ * of the same name elsewhere does not count. Independent of `isProjectEnabled`; callers check both.
+ */
+export function isProjectTrusted(projectDir = process.cwd(), { globalDir } = {}) {
+  if (typeof projectDir !== 'string' || !projectDir.trim()) return false;
+  const wanted = projectPathKey(resolveProjectRoot(projectDir.trim()));
+  return readTrustedProjects(globalDir).some((entry) => trustedPathKey(entry.path) === wanted);
+}
+
+/**
+ * True when the project folder contains a `.memory/` directory (whether or not it may be used).
+ */
+export function hasProjectMemoryDir(projectDir = process.cwd()) {
+  try {
+    return fs.statSync(getProjectMemoryDir(projectDir)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 // Entries of the global `projects` map whose key is exactly this project root (never a parent or a folder name).
@@ -300,7 +386,8 @@ function findProjectEntries(projects, projectRoot) {
  *   1. `DEFAULT_CONFIG`
  *   2. global `config.json`
  *   3. `projects["<this project's path>"].embedding` of the global `config.json` (exact project root, real path)
- *   4. the project's own `.memory/config.json`, reduced by `sanitizeProjectConfig`
+ *   4. the project's own `.memory/config.json`, reduced by `sanitizeProjectConfig` — only when the user
+ *      approved the project folder (`isProjectTrusted`); the file of an unapproved folder is not read at all
  *   5. `overrides` (programmatic, e.g. CLI flags)
  * Old-format flat `embedding.*` keys and an `embedding` block in the project file are ignored; each is reported
  * once per process on stderr and through `getConfigProblems(config)`.
@@ -326,7 +413,7 @@ export function loadConfig({ projectDir, globalDir, overrides } = {}) {
     }
 
     const pPaths = getTierPaths(getProjectMemoryDir(projectDir));
-    const projectRaw = readJsonSafe(pPaths.configPath);
+    const projectRaw = isProjectTrusted(projectRoot, { globalDir }) ? readJsonSafe(pPaths.configPath) : null;
     if (isPlainObject(projectRaw) && projectRaw.embedding !== undefined) {
       const message = `"embedding" in the project file "${pPaths.configPath}" is ignored: a repository cannot choose `
         + 'where documents are sent. Put per-project embedding settings in the global config.json under '
@@ -345,18 +432,35 @@ export function loadConfig({ projectDir, globalDir, overrides } = {}) {
   return cfg;
 }
 
-function normalizeMatchPath(p) {
-  return path.resolve(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+function normalizeMatchString(p) {
+  return String(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
-function matchesProjectRule(normPath, segments, rule) {
+// The project path in the forms rules are matched against: as given, and with junctions/symlinks resolved.
+function describeProjectForMatch(projectDir) {
+  const given = normalizeMatchString(path.resolve(projectDir));
+  const real = normalizeMatchString(realPathLenient(projectDir));
+  const forms = given === real ? [given] : [given, real];
+  return { forms, segments: new Set(forms.flatMap((form) => form.split('/').filter(Boolean))) };
+}
+
+function matchesProjectRule(project, rule) {
   if (typeof rule !== 'string') return false;
-  const clean = rule.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const raw = rule.trim();
+  const clean = normalizeMatchString(raw);
   if (!clean) return false;
   if (clean.includes('/') || /^[a-z]:/i.test(clean)) {
-    return normPath === clean || normPath.startsWith(`${clean}/`);
+    // Path rule: compared as written and, when absolute, by its real path, so the rule and the project match
+    // no matter which of the two is reached through a junction, a symlink or a short (8.3) name.
+    const ruleForms = new Set([clean]);
+    if (path.isAbsolute(raw)) ruleForms.add(normalizeMatchString(realPathLenient(raw)));
+    for (const ruleForm of ruleForms) {
+      if (!ruleForm) continue;
+      if (project.forms.some((form) => form === ruleForm || form.startsWith(`${ruleForm}/`))) return true;
+    }
+    return false;
   }
-  return segments.includes(clean);
+  return project.segments.has(clean);
 }
 
 /**
@@ -364,7 +468,9 @@ function matchesProjectRule(normPath, segments, rule) {
  * Note: `revive` session-ID tracking still runs independently so reboot recovery stays intact.
  * Precedence:
  *   1) Explicit opt-out `enabled: false`
- *   2) `excludedProjects` (exact/ancestor path OR folder name segment, case-insensitive) — cannot be bypassed
+ *   2) `excludedProjects` (exact/ancestor path OR folder name segment, case-insensitive) — cannot be bypassed,
+ *      including through a path alias: the project and each path rule are compared by real path as well as
+ *      by the path as written
  *   3) `mode === 'opt-in'` -> requires match in `enabledProjects` — cannot be bypassed by project `enabled: true`
  *   4) Otherwise enabled (`mode === 'all'`)
  */
@@ -372,17 +478,16 @@ export function isProjectEnabled(projectDir, config = DEFAULT_CONFIG) {
   if (!config || typeof config !== 'object') return true;
   if (config.enabled === false) return false;
 
-  const normPath = normalizeMatchPath(projectDir || process.cwd());
-  const segments = normPath.split('/').filter(Boolean);
+  const project = describeProjectForMatch(projectDir || process.cwd());
 
   const excluded = Array.isArray(config.excludedProjects) ? config.excludedProjects : [];
-  if (excluded.some((rule) => matchesProjectRule(normPath, segments, rule))) {
+  if (excluded.some((rule) => matchesProjectRule(project, rule))) {
     return false;
   }
 
   if (String(config.mode || 'all').trim().toLowerCase() === 'opt-in') {
     const enabled = Array.isArray(config.enabledProjects) ? config.enabledProjects : [];
-    return enabled.some((rule) => matchesProjectRule(normPath, segments, rule));
+    return enabled.some((rule) => matchesProjectRule(project, rule));
   }
 
   return true;

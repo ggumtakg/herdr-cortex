@@ -23,6 +23,14 @@ import {
   getTerminalInboxDir,
   peekInbox,
 } from '../src/relay/inbox.mjs';
+import { approveProject } from '../src/core/trust.mjs';
+import { UNTRUSTED_MEMORY_PREAMBLE } from '../src/core/budget.mjs';
+
+// The fake `execFileSync` of these tests never starts a process; an absolute `hcBin` is used as is, so the
+// client does not look for a real `hc` on PATH.
+const FAKE_HC_BIN = path.join(os.tmpdir(), 'herdr-cortex-test-bin', 'hc.exe');
+// Characters the relay block spends on its fixed preamble line (plus the line break before it).
+const INBOX_PREAMBLE_COST = UNTRUSTED_MEMORY_PREAMBLE.length + 1;
 
 function makeTempEnv(prefix = 'herdr-cortex-relay-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -30,6 +38,8 @@ function makeTempEnv(prefix = 'herdr-cortex-relay-') {
   const globalDir = path.join(root, 'global');
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
+  // The project folder of every test environment is approved, as a user would do with cortex-trust.
+  approveProject(projectDir, { globalDir });
   return {
     root,
     projectDir,
@@ -163,8 +173,10 @@ test('relay/inbox: terminalId validation, FIFO enqueue/peek, .taking-<pid> claim
 
 test('relay/hc: listTerminals, getTerminal idle/busy detection, single-line sendTrigger, and graceful missing hc', () => {
   const sentCalls = [];
-  const mockExec = (bin, args) => {
-    assert.equal(bin, 'hc');
+  const mockExec = (bin, args, options) => {
+    // hc is always started by absolute path, from the folder that contains it
+    assert.equal(bin, FAKE_HC_BIN);
+    assert.equal(options.cwd, path.dirname(FAKE_HC_BIN));
     if (args[0] === 'ls') {
       return JSON.stringify({
         terminals: [
@@ -187,7 +199,7 @@ test('relay/hc: listTerminals, getTerminal idle/busy detection, single-line send
     throw new Error(`Unexpected hc args: ${args.join(' ')}`);
   };
 
-  const hc = createHcClient({ execFileSync: mockExec });
+  const hc = createHcClient({ execFileSync: mockExec, hcBin: FAKE_HC_BIN });
   const ls = hc.listTerminals();
   assert.equal(ls.ok, true);
   assert.equal(ls.terminals.length, 3);
@@ -215,6 +227,7 @@ test('relay/hc: listTerminals, getTerminal idle/busy detection, single-line send
 
   // Missing hc binary degrades gracefully
   const missingHc = createHcClient({
+    hcBin: FAKE_HC_BIN,
     execFileSync() {
       const err = new Error('spawnSync hc ENOENT');
       err.code = 'ENOENT';
@@ -252,6 +265,7 @@ test('relay/tools + MCP server: exposes all 10 tools and runs relay_tabs, relay_
 
     const sentTriggers = [];
     const mockHc = createHcClient({
+      hcBin: FAKE_HC_BIN,
       execFileSync(_bin, args) {
         if (args[0] === 'ls') {
           return JSON.stringify({
@@ -442,6 +456,7 @@ test('regression: cross-project relay_send and relay_tabs route messages to targ
   try {
     process.env.HC_TERMINAL_ID = 'tab-a';
     const mockHc = createHcClient({
+      hcBin: FAKE_HC_BIN,
       execFileSync(_bin, args) {
         if (args[0] === 'ls') {
           return JSON.stringify({
@@ -535,11 +550,12 @@ test('P0-5 regression: inbox partial ACK preserves omitted and truncated message
 
     const d1 = drainInbox(env.projectDir, 'tab-p1');
     assert.equal(d1.messages.length, 2);
-    const det1 = formatInboxForHookDetailed(d1.messages, { maxChars: 170 });
+    const budget1 = 170 + INBOX_PREAMBLE_COST + 2;
+    const det1 = formatInboxForHookDetailed(d1.messages, { maxChars: budget1 });
     assert.deepEqual(det1.includedIds, ['msg-fit']);
     assert.deepEqual(det1.omittedIds, ['msg-omit']);
     assert.deepEqual(det1.truncatedIds, []);
-    assert.ok(det1.text.length <= 170);
+    assert.ok(det1.text.length <= budget1);
 
     const ack1 = d1.ack(det1.includedIds);
     assert.equal(ack1.acked, 1);
@@ -553,7 +569,7 @@ test('P0-5 regression: inbox partial ACK preserves omitted and truncated message
 
     // Case 2: Single oversized message is truncated -> includedIds is [] -> message restored for relay_inbox!
     const d2 = drainInbox(env.projectDir, 'tab-p1');
-    const det2 = formatInboxForHookDetailed(d2.messages, { maxChars: 140 });
+    const det2 = formatInboxForHookDetailed(d2.messages, { maxChars: 140 + INBOX_PREAMBLE_COST + 2 });
     assert.deepEqual(det2.includedIds, []);
     assert.deepEqual(det2.truncatedIds, ['msg-omit']);
     assert.match(det2.text, /\[\.\.\.trimmed, inspect via relay_inbox\]/);
@@ -578,6 +594,7 @@ test('P0-6 & P0-7 regression: hc blocked/error/done/isBareShell/foreground.cwd/e
     let rejectIfFlag = false;
 
     const mockHc = createHcClient({
+      hcBin: FAKE_HC_BIN,
       execFileSync(_bin, args) {
         if (args[0] === 'ls') {
           return JSON.stringify({
@@ -720,6 +737,7 @@ test('P0-3, P0-11, P1-8, P1-11, P2-5 regression: MCP excludedProjects enforcemen
   const otherEnabledProj = path.join(env.root, 'other_enabled_proj');
   fs.mkdirSync(excludedProj, { recursive: true });
   fs.mkdirSync(otherEnabledProj, { recursive: true });
+  approveProject(otherEnabledProj, { globalDir: env.globalDir });
 
   atomicWriteJson(path.join(env.globalDir, 'config.json'), {
     mode: 'all',
@@ -817,6 +835,7 @@ test('P0-3, P0-11, P1-8, P1-11, P2-5 regression: MCP excludedProjects enforcemen
 
     // 3. Cross-project relay_send targeting excluded project returns TARGET_PROJECT_EXCLUDED & never creates .memory/
     const mockHcTargetExcl = createHcClient({
+      hcBin: FAKE_HC_BIN,
       execFileSync(_bin, args) {
         if (args[0] === 'get' && args[1] === 't-excl') {
           return JSON.stringify({ address: 't-excl', state: 'live', foreground: { name: 'claude', status: 'idle', cwd: excludedProj } });

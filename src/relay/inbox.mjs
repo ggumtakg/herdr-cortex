@@ -4,9 +4,11 @@ import crypto from 'node:crypto';
 import {
   assertInsideDir,
   atomicWriteJson,
+  ensureMemoryGitignore,
   getProjectMemoryDir,
   getTierPaths,
 } from '../core/config.mjs';
+import { UNTRUSTED_MEMORY_PREAMBLE, sanitizeInline } from '../core/budget.mjs';
 import { validateTerminalId } from '../revive/tracker.mjs';
 
 const TAKING_DIR_RE = /^\.taking-(\d+)-([a-zA-Z0-9_-]+)$/;
@@ -107,6 +109,8 @@ export function enqueueMessage(projectDir, terminalId, msg = {}) {
   const cleanTerminalId = validateTerminalId(terminalId);
   const targetDir = getTerminalInboxDir(projectDir, cleanTerminalId);
   fs.mkdirSync(targetDir, { recursive: true });
+  // The inbox lives under the project's .memory/, which this call may just have created: keep it out of git.
+  ensureMemoryGitignore(getProjectMemoryDir(projectDir));
 
   const nowMs = Date.now();
   const rand = crypto.randomBytes(4).toString('hex');
@@ -420,10 +424,28 @@ export function ackMessage(projectDir, terminalId, messageId) {
   return { acked: false, terminalId: cleanTerminalId, messageId: cleanMsgId };
 }
 
+const BODY_LINE_BREAK_RE = /\r\n|[\r\n\u2028\u2029]/;
+const BODY_CONTROL_CHARS_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]+/g;
+
+// A message body may span several lines, but every line is quoted ("> ") so that nothing inside it can
+// pass for a heading, another entry, or text outside the entry it belongs to.
+function quoteMessageBody(message) {
+  return String(message ?? '')
+    .trim()
+    .split(BODY_LINE_BREAK_RE)
+    .map((line) => {
+      const clean = line.replace(BODY_CONTROL_CHARS_RE, ' ').trimEnd();
+      return clean ? `> ${clean}` : '>';
+    })
+    .join('\n');
+}
+
 /**
  * Format drained relay messages concisely for hook injection and report exactly
  * which message IDs were fully included vs omitted or truncated so hooks only ACK
  * messages delivered intact.
+ * The block starts with its heading and `UNTRUSTED_MEMORY_PREAMBLE` (counted against maxChars; when the two
+ * do not fit, nothing is emitted). Message metadata is printed as single sanitized lines, bodies are quoted.
  * Strictly guarantees returned text.length <= maxChars.
  */
 export function formatInboxForHookDetailed(messages, { maxChars = 2500 } = {}) {
@@ -432,10 +454,10 @@ export function formatInboxForHookDetailed(messages, { maxChars = 2500 } = {}) {
   }
 
   const allIds = messages.map((m) => m.id);
-  const header = `## Incoming Herdr Relay Messages (${messages.length})`;
+  const header = `## Incoming Herdr Relay Messages (${messages.length})\n${UNTRUSTED_MEMORY_PREAMBLE}`;
   if (header.length >= maxChars) {
     return {
-      text: header.slice(0, maxChars).trimEnd(),
+      text: '',
       includedIds: [],
       omittedIds: allIds,
       truncatedIds: [],
@@ -452,12 +474,17 @@ export function formatInboxForHookDetailed(messages, { maxChars = 2500 } = {}) {
 
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
-    const from = m.from_terminal_id || 'peer';
-    const ts = m.created_at ? ` @ ${m.created_at}` : '';
-    const docs = Array.isArray(m.context_docs) && m.context_docs.length > 0
-      ? `\nContext docs: ${m.context_docs.map((d) => `[[${d}]]`).join(', ')}`
+    const from = sanitizeInline(m.from_terminal_id) || 'peer';
+    const createdAt = sanitizeInline(m.created_at);
+    const ts = createdAt ? ` @ ${createdAt}` : '';
+    const docIds = (Array.isArray(m.context_docs) ? m.context_docs : [])
+      .map((d) => sanitizeInline(d))
+      .filter(Boolean);
+    const docs = docIds.length > 0
+      ? `\nContext docs: ${docIds.map((d) => `[[${d}]]`).join(', ')}`
       : '';
-    const entry = `### [${m.id}] from ${from}${ts}${docs}\n${m.message.trim()}`;
+    const entryHead = `### [${sanitizeInline(m.id)}] from ${from}${ts}${docs}`;
+    const entry = `${entryHead}\n${quoteMessageBody(m.message)}`;
 
     if (total + 2 + entry.length <= maxChars) {
       blocks.push(entry);
@@ -478,14 +505,12 @@ export function formatInboxForHookDetailed(messages, { maxChars = 2500 } = {}) {
 
     // First message alone exceeds remaining budget -> trim cleanly inside maxChars
     // and mark as truncated (NOT includedIds) so it remains in inbox for relay_inbox.
+    // The cut may only fall inside the quoted body: the entry's own header lines are printed whole or not at all.
     const avail = maxChars - total - 2;
-    if (avail > trimSuffix.length) {
+    if (avail > entryHead.length + trimSuffix.length) {
       const bodyLimit = avail - trimSuffix.length;
       const clipped = entry.slice(0, bodyLimit).trimEnd();
       blocks.push(`${clipped}${trimSuffix}`);
-      truncatedIds.push(m.id);
-    } else if (avail > 0) {
-      blocks.push(entry.slice(0, avail).trimEnd());
       truncatedIds.push(m.id);
     } else {
       omittedIds.push(m.id);
@@ -494,6 +519,14 @@ export function formatInboxForHookDetailed(messages, { maxChars = 2500 } = {}) {
       omittedIds.push(messages[j].id);
     }
     break;
+  }
+
+  // No entry fits at all: point to relay_inbox when there is room for that, otherwise emit nothing.
+  if (blocks.length === 1) {
+    if (total + 2 + footer.length > maxChars) {
+      return { text: '', includedIds, omittedIds, truncatedIds };
+    }
+    blocks.push(footer);
   }
 
   const joined = blocks.join('\n\n');

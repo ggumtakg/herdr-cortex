@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { REPO_ROOT, assertInsideDir, isProjectEnabled, loadConfig } from '../core/config.mjs';
+import { REPO_ROOT, assertInsideDir, isProjectEnabled, isProjectTrusted, loadConfig } from '../core/config.mjs';
+import { PROJECT_NOT_APPROVED_CODE, formatProjectNotApprovedMessage } from '../core/trust.mjs';
 import { CortexStore } from '../core/store.mjs';
 import { searchMemory } from '../core/search.mjs';
 import { fitOverviewToBudget } from '../core/budget.mjs';
@@ -106,12 +107,53 @@ function makeProjectExcludedError(toolName, projectDir) {
   };
 }
 
-function readGlobalOnlyOverview(targetStore, sessionFilter = '') {
+function makeProjectNotApprovedError(toolName, projectDir) {
+  return {
+    isError: true,
+    errorCode: PROJECT_NOT_APPROVED_CODE,
+    data: {
+      error: PROJECT_NOT_APPROVED_CODE,
+      tool: toolName,
+      project_dir: projectDir,
+      message: formatProjectNotApprovedMessage(projectDir),
+    },
+  };
+}
+
+/**
+ * Why a store's project tier may not be used: 'excluded' (herdr-cortex configuration), 'not_approved'
+ * (the user has not approved the folder), or null when it may be used. Exclusion is reported first.
+ */
+function projectBlockReason({ enabled, approved }) {
+  if (!enabled) return 'excluded';
+  if (!approved) return 'not_approved';
+  return null;
+}
+
+function makeProjectBlockedError(block, toolName, projectDir) {
+  return block === 'excluded'
+    ? makeProjectExcludedError(toolName, projectDir)
+    : makeProjectNotApprovedError(toolName, projectDir);
+}
+
+// Marker fields of a result that holds global-tier data only because the project tier was withheld.
+function projectBlockFlags(block, projectDir) {
+  if (block === 'excluded') return { projectExcluded: true };
+  if (block === 'not_approved') {
+    return {
+      projectNotApproved: true,
+      projectNotApprovedMessage: formatProjectNotApprovedMessage(projectDir),
+    };
+  }
+  return {};
+}
+
+function readGlobalOnlyOverview(targetStore, sessionFilter = '', flags = { projectExcluded: true }) {
   const globalDocsDir = path.join(targetStore.globalDir, 'docs');
   if (!fs.existsSync(globalDocsDir)) {
     return {
       sessionFilter: sessionFilter || null,
-      projectExcluded: true,
+      ...flags,
       sessions: [],
       todos: [],
       decisions: [],
@@ -146,7 +188,7 @@ function readGlobalOnlyOverview(targetStore, sessionFilter = '') {
 
   return {
     sessionFilter: sessionFilter || null,
-    projectExcluded: true,
+    ...flags,
     sessions: [],
     todos: [],
     decisions: [],
@@ -230,6 +272,14 @@ export function createToolRegistry(
     return isProjectEnabled(store.projectRoot, cfg);
   };
 
+  // Approval is read from the approval list on every call: the user can give or withdraw it while the
+  // server runs. It applies to the default project and to `project_dir` alike, so `project_dir` can only
+  // reach folders the user approved.
+  const isApproved = (projectDir) => {
+    if (!store) return true;
+    return isProjectTrusted(projectDir, { globalDir: store.globalDir });
+  };
+
   const withProjectStore = async (args, fn) => {
     const requestedDir = typeof args?.project_dir === 'string' && args.project_dir.trim()
       ? path.resolve(args.project_dir.trim())
@@ -240,6 +290,7 @@ export function createToolRegistry(
       return fn(store, {
         projectDir: defaultRoot,
         enabled: isDefaultProjectEnabled(),
+        approved: isApproved(defaultRoot),
         isDefaultStore: true,
       });
     }
@@ -256,6 +307,7 @@ export function createToolRegistry(
       return await fn(tempStore, {
         projectDir: requestedDir,
         enabled,
+        approved: isApproved(requestedDir),
         isDefaultStore: false,
       });
     } finally {
@@ -294,21 +346,22 @@ export function createToolRegistry(
       },
     },
     async handler(args) {
-      return withProjectStore(args, async (targetStore, { projectDir, enabled }) => {
+      return withProjectStore(args, async (targetStore, { projectDir, enabled, approved }) => {
         const requestedScope = args.scope || 'all';
-        if (!enabled && requestedScope === 'project') {
+        const block = projectBlockReason({ enabled, approved });
+        if (block && requestedScope === 'project') {
           return {
             query: args.query || '',
             scope: 'project',
-            projectExcluded: true,
+            ...projectBlockFlags(block, projectDir),
             projectDir,
             vectorUsed: false,
             results: [],
           };
         }
-        const effectiveScope = enabled ? requestedScope : 'global';
+        const effectiveScope = block ? 'global' : requestedScope;
         const provider = typeof getEmbeddingProvider === 'function' ? await getEmbeddingProvider() : null;
-        return searchMemory(targetStore, {
+        const found = await searchMemory(targetStore, {
           query: args.query || '',
           scope: effectiveScope,
           type: args.type || '',
@@ -320,6 +373,11 @@ export function createToolRegistry(
           embeddingProvider: provider,
           embeddingBreaker,
         });
+        // Results that lack the project tier because the folder is unapproved say so (a search that asked
+        // for the global tier only lacks nothing); an excluded project keeps its existing shape.
+        return block === 'not_approved' && requestedScope !== 'global'
+          ? { ...found, ...projectBlockFlags(block, projectDir) }
+          : found;
       });
     },
   });
@@ -338,12 +396,13 @@ export function createToolRegistry(
       },
     },
     async handler(args) {
-      return withProjectStore(args, async (targetStore, { projectDir, enabled }) => {
+      return withProjectStore(args, async (targetStore, { projectDir, enabled, approved }) => {
         const requestedScope = args.scope || 'all';
-        if (!enabled && requestedScope === 'project') {
-          return makeProjectExcludedError('memory_read', projectDir);
+        const block = projectBlockReason({ enabled, approved });
+        if (block && requestedScope === 'project') {
+          return makeProjectBlockedError(block, 'memory_read', projectDir);
         }
-        const effectiveScope = enabled ? requestedScope : 'global';
+        const effectiveScope = block ? 'global' : requestedScope;
         const doc = targetStore.readDoc({
           id: args.id,
           scope: effectiveScope,
@@ -352,7 +411,11 @@ export function createToolRegistry(
         if (!doc) {
           return {
             isError: true,
-            data: { error: 'NOT_FOUND', message: `Document "${args.id}" not found` },
+            data: {
+              error: 'NOT_FOUND',
+              message: `Document "${args.id}" not found`,
+              ...(block === 'not_approved' ? projectBlockFlags(block, projectDir) : {}),
+            },
           };
         }
         return doc;
@@ -387,10 +450,11 @@ export function createToolRegistry(
       },
     },
     async handler(args) {
-      return withProjectStore(args, async (targetStore, { projectDir, enabled, isDefaultStore }) => {
+      return withProjectStore(args, async (targetStore, { projectDir, enabled, approved, isDefaultStore }) => {
         const requestedScope = args.scope || 'project';
-        if (!enabled && requestedScope !== 'global') {
-          return makeProjectExcludedError('memory_save', projectDir);
+        const block = projectBlockReason({ enabled, approved });
+        if (block && requestedScope !== 'global') {
+          return makeProjectBlockedError(block, 'memory_save', projectDir);
         }
         const saved = targetStore.saveDoc(args);
         scheduleEmbedding(saved.scope, { projectDir, isDefaultStore });
@@ -426,10 +490,11 @@ export function createToolRegistry(
       },
     },
     async handler(args) {
-      return withProjectStore(args, async (targetStore, { projectDir, enabled, isDefaultStore }) => {
+      return withProjectStore(args, async (targetStore, { projectDir, enabled, approved, isDefaultStore }) => {
         const requestedScope = args.scope || 'all';
-        if (!enabled && requestedScope !== 'global') {
-          return makeProjectExcludedError('memory_update', projectDir);
+        const block = projectBlockReason({ enabled, approved });
+        if (block && requestedScope !== 'global') {
+          return makeProjectBlockedError(block, 'memory_update', projectDir);
         }
         const updated = targetStore.updateDoc(args);
         scheduleEmbedding(updated.scope, { projectDir, isDefaultStore });
@@ -454,26 +519,30 @@ export function createToolRegistry(
       },
     },
     async handler(args) {
-      return withProjectStore(args, async (targetStore, { projectDir, enabled }) => {
+      return withProjectStore(args, async (targetStore, { projectDir, enabled, approved }) => {
         const requestedScope = args.scope || 'project';
-        if (!enabled && requestedScope === 'project') {
+        const block = projectBlockReason({ enabled, approved });
+        if (block && requestedScope === 'project') {
           return {
             target: args.target,
             scope: 'project',
-            projectExcluded: true,
+            ...projectBlockFlags(block, projectDir),
             projectDir,
             nodes: [],
             edges: [],
           };
         }
-        const effectiveScope = enabled ? requestedScope : 'global';
-        return targetStore.exploreGraph({
+        const effectiveScope = block ? 'global' : requestedScope;
+        const graph = targetStore.exploreGraph({
           target: args.target,
           scope: effectiveScope,
           depth: args.depth ?? 2,
           direction: args.direction || 'both',
           limit: args.limit ?? 60,
         });
+        return block === 'not_approved' && requestedScope !== 'global'
+          ? { ...graph, ...projectBlockFlags(block, projectDir) }
+          : graph;
       });
     },
   });
@@ -492,17 +561,19 @@ export function createToolRegistry(
       },
     },
     async handler(args) {
-      return withProjectStore(args, async (targetStore, { enabled }) => {
-        const overview = enabled
+      return withProjectStore(args, async (targetStore, { projectDir, enabled, approved }) => {
+        const block = projectBlockReason({ enabled, approved });
+        const blockFlags = projectBlockFlags(block, projectDir);
+        const overview = !block
           ? targetStore.getOverview({
               session: args.session || '',
               includeGlobal: args.include_global !== false,
             })
           : (args.include_global !== false
-              ? readGlobalOnlyOverview(targetStore, args.session || '')
+              ? readGlobalOnlyOverview(targetStore, args.session || '', blockFlags)
               : {
                   sessionFilter: args.session || null,
-                  projectExcluded: true,
+                  ...blockFlags,
                   sessions: [],
                   todos: [],
                   decisions: [],
@@ -511,7 +582,12 @@ export function createToolRegistry(
                 });
         const fitted = fitOverviewToBudget(overview, args.budget ?? targetStore.config?.hookBudget ?? 9000);
         if (args.format === 'markdown') {
-          return { markdown: fitted.text, step: fitted.step, charCount: fitted.charCount };
+          return {
+            markdown: fitted.text,
+            step: fitted.step,
+            charCount: fitted.charCount,
+            ...(block === 'not_approved' ? blockFlags : {}),
+          };
         }
         if (args.format === 'json') {
           return overview;
@@ -587,6 +663,19 @@ export function createToolRegistry(
         }
         return { isError: false, data: result };
       } catch (err) {
+        // The store refuses to open the project tier of an unapproved folder; report it like the handlers do.
+        if (err?.code === PROJECT_NOT_APPROVED_CODE) {
+          return {
+            isError: true,
+            errorCode: PROJECT_NOT_APPROVED_CODE,
+            data: {
+              error: PROJECT_NOT_APPROVED_CODE,
+              tool: name,
+              ...(err.projectDir ? { project_dir: err.projectDir } : {}),
+              message: err.message || String(err),
+            },
+          };
+        }
         if (err?.code === 'UNSAFE_UPDATE') {
           return {
             isError: true,

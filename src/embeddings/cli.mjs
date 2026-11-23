@@ -1,6 +1,13 @@
 import path from 'node:path';
 import { CortexStore } from '../core/store.mjs';
-import { EMBEDDING_PROVIDER_NAMES, isMainModule, isProjectEnabled, loadConfig } from '../core/config.mjs';
+import {
+  EMBEDDING_PROVIDER_NAMES,
+  isMainModule,
+  isProjectEnabled,
+  isProjectTrusted,
+  loadConfig,
+} from '../core/config.mjs';
+import { formatProjectNotApprovedMessage } from '../core/trust.mjs';
 import {
   createEmbeddingBreaker,
   describeEmbeddingStatus,
@@ -43,7 +50,9 @@ function parseArgs(argv) {
  *   --retry-failed      first reset the documents that reached the attempt cap, so they are tried again
  *
  * Before any work it prints on stderr which provider is in effect, where documents would be sent and any
- * configuration problem. An unknown provider name, a provider without its API key, or --model without a
+ * configuration problem. A project that is excluded by the configuration, or that the user has not approved,
+ * is skipped (`reason: "project_disabled"` / `"project_not_approved"`, or `skippedProject` with --scope all);
+ * nothing in its .memory/ is read. An unknown provider name, a provider without its API key, or --model without a
  * provider to apply it to ends the run with exit code 1; so does any embedding error.
  */
 export async function runEmbedCli(
@@ -101,11 +110,17 @@ export async function runEmbedCli(
     return summary;
   };
 
-  const projectAllowed = isProjectEnabled(opts.projectDir, config);
+  const projectEnabled = isProjectEnabled(opts.projectDir, config);
+  // An unapproved project is skipped the same way an excluded one is; exclusion is reported first.
+  const projectNotApproved = projectEnabled && !isProjectTrusted(opts.projectDir, { globalDir: opts.globalDir });
+  const projectAllowed = projectEnabled && !projectNotApproved;
 
   let effectiveScope = opts.scope;
   let skippedProject = false;
   if (!projectAllowed) {
+    if (projectNotApproved && opts.scope !== 'global') {
+      stderr.write(`[herdr-cortex] ${formatProjectNotApprovedMessage(opts.projectDir)}\n`);
+    }
     if (opts.scope === 'project') {
       return emit({
         provider: null,
@@ -114,7 +129,7 @@ export async function runEmbedCli(
         rebuiltTiers: [],
         errors: 0,
         skipped: true,
-        reason: 'project_disabled',
+        reason: projectNotApproved ? 'project_not_approved' : 'project_disabled',
         ...(configProblems.length > 0 ? { configProblems } : {}),
       });
     }
@@ -195,6 +210,7 @@ export async function runEmbedCli(
       errors: totalErrors,
       circuitBroken,
       ...(skippedProject ? { skippedProject: true } : {}),
+      ...(skippedProject && projectNotApproved ? { projectNotApproved: true } : {}),
       ...(reason ? { reason } : {}),
       ...(error ? { error } : {}),
       // Documents the queue stopped retrying (attempt cap); `--retry-failed` gives them a fresh start.

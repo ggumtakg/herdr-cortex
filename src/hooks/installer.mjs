@@ -10,6 +10,7 @@ import {
   isMainModule,
 } from '../core/config.mjs';
 import { resolveEffectiveHome } from '../revive/tracker.mjs';
+import { CLAUDE_PRE_TOOL_USE_MATCHER } from './tool-names.mjs';
 
 export const AGY_HOOK_KEY = 'herdr-cortex';
 export const LEGACY_AGY_HOOK_KEY = 'herdr-revive-tracker';
@@ -230,8 +231,10 @@ function updateClaudeSettings(homeDir, repoRoot, isInstall) {
     ],
   });
 
+  // One entry for this server's tools (both server names) and for the file and shell tools whose calls
+  // the subagent `.memory/` guard inspects.
   data.hooks.PreToolUse.push({
-    matcher: 'mcp__cortex__.*',
+    matcher: CLAUDE_PRE_TOOL_USE_MATCHER,
     hooks: [
       {
         type: 'command',
