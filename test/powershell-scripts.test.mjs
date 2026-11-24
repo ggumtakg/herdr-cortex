@@ -573,14 +573,18 @@ test('auto-revive: a tab that starts as a bare shell gets the same plan (saved f
       hc.setGet(id, shellGet(id, cwd, where));
     }
     hc.setGet('t8', { ...shellGet('t8', here, 'busy / Claude Code'), foreground: { argv: ['claude.exe'], cwd: here, name: 'claude.exe', pid: 1 }, status: { app: 'claude-code', state: 'idle' } });
+    // Herdr's foreground sampler can catch our own `hc get` subprocess as `hc.exe` inside the booting shell.
+    hc.setGet('t10', { ...shellGet('t10', here, 'self-hc / 1'), foreground: { argv: ['hc.exe', 'get', 't10', '--json'], cwd: here, name: 'hc.exe', pid: 2 } });
+    hc.setGet('t11', { ...shellGet('t11', alone, 'self-hc / Antigravity'), foreground: { argv: ['hc.exe', 'get', 't11', '--json'], cwd: alone, name: 'hc.exe', pid: 3 } });
     saveSession(env, 't1', { agent: 'claude', sessionId: 'sess-here', cwd: here });
     saveSession(env, 't2', { agent: 'antigravity', sessionId: 'conv-elsewhere', cwd: saved });
     saveSession(env, 't3', { agent: 'claude', sessionId: 'sess-gone', cwd: gone });
+    saveSession(env, 't10', { agent: 'antigravity', sessionId: 'conv-self-hc', cwd: here });
     atomicWriteJson(path.join(env.globalDir, 'config.json'), { agyExtraArgs: ['--fast'] });
 
     const plan = (terminalId, cwd) => ({ kind: 'plan', terminalId, cwd });
     const options = { pathDirs: [hc.dir] };
-    const results = runInLoadedShell(env, [plan('t1', here), plan('t2', here), plan('t3', here), plan('t4', shared), plan('t6', alone), plan('t7', here), plan('t8', here), plan('t9', here)], options);
+    const results = runInLoadedShell(env, [plan('t1', here), plan('t2', here), plan('t3', here), plan('t4', shared), plan('t6', alone), plan('t7', here), plan('t8', here), plan('t9', here), plan('t10', here), plan('t11', alone)], options);
     const plans = results.map((res) => res.plan);
     const brief = (p) => (p ? [p.Action, p.Source, p.Exe, p.Arguments, p.ChangeTo] : null);
 
@@ -596,9 +600,11 @@ test('auto-revive: a tab that starts as a bare shell gets the same plan (saved f
     assert.equal(plans[5], null, 'a plain shell tab: nothing to restore');
     assert.equal(plans[6], null, 'hc reports an agent in the tab already');
     assert.equal(plans[7], null, 'unknown to hc, nothing saved');
+    assert.deepEqual(brief(plans[8]), ['revive', 'session-id', 'agy', ['--conversation', 'conv-self-hc', '--fast'], ''], 'self hc.exe foreground probe must not suppress session-id auto-revive');
+    assert.deepEqual(brief(plans[9]), ['revive', 'tab-title', 'agy', ['-c', '--fast'], ''], 'self hc.exe foreground probe must not suppress tab-title auto-revive');
     // `hc ls` is only asked when the title fallback is in play
     const lsCalls = hc.calls().filter((args) => args[0] === 'ls').length;
-    assert.equal(lsCalls, 2);
+    assert.equal(lsCalls, 3);
 
     // hc cannot list the tabs: the title fallback is not used blindly; a saved session id still works
     hc.setFlag('fail-ls.txt', '1');

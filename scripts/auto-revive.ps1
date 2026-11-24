@@ -208,6 +208,11 @@ function script:Get-HerdrAutoRevivePlan {
         $own.Agent = $liveMeta.Agent
         $own.Where = $liveMeta.Where
     }
+    # This shell just ran `hc get <id> --json` inside this tab, so Herdr's foreground sampler can
+    # report our own hc.exe subprocess. Treat hc/hc.exe as this bare shell rather than another app.
+    if ($own.Agent -match '^(?i)hc(\.exe)?$') {
+        $own.Agent = ""
+    }
     # hc reports another program in this tab: leave it alone.
     if ($own.Agent -and -not (Test-HerdrBareShell $own.Agent)) { return $null }
     # This code runs inside PowerShell, whatever hc could tell.
