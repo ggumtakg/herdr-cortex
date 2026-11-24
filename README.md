@@ -189,7 +189,7 @@ flowchart TB
 | `hc`의 `error`·`done` 상태와 몇 가지 오류 출력의 실물 | [relay](src/relay/README.md#hc의-errordone-상태와-몇-가지-오류-출력의-실물) |
 | `revive-agents`의 실제 실행, `hc send`로 탭을 실제로 깨우는 것 | [scripts](scripts/README.md#revive-agents의-실제-실행-hc-send로-탭을-실제로-깨우는-것) |
 | Antigravity CLI 전반 | [hooks](src/hooks/README.md#antigravity-cli-전반) |
-| 임베딩 프로바이더 네 가지의 실제 호출 | [embeddings](src/embeddings/README.md#임베딩-프로바이더-네-가지의-실제-호출) |
+| Gemini, OpenAI, Ollama 임베딩의 실제 호출 | [embeddings](src/embeddings/README.md#gemini-openai-ollama의-실제-호출) |
 | `sqlite-vec`의 미리 빌드된 실행 파일 | [core](src/core/README.md#sqlite-vec의-미리-빌드된-실행-파일) |
 | Node 22 | [test](test/README.md#node-22) |
 | Codex | [hooks](src/hooks/README.md#codex) |
