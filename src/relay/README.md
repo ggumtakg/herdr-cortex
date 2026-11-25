@@ -445,7 +445,7 @@ Another process is delivering this terminal's messages right now; nothing was ac
 | **확인 방법** | 그런 상태의 탭이 생겼을 때 `hc get <탭>`의 출력과 `relay_tabs`의 `activity`를 비교합니다. |
 | **틀렸을 때 증상** | 그 상태의 탭이 `activity: "unknown"`으로 나와 `auto`로는 깨워지지 않거나(`target_status_unknown`), 거부 이유가 `hc_send_failed`로 뭉뚱그려져 나옵니다. 메시지는 받은편지함에 저장되어 있으므로 잃지 않습니다. |
 
-`relay_send`가 쉬고 있는 실제 탭을 `hc send`로 깨우는 것도 가짜 `hc`로만 실행했습니다. 이 항목은 탭 복구의 실제 실행과 함께 [`scripts/README.md`의 "확인 상태"](../../scripts/README.md#확인-상태)에 적었습니다.
+`relay_send`가 쉬고 있는 실제 탭을 `hc send`로 깨우는 것도 가짜 `hc`로만 실행했습니다. 이 항목은 탭 복구에서 확인하지 못한 것과 함께 [`scripts/README.md`의 "확인 상태"](../../scripts/README.md#확인-상태)에 적었습니다.
 
 ---
 

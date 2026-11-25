@@ -187,7 +187,7 @@ flowchart TB
 | `systemMessage`가 실제 화면에 어떻게 보이는지 | [hooks](src/hooks/README.md#systemmessage가-실제-화면에-어떻게-보이는지) |
 | MCP 서버가 Claude Code의 환경변수를 빠짐없이 물려받는지 | [mcp](src/mcp/README.md#mcp-서버가-claude-code의-환경변수를-빠짐없이-물려받는지) |
 | `hc`의 `error`·`done` 상태와 몇 가지 오류 출력의 실물 | [relay](src/relay/README.md#hc의-errordone-상태와-몇-가지-오류-출력의-실물) |
-| `revive-agents`의 실제 실행, `hc send`로 탭을 실제로 깨우는 것 | [scripts](scripts/README.md#revive-agents의-실제-실행-hc-send로-탭을-실제로-깨우는-것) |
+| `relay_send`로 탭을 실제로 깨우는 것, 폴더 이동 복구와 탭 제목 복구 | [scripts](scripts/README.md#relay_send로-탭을-실제로-깨우는-것-폴더-이동-복구와-탭-제목-복구) |
 | Antigravity CLI 전반 | [hooks](src/hooks/README.md#antigravity-cli-전반) |
 | Gemini, OpenAI, Ollama 임베딩의 실제 호출 | [embeddings](src/embeddings/README.md#gemini-openai-ollama의-실제-호출) |
 | `sqlite-vec`의 미리 빌드된 실행 파일 | [core](src/core/README.md#sqlite-vec의-미리-빌드된-실행-파일) |
@@ -206,7 +206,7 @@ flowchart TB
 - **임베딩을 켜면 문서 내용과 검색어가 선택한 서비스로 전송됩니다**(`onnx`와 이 PC의 `ollama`는 PC 밖으로 나가지 않음). 색인을 지우면 벡터는 임베딩을 다시 해야 채워집니다([embeddings](src/embeddings/README.md#한계)).
 - **직전 대화는 최대 5턴, 최대 4,500자이고 `hookBudget`의 상한은 9,000자입니다.** `/clear` 뒤에 직전 세션을 특정하지 못하면 복원하지 않습니다([hooks](src/hooks/README.md#한계)).
 - **릴레이는 같은 PC의 탭끼리만 됩니다**([relay](src/relay/README.md#한계)).
-- **`revive-agents`가 실제 탭에 입력하는 동작은 가짜 `hc`로만 시험했습니다.** 처음에는 `revive-agents -DryRun`으로 계획을 확인하세요. 재부팅 뒤의 자동 복구는 실제 탭에서 확인했습니다([scripts](scripts/README.md#한계)).
+- **탭 복구는 PC 두 대에서 몇 번 확인한 것이 전부입니다.** 재부팅 뒤의 자동 복구와 `revive-agents`가 실제 탭에서 동작하는 것은 확인했지만, 원격으로 연결한 PC에서 자동 복구가 실행되지 않은 일이 있었습니다. 처음에는 `revive-agents -DryRun`으로 계획을 확인하세요([scripts](scripts/README.md#한계)).
 - **아주 큰 문서는 색인을 미룹니다.** 미룬 문서는 MCP 서버가 뒤에서 색인하며, 그때까지 검색과 기억 요약에서 빠질 수 있습니다([core](src/core/README.md#미루기)). 구현하지 않고 남겨 둔 개선안은 [mcp](src/mcp/README.md#향후-개선안), [core](src/core/README.md#향후-개선안), [hooks](src/hooks/README.md#향후-개선안)의 "향후 개선안"에 있습니다.
 
 ---
