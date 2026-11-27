@@ -41,7 +41,7 @@ function collectFilesRecursive(dirPath) {
   return results;
 }
 
-test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 plan-run steps, and all 3 agents without traversal leaks', async () => {
+test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 plan-run steps, and all 4 agents without traversal leaks', async () => {
   const env = makeTempEnv();
   const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
   const registry = createToolRegistry(store, {
@@ -53,19 +53,46 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
     const coreDefault = await registry.callTool('cortex_prompt', { kind: 'core' });
     assert.equal(coreDefault.isError, false);
     assert.equal(coreDefault.data.path, 'HEAD_CORE.md');
-    const coreLines = coreDefault.data.content.trim().split(/\r?\n/);
-    assert.ok(coreLines.length >= 25 && coreLines.length <= 40, `HEAD_CORE.md expected ~28-36 lines, got ${coreLines.length}`);
-    assert.match(coreDefault.data.content, /해상도 분리/);
-    assert.match(coreDefault.data.content, /시야 협소화 예방/);
-    assert.match(coreDefault.data.content, /Open Facts/);
-    assert.match(coreDefault.data.content, /독립 검수/);
-    assert.match(coreDefault.data.content, /실제 실행으로 증명/);
-    assert.match(coreDefault.data.content, /Canon Protection/);
-    assert.match(coreDefault.data.content, /supersedes/);
-    assert.match(coreDefault.data.content, /cortex_prompt/);
-    // Deduplicated from SERVER_INSTRUCTIONS: no redundant tool-by-tool relay/skill catalog in HEAD_CORE
-    assert.doesNotMatch(coreDefault.data.content, /relay_tabs/);
-    assert.doesNotMatch(coreDefault.data.content, /kind: "skill"/);
+    const coreContent = coreDefault.data.content;
+    const coreLines = coreContent.trim().split(/\r?\n/);
+    assert.equal(coreLines[0], '# HEAD 운영 원칙');
+    assert.ok(coreContent.length > 0 && coreContent.length <= 4500, `HEAD_CORE.md must be <= 4500 chars, got ${coreContent.length}`);
+    // (a) Role & cognitive principles
+    assert.match(coreContent, /목적 합의/);
+    assert.match(coreContent, /시야/);
+    assert.match(coreContent, /Open Facts/);
+    assert.match(coreContent, /외부 마크다운 정본/);
+    // (b) Start of every job: agreement + memory-first lookup
+    assert.match(coreContent, /memory_overview/);
+    assert.match(coreContent, /memory_search/);
+    assert.match(coreContent, /memory_read/);
+    assert.match(coreContent, /memory_graph\(target: "file:<프로젝트 상대 경로>", direction: "in"\)/);
+    // (c) S / L sizing (4 criteria, S->L escalation, L delegates via start-job)
+    assert.match(coreContent, /고칠 파일이 2개 이상/);
+    assert.match(coreContent, /고칠 위치와 이유를 지금 말할 수 없다/);
+    assert.match(coreContent, /공개 인터페이스, 설정 형식, 저장 데이터 구조, 훅 동작/);
+    assert.match(coreContent, /1,000자/);
+    assert.match(coreContent, /멈추고 \*\*L\*\*로 올린다/);
+    assert.match(coreContent, /HEAD는 코드를 직접 고치지 않는다/);
+    assert.match(coreContent, /cortex_prompt\(kind: "skill", name: "start-job"\)/);
+    // (d) Working principles & real execution proof
+    assert.match(coreContent, /실제 환경에서 실제 입력부터 결과가 쓰이는 지점까지 동작/);
+    assert.match(coreContent, /독립 검수/);
+    // (e) Memory save triggers, minimal call shape, supersedes, global preferences, canon protection
+    assert.match(coreContent, /그 턴의 최종 응답을 쓰기 전에/);
+    assert.match(coreContent, /memory_save\(type, title, summary\)/);
+    assert.match(coreContent, /supersedes/);
+    assert.match(coreContent, /scope: "global"/);
+    assert.match(coreContent, /category: "preferences"/);
+    assert.match(coreContent, /실수 방지 장치이지 보안 경계가 아니다/);
+    // (f) Situational asset table + list call
+    for (const assetName of ['start-job', 'delegate', 'independent-review', 'plan-run', 'product-planning', 'DEVELOPMENT_STANDARD', 'coder', 'developer', 'reviewer', 'researcher']) {
+      assert.match(coreContent, new RegExp(assetName), `HEAD_CORE.md missing asset "${assetName}"`);
+    }
+    assert.match(coreContent, /cortex_prompt\(\)/);
+    // Relay details stay in start-job / delegate, and unimplemented edit-counting hooks are not claimed
+    assert.doesNotMatch(coreContent, /relay_tabs/);
+    assert.doesNotMatch(coreContent, /훅이 편집을 세어/);
 
     const coreExplicit = await registry.callTool('cortex_prompt', { kind: 'core', name: 'HEAD_CORE' });
     assert.equal(coreExplicit.isError, false);
@@ -82,9 +109,41 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
 
     // 3. All 5 unified skills
     const expectedSkills = [
-      { name: 'start-job', mustMatch: [/직접 실행/, /delegate/, /independent-review/, /plan-run/, /memory_overview/, /memory_search/, /프로젝트 상대 경로/, /category: "preferences"/] },
-      { name: 'product-planning', mustMatch: [/1단계: 문제 정의/, /2단계: 사용자 가치/, /3단계: 유저플로우/, /사용자 통제/] },
-      { name: 'delegate', mustMatch: [/Entry Contract/, /contract_conflict/, /coder/, /developer/, /reviewer/, /cortex_prompt/, /프로젝트 상대 경로/, /category: "preferences"/] },
+      {
+        name: 'start-job',
+        mustMatch: [
+          /^description:.*L 작업/m,
+          /한 줄로 알린다/,
+          /코드는 워커가 고친다/,
+          /researcher/,
+          /서로 다른 모델/,
+          /미리 생각한 원인이나 해결안은 적지 않는다/,
+          /파일:줄/,
+          /원인이 확정된 뒤에야 구현을 맡긴다/,
+          /delegate/,
+          /coder/,
+          /developer/,
+          /plan-run/,
+          /\{\{HERDR_CORTEX_ROOT\}\}\/scripts\/cortex-worker\.mjs/,
+          /--role <역할> --agent <antigravity\|claude> --model <모델> --brief <지시 파일>/,
+          /--out <결과 파일>/,
+          /--allow <허용 규칙>/,
+          /cortex-worker/,
+          /relay_tabs/,
+          /relay_send/,
+          /워커의 보고를 그대로 믿지 않/,
+          /independent-review/,
+          /reviewer/,
+          /NEEDS_FIX/,
+          /ACCEPT/,
+          /memory_save/,
+          /둘 다/,
+          /DEVELOPMENT_STANDARD/,
+          /product-planning/,
+        ],
+      },
+      { name: 'product-planning', mustMatch: [/1단계: 문제 정의/, /2단계: 사용자 가치/, /3단계: 유저플로우/, /사용자 통제/, /규모 판정\(S\/L\)/, /start-job/] },
+      { name: 'delegate', mustMatch: [/Entry Contract/, /contract_conflict/, /researcher/, /coder/, /developer/, /reviewer/, /조사와 구현을 한 워커에 함께 맡기지 않는다/, /cortex-worker/, /cortex_prompt/, /그 턴의 최종 응답을 쓰기 전에/, /프로젝트 상대 경로/, /category: "preferences"/] },
       { name: 'independent-review', mustMatch: [/Verified Facts/, /Open Facts/, /Blockers/, /Minor Notes/, /Verdict/, /ACCEPT/, /NEEDS_FIX/, /P0/] },
       { name: 'plan-run', mustMatch: [/P0/, /C\{k\}-IDEATION/, /C\{k\}-PLAN/, /C\{k\}-PN/, /C\{k\}-R\{k\}/, /C\{k\}-SEED/, /C1-PLAN/, /derived_from/, /memory_graph/, /depth: 8/, /attempt: N\/2/, /01-ideation/, /08-next-direction/] },
     ];
@@ -97,6 +156,13 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
         assert.match(res.data.content, pattern, `Skill "${skill.name}" missing expected pattern ${pattern}`);
       }
     }
+
+    const startJobRes = await registry.callTool('cortex_prompt', { kind: 'skill', name: 'start-job' });
+    assert.ok(startJobRes.data.content.length <= 4500, `start-job/SKILL.md must be <= 4500 chars, got ${startJobRes.data.content.length}`);
+    assert.doesNotMatch(startJobRes.data.content, /\*\*직접 실행\*\*/, 'start-job is L-only and must not repeat old direct-execution routing table');
+
+    const delegateRes = await registry.callTool('cortex_prompt', { kind: 'skill', name: 'delegate' });
+    assert.doesNotMatch(delegateRes.data.content, /로컬 진단/, 'delegate must not assign diagnosis to developer');
 
     // 4. All 8 plan-run step files (01..08)
     const planSteps = [
@@ -123,10 +189,11 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
       assert.ok(stepLines.length >= 20 && stepLines.length <= 55, `Step "${stepName}" expected compact ~25-45 lines, got ${stepLines.length}`);
     }
 
-    // 5. All 3 worker agents
+    // 5. All 4 worker agents
     const expectedAgents = [
       { name: 'coder', mustMatch: [/contract_conflict/, /프리플라이트/] },
-      { name: 'developer', mustMatch: [/DEVELOPMENT_STANDARD/, /contract_conflict/, /실제 실행으로 증명/] },
+      { name: 'developer', mustMatch: [/원인과 고칠 위치가 확정된 뒤/, /DEVELOPMENT_STANDARD/, /contract_conflict/, /전달받은 원인이 실제 코드·관측과 다르거나/, /넓게 조사하지 않고/, /실제 실행으로 증명/] },
+      { name: 'researcher', mustMatch: [/조사 전용 워커/, /읽기/, /비파괴 명령/, /파일을 만들거나 고치지 않고/, /해결책을 구현하지 않는다/, /파일:줄/, /실행한 명령과 출력/, /직접 본 사실과 추론을 구분/, /불확실성/, /물음 자체가 성립하지 않/, /범위 밖을 봐야만/] },
       { name: 'reviewer', mustMatch: [/수정 권한 0/, /Verified Facts/, /Open Facts/, /ACCEPT \(Clean Evaluation\)/] },
     ];
 
@@ -137,6 +204,21 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
       for (const pattern of agent.mustMatch) {
         assert.match(res.data.content, pattern, `Agent "${agent.name}" missing expected pattern ${pattern}`);
       }
+    }
+
+    const devAgentRes = await registry.callTool('cortex_prompt', { kind: 'agent', name: 'developer' });
+    assert.doesNotMatch(devAgentRes.data.content, /로컬 진단/, 'developer.md must not include local diagnosis');
+
+    const researcherLines = (await registry.callTool('cortex_prompt', { kind: 'agent', name: 'researcher' })).data.content.trim().split(/\r?\n/);
+    assert.ok(researcherLines.length >= 20 && researcherLines.length <= 45, `researcher.md expected compact ~25-40 lines, got ${researcherLines.length}`);
+
+    // Prompts must remain model-agnostic (no hardcoded model family names)
+    const promptMdFiles = collectFilesRecursive(path.join(REPO_ROOT, 'prompts')).filter((f) => f.endsWith('.md'));
+    const modelNameRe = /\b(?:Gemini|Opus|Sonnet|Haiku|GPT-?\d|Carbon|Neon)\b/i;
+    for (const absFile of promptMdFiles) {
+      const relFile = path.relative(REPO_ROOT, absFile).replace(/\\/g, '/');
+      const m = fs.readFileSync(absFile, 'utf8').match(modelNameRe);
+      assert.equal(m, null, `${relFile} must not name a specific model (matched "${m?.[0]}")`);
     }
 
     // 6. Subagent can still read prompts via cortex_prompt
@@ -194,6 +276,7 @@ test('cortex_prompt lists available assets, exposes names in tool description, a
         'skill:start-job',
         'agent:coder',
         'agent:developer',
+        'agent:researcher',
         'agent:reviewer',
         'standard:DEVELOPMENT_STANDARD',
         'core:HEAD_CORE',
@@ -203,6 +286,10 @@ test('cortex_prompt lists available assets, exposes names in tool description, a
       assert.equal(typeof asset.description, 'string');
       assert.ok(asset.description.length > 0, `Expected non-empty description for ${asset.kind}:${asset.name}`);
     }
+    const startJobAsset = allRes.data.assets.find((a) => a.kind === 'skill' && a.name === 'start-job');
+    assert.match(startJobAsset.description, /L 작업/);
+    const researcherAsset = allRes.data.assets.find((a) => a.kind === 'agent' && a.name === 'researcher');
+    assert.match(researcherAsset.description, /조사 전용 워커/);
 
     // 2. kind="skill" or kind="agent" without name lists only that kind
     const skillList = await registry.callTool('cortex_prompt', { kind: 'skill' });
@@ -220,7 +307,7 @@ test('cortex_prompt lists available assets, exposes names in tool description, a
     assert.equal(agentList.data.name, '');
     assert.deepEqual(
       agentList.data.assets.map((a) => a.name),
-      ['coder', 'developer', 'reviewer'],
+      ['coder', 'developer', 'researcher', 'reviewer'],
     );
 
     // 3. kind="core" and kind="standard" without name still return content
@@ -277,6 +364,7 @@ test('cortex_prompt lists available assets, exposes names in tool description, a
     const promptTool = registry.listTools().find((t) => t.name === 'cortex_prompt');
     assert.ok(promptTool);
     assert.match(promptTool.description, /start-job/);
+    assert.match(promptTool.description, /researcher/);
     assert.match(promptTool.description, /reviewer/);
   } finally {
     store.close();

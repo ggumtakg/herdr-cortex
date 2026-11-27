@@ -42,4 +42,4 @@ description: 제품 기획 3단계(문제 정의 → 사용자 가치 → 유저
 ## 산출물 고정 및 다음 단계 연결
 
 - 3단계 합의가 끝나면 HEAD가 `memory_save`로 기획 정본(`type: "baseline"` 또는 `type: "decision"`, 기존 기획 대체 시 `supersedes` 지정)을 저장한다.
-- 구현 규모가 단일 경계라면 `start-job` → `delegate`로, 다단계 계획·검수·실행이 필요하면 `plan-run`의 `P0` 기준선으로 연결한다.
+- 구현으로 넘어갈 때는 `HEAD_CORE`의 규모 판정(S/L)을 따르며, L 작업이면 `start-job` 절차에 따라 단일 경계 작업은 `delegate`로, 다단계 계획·검수·실행이 필요하면 `plan-run`의 `P0` 기준선으로 연결한다.
