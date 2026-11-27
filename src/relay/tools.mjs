@@ -12,6 +12,7 @@ import {
   peekInbox,
 } from './inbox.mjs';
 import { isValidTerminalId, listSavedSessions, readSavedSession, validateTerminalId } from '../revive/tracker.mjs';
+import { clearTabDelegation } from '../hooks/work-size.mjs';
 import { isSubagentCaller } from '../mcp/tools.mjs';
 import { isWorkerSession } from '../core/role.mjs';
 
@@ -266,6 +267,11 @@ export function createRelayTools({
           default: 'auto',
           description: 'Wake policy via hc send: auto (only when the target agent is idle or done), always (also while it is working; never into a bare shell, a tab that is not live, or one in an error state), or never',
         },
+        delegate: {
+          type: 'boolean',
+          default: false,
+          description: 'Mark this message as task delegation: when delivered by the target tab\'s hook, that tab is treated as a delegated worker until it replies to the delegating tab via relay_send',
+        },
         from_terminal_id: { type: 'string', description: 'Optional sender terminal ID override' },
       },
     },
@@ -296,9 +302,54 @@ export function createRelayTools({
         };
       }
 
-      const fromTerminalId = typeof args.from_terminal_id === 'string' && args.from_terminal_id.trim()
+      const isDelegate = args.delegate === true;
+      const ownRawTerminalId = getCurrentTerminalId();
+      const explicitFrom = typeof args.from_terminal_id === 'string' && args.from_terminal_id.trim()
         ? validateTerminalId(args.from_terminal_id)
-        : getCurrentTerminalId();
+        : '';
+
+      let fromTerminalId = explicitFrom || ownRawTerminalId;
+      if (isDelegate) {
+        if (!ownRawTerminalId) {
+          return {
+            isError: true,
+            errorCode: 'MISSING_TERMINAL_ID',
+            data: {
+              error: 'MISSING_TERMINAL_ID',
+              tool: 'relay_send',
+              message: 'HC_TERMINAL_ID is not set; relay_send(delegate=true) requires the sender Herdr terminal ID.',
+            },
+          };
+        }
+        const ownTerminalId = validateTerminalId(ownRawTerminalId);
+        if (toTerminalId === ownTerminalId) {
+          return {
+            isError: true,
+            errorCode: 'SELF_DELEGATION',
+            data: {
+              error: 'SELF_DELEGATION',
+              tool: 'relay_send',
+              to_terminal_id: toTerminalId,
+              from_terminal_id: ownTerminalId,
+              message: `Terminal "${ownTerminalId}" cannot delegate a task to itself.`,
+            },
+          };
+        }
+        if (explicitFrom && explicitFrom !== ownTerminalId) {
+          return {
+            isError: true,
+            errorCode: 'INVALID_FROM_TERMINAL_ID',
+            data: {
+              error: 'INVALID_FROM_TERMINAL_ID',
+              tool: 'relay_send',
+              from_terminal_id: explicitFrom,
+              current_terminal_id: ownTerminalId,
+              message: `relay_send(delegate=true) must use the sender tab's own HC_TERMINAL_ID ("${ownTerminalId}"), not "${explicitFrom}".`,
+            },
+          };
+        }
+        fromTerminalId = ownTerminalId;
+      }
 
       const contextDocs = Array.isArray(args.context_docs)
         ? [...new Set(args.context_docs.map((d) => String(d).trim()).filter(Boolean))]
@@ -334,9 +385,19 @@ export function createRelayTools({
           from_terminal_id: fromTerminalId,
           message,
           context_docs: contextDocs,
+          ...(isDelegate ? { delegate: true } : {}),
         },
         { globalDir },
       );
+
+      // When a delegated tab sends results back to the tab that delegated to it, its own delegation ends.
+      if (isValidTerminalId(ownRawTerminalId) && toTerminalId !== ownRawTerminalId) {
+        try {
+          clearTabDelegation(ownRawTerminalId, { onlyFromTerminalId: toTerminalId, globalDir });
+        } catch {
+          // ignore work-size state errors in relay_send
+        }
+      }
 
       const trigger = buildWakeTrigger({
         messageId: enqueued.id,
@@ -399,6 +460,7 @@ export function createRelayTools({
         from_terminal_id: fromTerminalId || null,
         target_project_dir: targetProjectDir,
         context_docs: contextDocs,
+        ...(isDelegate ? { delegate: true } : {}),
         wakeRequested: wake,
         woke,
         wakeReason,

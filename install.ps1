@@ -3,8 +3,8 @@
     Unified herdr-cortex Installer for Windows 11 Herdr GUI (herdr-core / hc):
       - Registers the herdr-cortex Stdio MCP server for Claude Code (through `claude mcp add`) and, when
         Antigravity is present, for Antigravity CLI
-      - Registers official hooks (Claude Code SessionStart/SessionEnd/PreCompact/UserPromptSubmit/PreToolUse/PostToolUse/SubagentStop,
-        Antigravity SessionStart/PreInvocation) with the absolute path of node.exe
+      - Registers official hooks (Claude Code SessionStart/SessionEnd/PreCompact/UserPromptSubmit/PreToolUse/PostToolUse/PostToolUseFailure/SubagentStop,
+        Antigravity SessionStart/PreInvocation/PreToolUse/PostToolUse) with the absolute path of node.exe
       - Installs cortex skills into ~/.claude/skills/cortex-* (when prompts/skills exists)
       - Initializes ~/.herdr-cortex/ (sessions, docs, config.json)
       - Adds a marker-delimited block to the PowerShell profile(s) that provides auto-resume and the commands

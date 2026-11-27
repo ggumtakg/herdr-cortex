@@ -52,6 +52,7 @@ export const WORK_SIZE_DENY_MAX_CHARS = 500;
 export const WORK_SIZE_SESSION_NOTICE_MAX_CHARS = 300;
 export const WORK_SIZE_NOTICE_MAX_CHARS = 300;
 export const WORK_SIZE_SESSION_STALE_MS = 30 * 24 * 60 * 60 * 1000;
+export const WORK_SIZE_DELEGATION_TTL_MS = 24 * 60 * 60 * 1000;
 export const WORK_SIZE_LOCK_STALE_MS = 5000;
 export const WORK_SIZE_LOCK_RETRY_MS = 15;
 export const WORK_SIZE_LOCK_MAX_RETRIES = 20;
@@ -220,24 +221,8 @@ export function resolveWorkSizeProjectRoot({
     }
   }
 
-  if (Array.isArray(workspacePaths) && workspacePaths.length > 0) {
-    const validWorkspaces = workspacePaths
-      .filter((item) => isExistingAbsoluteDirectory(item))
-      .map((item) => resolveProjectRoot(path.resolve(item.trim())));
-    if (validWorkspaces.length > 0) {
-      let bestMatch = null;
-      let bestLen = -1;
-      for (const ws of validWorkspaces) {
-        if (isSameOrSubpath(baseCwd, ws)) {
-          const cmpLen = comparableDirPath(ws).length;
-          if (cmpLen > bestLen) {
-            bestLen = cmpLen;
-            bestMatch = ws;
-          }
-        }
-      }
-      return bestMatch || validWorkspaces[0];
-    }
+  if (Array.isArray(workspacePaths) && workspacePaths.length > 0 && isExistingAbsoluteDirectory(workspacePaths[0])) {
+    return resolveProjectRoot(path.resolve(workspacePaths[0].trim()));
   }
 
   const effectiveScopeState = scopeState !== undefined
@@ -636,6 +621,45 @@ function parseOptionalNonNegInt(rawVal) {
   return Math.floor(rawVal);
 }
 
+function parsePendingNotices(rawList) {
+  if (rawList === undefined || rawList === null) return [];
+  if (!Array.isArray(rawList)) return null;
+  const seen = new Set();
+  const out = [];
+  for (const item of rawList) {
+    if (typeof item !== 'string') return null;
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function parseDelegatedState(rawDelegated) {
+  if (rawDelegated === undefined || rawDelegated === null) return null;
+  if (!isPlainObject(rawDelegated)) return null;
+  const rawFrom = typeof rawDelegated.fromTerminalId === 'string' ? rawDelegated.fromTerminalId.trim() : '';
+  if (rawFrom && !isValidTerminalId(rawFrom)) return null;
+  const delegatedAt = typeof rawDelegated.delegatedAt === 'string' ? rawDelegated.delegatedAt.trim() : '';
+  let delegatedAtMs = Number(rawDelegated.delegatedAtMs);
+  if (!Number.isFinite(delegatedAtMs) || delegatedAtMs <= 0) {
+    const parsedMs = delegatedAt ? Date.parse(delegatedAt) : NaN;
+    if (!Number.isFinite(parsedMs) || parsedMs <= 0) return null;
+    delegatedAtMs = parsedMs;
+  }
+  return {
+    fromTerminalId: rawFrom,
+    delegatedAt: delegatedAt || formatIsoTimestamp(new Date(delegatedAtMs)),
+    delegatedAtMs,
+  };
+}
+
+export function isDelegationActive(delegated, nowMs = Date.now()) {
+  if (!delegated || !Number.isFinite(delegated.delegatedAtMs)) return false;
+  return nowMs - delegated.delegatedAtMs < WORK_SIZE_DELEGATION_TTL_MS;
+}
+
 function parseFolderEntry(raw) {
   if (!isPlainObject(raw)) return null;
   if (raw.size !== 'S' && raw.size !== 'L') return null;
@@ -653,6 +677,9 @@ function parseFolderEntry(raw) {
 
   const unsavedFiles = parseStoredStringList(raw.unsavedFiles);
   if (!unsavedFiles) return null;
+
+  const pendingNotices = parsePendingNotices(raw.pendingNotices);
+  if (!pendingNotices) return null;
 
   const promptTurns = parseOptionalNonNegInt(raw.promptTurns);
   const turnReads = parseOptionalNonNegInt(raw.turnReads);
@@ -685,6 +712,7 @@ function parseFolderEntry(raw) {
       ? raw.memorySavedAt.trim()
       : null,
     completedNoticePending: Boolean(raw.completedNoticePending),
+    pendingNotices,
     updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : '',
   };
 }
@@ -699,7 +727,8 @@ function isCleanEmptyFolderEntry(entry) {
     && !entry.unsavedCommitted
     && (entry.promptTurns || 0) === 0
     && (entry.turnReads || 0) === 0
-    && !entry.completedNoticePending;
+    && !entry.completedNoticePending
+    && (entry.pendingNotices?.length || 0) === 0;
 }
 
 /**
@@ -730,6 +759,7 @@ export function readWorkSizeScopeState(globalDir, scope) {
       scopeKind,
       scopeId,
       updatedAt,
+      delegated: null,
       projects: {
         [single.cwdKey]: single,
       },
@@ -737,6 +767,11 @@ export function readWorkSizeScopeState(globalDir, scope) {
   }
 
   if (parsed.version !== WORK_SIZE_STATE_VERSION || !isPlainObject(parsed.projects)) {
+    return null;
+  }
+
+  const delegated = parsed.delegated !== undefined ? parseDelegatedState(parsed.delegated) : null;
+  if (parsed.delegated !== undefined && parsed.delegated !== null && !delegated) {
     return null;
   }
 
@@ -752,6 +787,7 @@ export function readWorkSizeScopeState(globalDir, scope) {
     scopeKind,
     scopeId,
     updatedAt,
+    delegated,
     projects,
   };
 }
@@ -843,11 +879,22 @@ export function writeWorkSizeScopeState(
     for (const [key, entry] of Object.entries(scopeState.projects)) {
       if (!entry || isCleanEmptyFolderEntry(entry)) continue;
       const cleanKey = typeof entry.cwdKey === 'string' && entry.cwdKey.trim() ? entry.cwdKey.trim() : key;
-      cleanProjects[cleanKey] = entry;
+      const cleanEntry = { ...entry };
+      if (!Array.isArray(cleanEntry.pendingNotices) || cleanEntry.pendingNotices.length === 0) {
+        delete cleanEntry.pendingNotices;
+      }
+      cleanProjects[cleanKey] = cleanEntry;
     }
   }
 
-  const hasEntries = Object.keys(cleanProjects).length > 0;
+  const parsedDelegated = scope.kind === 'tab' && scopeState?.delegated
+    ? parseDelegatedState(scopeState.delegated)
+    : null;
+  const activeDelegated = parsedDelegated && isDelegationActive(parsedDelegated, nowMs)
+    ? parsedDelegated
+    : null;
+
+  const hasEntries = Object.keys(cleanProjects).length > 0 || Boolean(activeDelegated);
   if (!hasEntries) {
     removeQuietly(filePath);
   } else {
@@ -858,6 +905,7 @@ export function writeWorkSizeScopeState(
       updatedAt: (scopeState && typeof scopeState.updatedAt === 'string' && scopeState.updatedAt)
         ? scopeState.updatedAt
         : formatIsoTimestamp(nowDate),
+      ...(activeDelegated ? { delegated: activeDelegated } : {}),
       projects: cleanProjects,
     });
   }
@@ -888,6 +936,7 @@ export function writeWorkSizeState(globalDir, scope, folderState, { now = new Da
       scopeKind: scope.kind,
       scopeId: scope.id,
       updatedAt: folderState?.updatedAt || formatIsoTimestamp(toDate(now)),
+      delegated: existing?.delegated || null,
       projects,
     },
     { now },
@@ -915,8 +964,16 @@ function createFreshFolderState(projectRoot, cwdKey) {
     memorySaved: false,
     memorySavedAt: null,
     completedNoticePending: false,
+    pendingNotices: [],
     updatedAt: '',
   };
+}
+
+function appendUniqueNotice(list, notice) {
+  const trimmed = typeof notice === 'string' ? notice.trim() : '';
+  const existing = Array.isArray(list) ? list : [];
+  if (!trimmed || existing.includes(trimmed)) return existing;
+  return [...existing, trimmed];
 }
 
 function appendTrackedFileOnce(list, relPath) {
@@ -1077,6 +1134,18 @@ export function formatFailedRetryDenyReason({ file, failedCount, escalated = tru
 
 export { formatContractFileDenyReason, formatFileDependencyNotice };
 
+/**
+ * One-line Korean notice appended to a delivered relay message when `delegate: true` marks the
+ * recipient tab as a delegated worker.
+ */
+export function formatDelegatedRelayNotice(fromTerminalId) {
+  const cleanFrom = sanitizeInline(fromTerminalId);
+  if (cleanFrom) {
+    return `[herdr-cortex] 이 탭은 지금 탭 ${cleanFrom}에서 위임받은 워커입니다. 작업이 끝나면 relay_send(to_terminal_id="${cleanFrom}")로 결과를 돌려주세요.`;
+  }
+  return '[herdr-cortex] 이 탭은 지금 릴레이로 위임받은 워커입니다. 작업이 끝나면 맡긴 탭으로 relay_send를 호출해 결과를 돌려주세요.';
+}
+
 function findMatchingFileKey(files, relPath) {
   const targetKey = normalizeTrackedFileKey(relPath);
   for (const existingKey of Object.keys(files || {})) {
@@ -1116,6 +1185,7 @@ export function evaluateWorkSizeEdit({
   loadConfigForRoot,
   isEnabledForRoot,
   dependencyLookupOptions,
+  queueNotice = false,
   lockOptions,
   now = new Date(),
 } = {}) {
@@ -1155,7 +1225,7 @@ export function evaluateWorkSizeEdit({
   const preTracked = resolveTrackedProjectFile(filePath, cwd, { projectRoot: preRoot });
   if (!preTracked) return { action: 'pass', reason: 'outside_or_memory' };
 
-  const escalateIfS = (state, existingProjects, cwdKey, violation, stamp, nowDate) => {
+  const escalateIfS = (state, existingScope, existingProjects, cwdKey, violation, stamp, nowDate) => {
     if (state.size !== 'S') return state;
     const escalated = {
       ...state,
@@ -1177,6 +1247,7 @@ export function evaluateWorkSizeEdit({
         scopeKind: scope.kind,
         scopeId: scope.id,
         updatedAt: stamp,
+        delegated: existingScope?.delegated || null,
         projects: { ...existingProjects, [cwdKey]: escalated },
       },
       { now: nowDate },
@@ -1238,7 +1309,7 @@ export function evaluateWorkSizeEdit({
           maxFailedRetries: workSize.maxFailedRetries,
           summary: `${clipText(fileKey, 64)} 수정 실패 ${formatNumber(failedCount)}회 되풀이`,
         };
-        const nextFolder = escalateIfS(state, existingProjects, cwdKey, violation, stamp, nowDate);
+        const nextFolder = escalateIfS(state, existingScope, existingProjects, cwdKey, violation, stamp, nowDate);
         return {
           action: 'deny',
           denyReason: formatFailedRetryDenyReason({ file: fileKey, failedCount, escalated: wasS }),
@@ -1257,7 +1328,7 @@ export function evaluateWorkSizeEdit({
             pattern: matchedPattern,
             summary: `계약 파일(${clipText(fileKey, 48)}, 패턴: ${clipText(matchedPattern, 40)})`,
           };
-          const nextFolder = escalateIfS(state, existingProjects, cwdKey, violation, stamp, nowDate);
+          const nextFolder = escalateIfS(state, existingScope, existingProjects, cwdKey, violation, stamp, nowDate);
           return {
             action: 'deny',
             denyReason: formatContractFileDenyReason({
@@ -1302,6 +1373,7 @@ export function evaluateWorkSizeEdit({
             scopeKind: scope.kind,
             scopeId: scope.id,
             updatedAt: stamp,
+            delegated: existingScope?.delegated || null,
             projects: { ...existingProjects, [cwdKey]: nextFolder },
           },
           { now: nowDate },
@@ -1328,7 +1400,7 @@ export function evaluateWorkSizeEdit({
         exceedsChars,
       });
 
-      const nextFolder = escalateIfS(state, existingProjects, cwdKey, violation, stamp, nowDate);
+      const nextFolder = escalateIfS(state, existingScope, existingProjects, cwdKey, violation, stamp, nowDate);
       return {
         action: 'deny',
         denyReason: formatWorkSizeDenyReason(violation),
@@ -1366,6 +1438,9 @@ export function evaluateWorkSizeEdit({
     if (depDocs.length > 0) {
       const additionalContext = formatFileDependencyNotice(depDocs);
       if (additionalContext) {
+        if (queueNotice) {
+          queueWorkSizePendingNotice(globalDir, scope, trackedRoot, additionalContext, { lockOptions, now });
+        }
         return {
           ...publicOutcome,
           additionalContext,
@@ -1394,6 +1469,7 @@ export function evaluateWorkSizeRead({
   config = DEFAULT_CONFIG,
   loadConfigForRoot,
   isEnabledForRoot,
+  queueNotice = false,
   lockOptions,
   now = new Date(),
 } = {}) {
@@ -1423,7 +1499,7 @@ export function evaluateWorkSizeRead({
   const hasPerProjectOverrides = isPlainObject(initialCfg?.projects) && Object.keys(initialCfg.projects).length > 0;
   const hasExplicitHostRoot = Boolean(
     (projectDirEnvVar && getEnvValue(env, projectDirEnvVar).trim())
-    || (Array.isArray(workspacePaths) && workspacePaths.length > 0),
+    || (Array.isArray(workspacePaths) && workspacePaths.length > 0 && isExistingAbsoluteDirectory(workspacePaths[0])),
   );
   if (
     (!initialEval.enabled || initialEval.workSize.readNoticeThreshold <= 0)
@@ -1483,12 +1559,16 @@ export function evaluateWorkSizeRead({
 
       const readCount = (state.turnReads || 0) + 1;
       const shouldNotify = readCount > threshold && !state.turnReadNotified;
+      const noticeText = shouldNotify ? formatReadVolumeNotice({ readCount, threshold }) : '';
       const nowDate = toDate(now);
       const stamp = formatIsoTimestamp(nowDate);
       const nextFolder = {
         ...state,
         turnReads: readCount,
         turnReadNotified: state.turnReadNotified || shouldNotify,
+        pendingNotices: queueNotice && noticeText
+          ? appendUniqueNotice(state.pendingNotices, noticeText)
+          : (state.pendingNotices || []),
         updatedAt: stamp,
       };
 
@@ -1500,6 +1580,7 @@ export function evaluateWorkSizeRead({
           scopeKind: scope.kind,
           scopeId: scope.id,
           updatedAt: stamp,
+          delegated: existingScope?.delegated || null,
           projects: { ...existingProjects, [cwdKey]: nextFolder },
         },
         { now: nowDate, skipPruneSessions: true },
@@ -1509,7 +1590,7 @@ export function evaluateWorkSizeRead({
         action: 'allow',
         readCount,
         notified: shouldNotify,
-        additionalContext: shouldNotify ? formatReadVolumeNotice({ readCount, threshold }) : '',
+        additionalContext: noticeText,
         state: { version: WORK_SIZE_STATE_VERSION, scopeKind: scope.kind, scopeId: scope.id, ...nextFolder },
       };
     },
@@ -1674,6 +1755,7 @@ export function recordShellResultForWorkSize({
               scopeKind: scope.kind,
               scopeId: scope.id,
               updatedAt: stamp,
+              delegated: existingScope?.delegated || null,
               projects: { ...existingProjects, [cwdKey]: clearedEntry },
             },
             { now: nowDate },
@@ -1700,6 +1782,7 @@ export function recordShellResultForWorkSize({
             scopeKind: scope.kind,
             scopeId: scope.id,
             updatedAt: stamp,
+            delegated: existingScope?.delegated || null,
             projects: { ...existingProjects, [cwdKey]: nextEntry },
           },
           { now: nowDate },
@@ -1726,6 +1809,7 @@ export function recordShellResultForWorkSize({
             scopeKind: scope.kind,
             scopeId: scope.id,
             updatedAt: stamp,
+            delegated: existingScope?.delegated || null,
             projects: { ...existingProjects, [cwdKey]: nextEntry },
           },
           { now: nowDate },
@@ -1754,6 +1838,7 @@ export function recordShellResultForWorkSize({
           scopeKind: scope.kind,
           scopeId: scope.id,
           updatedAt: stamp,
+          delegated: existingScope?.delegated || null,
           projects: { ...existingProjects, [cwdKey]: nextEntry },
         },
         { now: nowDate },
@@ -1871,6 +1956,7 @@ export function recordGitCommitForWorkSize({
           scopeKind: scope.kind,
           scopeId: scope.id,
           updatedAt: stamp,
+          delegated: existingScope?.delegated || null,
           projects: { ...existingProjects, [cwdKey]: nextEntry },
         },
         { now: nowDate },
@@ -2374,6 +2460,7 @@ export function evaluateWorkSizePrompt({
           scopeKind: scope.kind,
           scopeId: scope.id,
           updatedAt: stamp,
+          delegated: existingScope?.delegated || null,
           projects: { ...existingProjects, [cwdKey]: stateAfterConsume },
         },
         { now: nowDate },
@@ -2391,6 +2478,325 @@ export function evaluateWorkSizePrompt({
   );
 
   return lockedResult.locked ? lockedResult.value : empty;
+}
+
+function queueWorkSizePendingNotice(
+  globalDir,
+  scope,
+  projectRoot,
+  noticeText,
+  { lockOptions, now = new Date() } = {},
+) {
+  const cleanNotice = typeof noticeText === 'string' ? noticeText.trim() : '';
+  if (!scope || !cleanNotice) return false;
+  const lockedResult = withWorkSizeScopeLock(
+    globalDir,
+    scope,
+    () => {
+      const existingScope = readWorkSizeScopeState(globalDir, scope);
+      const cwdKey = projectPathKey(projectRoot);
+      const existingProjects = existingScope ? existingScope.projects : {};
+      const base = existingProjects[cwdKey] || createFreshFolderState(projectRoot, cwdKey);
+      const nowDate = toDate(now);
+      const stamp = formatIsoTimestamp(nowDate);
+      const nextEntry = {
+        ...base,
+        pendingNotices: appendUniqueNotice(base.pendingNotices, cleanNotice),
+        updatedAt: stamp,
+      };
+      writeWorkSizeScopeState(
+        globalDir,
+        scope,
+        {
+          version: WORK_SIZE_STATE_VERSION,
+          scopeKind: scope.kind,
+          scopeId: scope.id,
+          updatedAt: stamp,
+          delegated: existingScope?.delegated || null,
+          projects: { ...existingProjects, [cwdKey]: nextEntry },
+        },
+        { now: nowDate, skipPruneSessions: true },
+      );
+      return true;
+    },
+    lockOptions,
+  );
+  return Boolean(lockedResult.locked && lockedResult.value);
+}
+
+/**
+ * Consume pending non-blocking notices queued during tool calls (read-volume notice, file-dependency
+ * notice, and any pending L-completion notice not yet consumed) for hosts like Antigravity whose
+ * `PreToolUse` output cannot attach model-only context. Returns the notices that fit within `maxChars`
+ * and clears them from disk.
+ */
+export function consumeWorkSizePendingNotices({
+  cwd = process.cwd(),
+  env,
+  projectDirEnvVar = '',
+  workspacePaths,
+  globalDir,
+  terminalId,
+  sessionId,
+  config = DEFAULT_CONFIG,
+  loadConfigForRoot,
+  isEnabledForRoot,
+  maxChars = Infinity,
+  includeCompleted = true,
+  lockOptions,
+  now = new Date(),
+} = {}) {
+  if (maxChars <= 0) return [];
+  const scope = resolveWorkSizeScope({ terminalId, sessionId });
+  if (!scope) return [];
+
+  try {
+    const statePath = getWorkSizeStatePath(globalDir, scope);
+    if (!fs.existsSync(statePath)) return [];
+  } catch {
+    return [];
+  }
+
+  const quickScope = readWorkSizeScopeState(globalDir, scope);
+  if (!quickScope) return [];
+  const quickRoot = resolveWorkSizeProjectRoot({
+    cwd,
+    env,
+    projectDirEnvVar,
+    workspacePaths,
+    scopeState: quickScope,
+  });
+  const quickEntry = quickScope.projects[projectPathKey(quickRoot)];
+  if (!quickEntry) return [];
+  const hasQueued = (quickEntry.pendingNotices?.length || 0) > 0
+    || (includeCompleted && quickEntry.completedNoticePending);
+  if (!hasQueued) return [];
+
+  const evalCfg = evaluateConfigForRoot(quickRoot, {
+    loadConfigForRoot,
+    isEnabledForRoot,
+    fallbackConfig: config,
+  });
+  if (!evalCfg.enabled) return [];
+
+  const lockedResult = withWorkSizeScopeLock(
+    globalDir,
+    scope,
+    () => {
+      const existingScope = readWorkSizeScopeState(globalDir, scope);
+      if (!existingScope) return [];
+      const projectRoot = resolveWorkSizeProjectRoot({
+        cwd,
+        env,
+        projectDirEnvVar,
+        workspacePaths,
+        scopeState: existingScope,
+      });
+      const cwdKey = projectPathKey(projectRoot);
+      const existing = existingScope.projects[cwdKey];
+      if (!existing) return [];
+
+      const candidates = [];
+      if (includeCompleted && existing.completedNoticePending) {
+        candidates.push({ kind: 'completed', text: WORK_SIZE_COMPLETED_NOTICE });
+      }
+      for (const item of existing.pendingNotices || []) {
+        candidates.push({ kind: 'pending', text: item });
+      }
+      if (candidates.length === 0) return [];
+
+      const emitted = [];
+      const remainingPending = [];
+      let keepCompleted = Boolean(existing.completedNoticePending);
+      let used = 0;
+
+      for (const item of candidates) {
+        if (used + item.text.length <= maxChars) {
+          emitted.push(item.text);
+          used += item.text.length;
+          if (item.kind === 'completed') keepCompleted = false;
+        } else if (item.kind === 'pending') {
+          remainingPending.push(item.text);
+        }
+      }
+
+      if (emitted.length === 0) return [];
+
+      const nowDate = toDate(now);
+      const stamp = formatIsoTimestamp(nowDate);
+      const nextEntry = {
+        ...existing,
+        completedNoticePending: keepCompleted,
+        pendingNotices: remainingPending,
+        updatedAt: stamp,
+      };
+      writeWorkSizeScopeState(
+        globalDir,
+        scope,
+        {
+          ...existingScope,
+          updatedAt: stamp,
+          projects: { ...existingScope.projects, [cwdKey]: nextEntry },
+        },
+        { now: nowDate, skipPruneSessions: true },
+      );
+      return emitted;
+    },
+    lockOptions,
+  );
+
+  return lockedResult.locked ? lockedResult.value : [];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Relay delegation state (2-2: tab-scoped delegated worker marker)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Return the active delegation info for `terminalId` (`{ fromTerminalId, delegatedAt, delegatedAtMs, remainingMs }`),
+ * or `null` when not delegated or when the 24-hour TTL has elapsed.
+ */
+export function getTabDelegation(terminalId, { globalDir, now = new Date() } = {}) {
+  if (!isValidTerminalId(terminalId)) return null;
+  const scope = tabWorkSizeScope(terminalId);
+  const scopeState = readWorkSizeScopeState(globalDir, scope);
+  if (!scopeState?.delegated) return null;
+  if (scopeState.delegated.fromTerminalId && scopeState.delegated.fromTerminalId === scope.id) return null;
+  const nowMs = toEpochMs(now);
+  if (!isDelegationActive(scopeState.delegated, nowMs)) return null;
+  const elapsed = Math.max(0, nowMs - scopeState.delegated.delegatedAtMs);
+  return {
+    fromTerminalId: scopeState.delegated.fromTerminalId,
+    delegatedAt: scopeState.delegated.delegatedAt,
+    delegatedAtMs: scopeState.delegated.delegatedAtMs,
+    remainingMs: Math.max(0, WORK_SIZE_DELEGATION_TTL_MS - elapsed),
+  };
+}
+
+/**
+ * Record that `terminalId` received a `delegate: true` relay message from `fromTerminalId`.
+ * Refuses self-delegation (`fromTerminalId === terminalId`) and preserves all existing per-folder
+ * `projects` state (including any pre-existing `L` state and counts).
+ */
+export function recordTabDelegation(
+  terminalId,
+  {
+    fromTerminalId = '',
+    globalDir,
+    lockOptions,
+    now = new Date(),
+  } = {},
+) {
+  if (!isValidTerminalId(terminalId)) return { changed: false, delegated: null };
+  const scope = tabWorkSizeScope(terminalId);
+  const cleanFrom = typeof fromTerminalId === 'string' && isValidTerminalId(fromTerminalId.trim())
+    ? fromTerminalId.trim()
+    : '';
+  if (cleanFrom && cleanFrom === scope.id) {
+    return { changed: false, delegated: null };
+  }
+  const nowDate = toDate(now);
+  const nowMs = nowDate.getTime();
+  const stamp = formatIsoTimestamp(nowDate);
+  const delegated = {
+    fromTerminalId: cleanFrom,
+    delegatedAt: stamp,
+    delegatedAtMs: nowMs,
+  };
+
+  const lockedResult = withWorkSizeScopeLock(
+    globalDir,
+    scope,
+    () => {
+      const existingScope = readWorkSizeScopeState(globalDir, scope);
+      writeWorkSizeScopeState(
+        globalDir,
+        scope,
+        {
+          version: WORK_SIZE_STATE_VERSION,
+          scopeKind: scope.kind,
+          scopeId: scope.id,
+          updatedAt: stamp,
+          delegated,
+          projects: existingScope ? existingScope.projects : {},
+        },
+        { now: nowDate, skipPruneSessions: true },
+      );
+      return { changed: true, delegated };
+    },
+    lockOptions,
+  );
+
+  return lockedResult.locked ? lockedResult.value : { changed: false, delegated: null };
+}
+
+/**
+ * Clear relay delegation on `terminalId` while preserving all per-folder `projects` state (existing `L`
+ * state and cumulative edit counts stay intact and take effect again immediately).
+ * When `onlyFromTerminalId` is given (e.g. `relay_send` to `to_terminal_id`), clears delegation only if
+ * `delegated.fromTerminalId` matches `onlyFromTerminalId` (or was empty).
+ */
+export function clearTabDelegation(
+  terminalId,
+  {
+    onlyFromTerminalId = undefined,
+    globalDir,
+    lockOptions,
+    now = new Date(),
+  } = {},
+) {
+  if (!isValidTerminalId(terminalId)) return { changed: false };
+  const scope = tabWorkSizeScope(terminalId);
+  try {
+    const filePath = getWorkSizeStatePath(globalDir, scope);
+    if (!fs.existsSync(filePath)) return { changed: false };
+  } catch {
+    return { changed: false };
+  }
+
+  const quickScope = readWorkSizeScopeState(globalDir, scope);
+  if (!quickScope?.delegated) return { changed: false };
+  if (
+    typeof onlyFromTerminalId === 'string'
+    && quickScope.delegated.fromTerminalId
+    && quickScope.delegated.fromTerminalId !== onlyFromTerminalId.trim()
+  ) {
+    return { changed: false };
+  }
+
+  const lockedResult = withWorkSizeScopeLock(
+    globalDir,
+    scope,
+    () => {
+      const existingScope = readWorkSizeScopeState(globalDir, scope);
+      if (!existingScope?.delegated) return { changed: false };
+      if (
+        typeof onlyFromTerminalId === 'string'
+        && existingScope.delegated.fromTerminalId
+        && existingScope.delegated.fromTerminalId !== onlyFromTerminalId.trim()
+      ) {
+        return { changed: false };
+      }
+      const nowDate = toDate(now);
+      const nowMs = nowDate.getTime();
+      const wasActive = isDelegationActive(existingScope.delegated, nowMs);
+      const stamp = formatIsoTimestamp(nowDate);
+      writeWorkSizeScopeState(
+        globalDir,
+        scope,
+        {
+          ...existingScope,
+          updatedAt: stamp,
+          delegated: null,
+        },
+        { now: nowDate, skipPruneSessions: true },
+      );
+      return { changed: wasActive, clearedFrom: existingScope.delegated.fromTerminalId };
+    },
+    lockOptions,
+  );
+
+  return lockedResult.locked ? lockedResult.value : { changed: false };
 }
 
 /**
@@ -2506,6 +2912,7 @@ export function releaseWorkSizeForTab(
       previousSize: 'S',
       size: 'S',
       changed: false,
+      releasedDelegation: false,
       releasedFolders: [],
       otherLFolders: [],
       state: null,
@@ -2518,11 +2925,14 @@ export function releaseWorkSizeForTab(
     () => {
       const existingScope = readWorkSizeScopeState(globalDir, scope);
       const nowDate = toDate(now);
+      const nowMs = nowDate.getTime();
       const stamp = formatIsoTimestamp(nowDate);
+      const hadRawDelegated = Boolean(existingScope?.delegated);
+      const hadActiveDelegated = Boolean(existingScope?.delegated && isDelegationActive(existingScope.delegated, nowMs));
 
       if (all) {
         const entries = existingScope ? Object.values(existingScope.projects) : [];
-        if (entries.length === 0) {
+        if (entries.length === 0 && !hadRawDelegated) {
           return {
             terminalId: scope.id,
             filePath,
@@ -2531,6 +2941,7 @@ export function releaseWorkSizeForTab(
             previousSize: 'S',
             size: 'S',
             changed: false,
+            releasedDelegation: false,
             releasedFolders: [],
             otherLFolders: [],
             state: null,
@@ -2546,6 +2957,7 @@ export function releaseWorkSizeForTab(
             scopeKind: scope.kind,
             scopeId: scope.id,
             updatedAt: stamp,
+            delegated: null,
             projects: {},
           },
           { now: nowDate },
@@ -2557,7 +2969,8 @@ export function releaseWorkSizeForTab(
           cwd: null,
           previousSize: hadL ? 'L' : 'S',
           size: 'S',
-          changed: true,
+          changed: entries.length > 0 || hadActiveDelegated,
+          releasedDelegation: hadActiveDelegated,
           releasedFolders,
           otherLFolders: [],
           state: null,
@@ -2573,7 +2986,7 @@ export function releaseWorkSizeForTab(
             .map((entry) => entry.cwd)
             .sort((a, b) => a.localeCompare(b))
         : [];
-      if (!existing) {
+      if (!existing && !hadRawDelegated) {
         return {
           terminalId: scope.id,
           filePath,
@@ -2582,20 +2995,22 @@ export function releaseWorkSizeForTab(
           previousSize: 'S',
           size: 'S',
           changed: false,
+          releasedDelegation: false,
           releasedFolders: [],
           otherLFolders,
           state: null,
         };
       }
 
-      const nextProjects = { ...existingScope.projects };
-      delete nextProjects[targetKey];
+      const nextProjects = existingScope ? { ...existingScope.projects } : {};
+      if (existing) delete nextProjects[targetKey];
       writeWorkSizeScopeState(
         globalDir,
         scope,
         {
-          ...existingScope,
+          ...(existingScope || { version: WORK_SIZE_STATE_VERSION, scopeKind: scope.kind, scopeId: scope.id }),
           updatedAt: stamp,
+          delegated: null,
           projects: nextProjects,
         },
         { now: nowDate },
@@ -2605,11 +3020,12 @@ export function releaseWorkSizeForTab(
         terminalId: scope.id,
         filePath,
         all: false,
-        cwd: existing.cwd,
-        previousSize: existing.size,
+        cwd: existing ? existing.cwd : targetRoot,
+        previousSize: existing ? existing.size : 'S',
         size: 'S',
-        changed: true,
-        releasedFolders: [existing.cwd],
+        changed: Boolean(existing) || hadActiveDelegated,
+        releasedDelegation: hadActiveDelegated,
+        releasedFolders: existing ? [existing.cwd] : [],
         otherLFolders,
         state: null,
       };
@@ -2808,7 +3224,7 @@ export function resetWorkSizeWindowForTab(
   return lockedResult.value;
 }
 
-export function listTabWorkSizeStates(globalDir) {
+export function listTabWorkSizeStates(globalDir, { now = new Date() } = {}) {
   const dir = getWorkSizeDir(globalDir);
   let entries;
   try {
@@ -2816,14 +3232,20 @@ export function listTabWorkSizeStates(globalDir) {
   } catch {
     return [];
   }
+  const nowMs = toEpochMs(now);
   const out = [];
   for (const ent of entries) {
     if (!ent.isFile() || !ent.name.startsWith('tab-') || !ent.name.endsWith('.json')) continue;
     const tid = ent.name.slice(4, -5);
     if (!isValidTerminalId(tid)) continue;
     const scopeState = readWorkSizeScopeState(globalDir, { kind: 'tab', id: tid, fileName: ent.name });
-    if (scopeState && Object.keys(scopeState.projects).length > 0) {
-      out.push(scopeState);
+    if (!scopeState) continue;
+    const hasActiveDelegation = Boolean(scopeState.delegated && isDelegationActive(scopeState.delegated, nowMs));
+    if (Object.keys(scopeState.projects).length > 0 || hasActiveDelegation) {
+      out.push({
+        ...scopeState,
+        delegated: hasActiveDelegation ? scopeState.delegated : null,
+      });
     }
   }
   return out.sort((a, b) => a.scopeId.localeCompare(b.scopeId));

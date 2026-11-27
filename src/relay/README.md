@@ -18,7 +18,7 @@ Herdr에 열려 있는 여러 Claude Code / Antigravity CLI 탭이 서로 메시
 | 파일 | 역할 | Export |
 | :--- | :--- | :--- |
 | **`hc.mjs`** | `hc` 실행 파일을 PATH에서 찾아 절대 경로로만 실행하는 클라이언트(`hc ls --json`, `hc get <탭> --json`, `hc send`), 탭 주소 해석, 탭 상태 판정, `hc` 오류 분류, 깨우기 알림을 한 줄로 다듬기 | `HC_STATUS_STATES`, `HC_BLOCKED_KINDS`, `MAX_WAKE_TRIGGER_CHARS`, `sanitizeSingleLineTrigger`, `parseTerminalAddress`, `detectTerminalActivity`, `HC_EXIT_BLOCKED`, `HC_TARGET_ERROR_CODES`, `resolveHcExecutable`, `createHcClient` |
-| **`inbox.mjs`** | 받은편지함: 메시지 저장, 탭별 잠금, 옛 위치의 메시지 옮기기, 훅 주입용 글 만들기, 긴 메시지 알림, 전달된 메시지 보관과 삭제 | `INBOX_LOCK_FILE`, `INBOX_DELIVERED_DIR`, `INBOX_DELIVERED_RETENTION_MS`, `describeRetention`, `DEFAULT_INBOX_STALE_MS`, `INBOX_PREVIEW_MAX_CHARS`, `defaultIsPidAlive`, `getInboxRootDir`, `getTerminalInboxDir`, `getLegacyProjectInboxDir`, `enqueueMessage`, `countPendingMessages`, `countInboxMessages`, `deleteHeldMessages`, `drainInbox`, `peekInbox`, `ackMessage`, `formatLongMessageNotice`, `formatInboxForHookDetailed`, `formatInboxForHook`, `deliverInboxForHook` |
+| **`inbox.mjs`** | 받은편지함: 메시지 저장(`delegate` 위임 표시 포함), 탭별 잠금, 옛 위치의 메시지 옮기기, 훅 주입용 글 만들기와 위임 상태 기록, 긴 메시지 알림, 전달된 메시지 보관과 삭제 | `INBOX_LOCK_FILE`, `INBOX_DELIVERED_DIR`, `INBOX_DELIVERED_RETENTION_MS`, `describeRetention`, `DEFAULT_INBOX_STALE_MS`, `INBOX_PREVIEW_MAX_CHARS`, `defaultIsPidAlive`, `getInboxRootDir`, `getTerminalInboxDir`, `getLegacyProjectInboxDir`, `enqueueMessage`, `countPendingMessages`, `hasPendingDelegatedMessage`, `countInboxMessages`, `deleteHeldMessages`, `drainInbox`, `peekInbox`, `ackMessage`, `formatLongMessageNotice`, `formatInboxForHookDetailed`, `formatInboxForHook`, `deliverInboxForHook` |
 | **`tools.mjs`** | MCP 도구 3개(`relay_tabs`, `relay_send`, `relay_inbox`)의 정의. [`src/mcp/`](../mcp/README.md)의 서버가 자기 레지스트리에 등록합니다 | `SEND_REFUSED_WAKE_REASONS`, `createRelayTools` |
 
 ---
@@ -139,7 +139,7 @@ Windows에서 프로그램을 이름만으로 실행하면 PATH보다 현재 폴
     .delivered/                          훅이 전문을 주입한 메시지 (INBOX_DELIVERED_DIR)
 ```
 
-메시지 파일의 내용은 `id`, `from_terminal_id`, `to_terminal_id`, `message`, `context_docs`, `created_at`이고, 훅이 처리하면서 `announced_at`이나 `delivered_at`을 덧붙입니다. 파일 이름이 시각으로 시작하므로 이름순이 곧 보낸 순서입니다. 파일은 임시 파일에 쓴 뒤 이름을 바꾸는 방식으로 저장합니다.
+메시지 파일의 내용은 `id`, `from_terminal_id`, `to_terminal_id`, `message`, `context_docs`, `created_at`(그리고 `delegate: true`로 보냈을 때만 `delegate: true`)이고, 훅이 처리하면서 `announced_at`이나 `delivered_at`을 덧붙입니다. 파일 이름이 시각으로 시작하므로 이름순이 곧 보낸 순서입니다. 파일은 임시 파일에 쓴 뒤 이름을 바꾸는 방식으로 저장합니다.
 
 JSON이 아니거나 문자열 `message`가 없는 파일은 `.broken/`으로 옮기고 나머지 메시지를 계속 처리합니다. 그 순간에 읽기만 실패한 파일은 그대로 두고 다음에 다시 읽습니다.
 
@@ -184,6 +184,7 @@ Context docs: [[decision-20261123-api]]
 - 보낸 탭·시각·문서 ID 같은 부가 정보는 한 줄로 다듬어 출력하고, 본문은 모든 줄 앞에 `> `를 붙여 인용합니다. 메시지 안의 글이 제목이나 다른 메시지처럼 보이지 않게 하기 위해서입니다.
 - 메시지는 보낸 순서대로 넣습니다. 혼자서는 한 번의 주입 분량에 들어가지만 지금 남은 자리에는 안 들어가는 메시지는 다음 프롬프트로 미루며, 순서를 지키기 위해 그 뒤의 메시지도 함께 미룹니다. 미룬 것이 있으면 마지막 줄의 안내가 붙습니다.
 - 돌려주는 글은 항상 `maxChars`자 이하입니다.
+- 전달(전문 주입 또는 긴 메시지 알림)된 메시지 가운데 **보낸 탭이 받는 탭 자신이 아닌** `delegate: true` 메시지가 있으면 그 순간 받는 탭의 작업 규모 상태(`<전역>/state/work-size/tab-<탭 ID>.json`)에 `delegated`(맡긴 탭 ID·시각)를 기록하고, 전달된 글 끝에 이 탭이 지금 위임받은 워커이며 끝나면 맡긴 탭으로 `relay_send`를 호출해 결과를 돌려주라는 안내 한 줄(`formatDelegatedRelayNotice`, `maxChars` 예산 안)을 붙입니다. 받은편지함에 보낸 탭이 받는 탭 자신인 `delegate: true` 메시지가 들어 있더라도 위임받음으로 기록하지 않고 일반 메시지로만 전달합니다.
 
 ### 긴 메시지: 한 번 알리고 전문은 보관
 
@@ -296,15 +297,17 @@ Context docs: [[decision-20261123-api]]
 | `message` (필수) | 문자열 | | 본문. 길이 제한 없음. 비어 있으면 `EMPTY_MESSAGE` |
 | `context_docs` | 문자열 배열 | `[]` | 받는 쪽이 참고할 기억 문서 ID. 중복은 하나로 합칩니다. 문서가 실제로 있는지는 확인하지 않습니다 |
 | `wake` | `auto` \| `always` \| `never` | `auto` | 깨우기 방침. 다른 값은 `INVALID_WAKE` |
-| `from_terminal_id` | 문자열 | 이 서버의 `HC_TERMINAL_ID` | 보낸 탭 ID를 직접 지정 |
+| `delegate` | 불리언 | `false` | `true`이면 일을 맡기는 메시지로 기록합니다(서버의 `HC_TERMINAL_ID`가 필수이며, 자기 탭 대상이면 `SELF_DELEGATION`, `from_terminal_id`가 `HC_TERMINAL_ID`와 다르면 `INVALID_FROM_TERMINAL_ID`로 거부). 받는 탭의 훅이 이 메시지를 전달하면 받는 탭은 작업 규모에서 워커로 다뤄지며(기존 `L`과 누적은 보존), 맡긴 탭으로 `relay_send`를 돌려보내거나 24시간 경과·새 세션(`/clear`, `startup`, 새 대화) 시 위임이 끝나 기존 상태가 복원됩니다(`cortex-work release`는 위임과 함께 그 폴더의 `L`도 지움) |
+| `from_terminal_id` | 문자열 | 이 서버의 `HC_TERMINAL_ID` | 보낸 탭 ID를 직접 지정(`delegate: true`일 때는 서버의 `HC_TERMINAL_ID`와 같아야 함) |
 
 처리 순서:
 
 1. 현재 프로젝트가 제외돼 있으면 `PROJECT_EXCLUDED`.
 2. `to_terminal_id`가 다른 PC의 주소면 `REMOTE_TERMINAL_UNSUPPORTED`.
-3. `hc get`으로 받는 탭을 조회합니다. 받는 탭의 작업 폴더(`hc get`의 값 → 저장된 세션의 폴더 → 현재 프로젝트 순서로 정함)가 제외된 프로젝트이면 `TARGET_PROJECT_EXCLUDED`이고 아무것도 저장하지 않습니다. 이 폴더는 이 검사에만 쓰이며 거기에 쓰는 것은 없습니다.
-4. 메시지를 받은편지함에 저장합니다.
-5. `wake`와 탭의 상태에 따라 깨우기 알림을 보냅니다.
+3. `delegate: true`이면 서버 프로세스의 `HC_TERMINAL_ID`로 보내는 탭을 확인합니다: `HC_TERMINAL_ID`가 없으면 `MISSING_TERMINAL_ID`, 받는 탭이 자기 탭 자신이면 `SELF_DELEGATION`, `from_terminal_id` 인자가 `HC_TERMINAL_ID`와 다르면 `INVALID_FROM_TERMINAL_ID`로 거부하고 아무것도 저장하지 않습니다(`delegate`가 없는 일반 메시지는 기존대로 자기 탭 전송과 `from_terminal_id` 지정을 허용).
+4. `hc get`으로 받는 탭을 조회합니다. 받는 탭의 작업 폴더(`hc get`의 값 → 저장된 세션의 폴더 → 현재 프로젝트 순서로 정함)가 제외된 프로젝트이면 `TARGET_PROJECT_EXCLUDED`이고 아무것도 저장하지 않습니다. 이 폴더는 이 검사에만 쓰이며 거기에 쓰는 것은 없습니다.
+5. 메시지를 받은편지함에 저장합니다(`delegate: true`이면 함께 기록). 이 탭이 다른 탭(맡긴 탭)으로 결과를 돌려보내는 `relay_send`이면 자기 탭의 `delegated` 위임 상태를 지웁니다.
+6. `wake`와 탭의 상태에 따라 깨우기 알림을 보냅니다.
 
 받는 탭이 실제로 있는지는 확인하지 않습니다. 형식이 맞는 ID면 메시지는 저장되고, 탭을 찾지 못한 사실은 깨우기를 시도했을 때의 `wakeReason: "hc_unavailable"`로만 드러납니다.
 
@@ -391,7 +394,9 @@ Another process is delivering this terminal's messages right now; nothing was ac
 | `SUBAGENT_WRITE_DENIED` | `relay_send`, `relay_inbox`의 `ack` | 서브에이전트로 판정된 호출 또는 워커 세션(`HERDR_CORTEX_ROLE=worker`) |
 | `EMPTY_MESSAGE` | `relay_send` | `message`가 비었거나 공백뿐임 |
 | `INVALID_WAKE` | `relay_send` | `wake`가 `auto`, `always`, `never`가 아님 |
-| `MISSING_TERMINAL_ID` | `relay_inbox` | `HC_TERMINAL_ID`도 `terminal_id`도 없음 |
+| `SELF_DELEGATION` | `relay_send` | `delegate: true`인데 받는 탭(`to_terminal_id`)이 보내는 탭(`HC_TERMINAL_ID`) 자신임 |
+| `INVALID_FROM_TERMINAL_ID` | `relay_send` | `delegate: true`인데 `from_terminal_id`가 서버의 `HC_TERMINAL_ID`와 다름 |
+| `MISSING_TERMINAL_ID` | `relay_send`, `relay_inbox` | `relay_send(delegate: true)`에 서버 `HC_TERMINAL_ID`가 없거나, `relay_inbox`에 `HC_TERMINAL_ID`도 `terminal_id`도 없음 |
 | `MISSING_MESSAGE_ID` | `relay_inbox`의 `ack` | `message_id`가 없음 |
 | `INVALID_ACTION` | `relay_inbox` | `action`이 `peek`, `ack`가 아님 |
 | `UNKNOWN_ARGUMENT` | 셋 모두 | 스키마에 없는 인자(레지스트리가 검사) |

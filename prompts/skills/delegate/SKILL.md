@@ -36,7 +36,7 @@ description: 경계가 확정된 단일 작업을 워커(researcher/coder/develo
 
 ## 3단계: 실행 격리 및 `contract_conflict` Fail-Closed 처리
 
-- 호스트 네이티브 서브에이전트, 다른 모델을 헤드리스로 띄우는 `cortex-worker` 명령(전체 사용법과 `--allow` 권한 지정은 `cortex_prompt(kind: "skill", name: "start-job")` 참조), 또는 유휴 Herdr 탭(`relay_tabs`로 조회한 뒤 `relay_send(to_terminal_id, message, context_docs, wake)`로 전달) 중 하나로 실행한다.
+- 호스트 네이티브 서브에이전트, 다른 모델을 헤드리스로 띄우는 `cortex-worker` 명령(전체 사용법과 `--allow` 권한 지정은 `cortex_prompt(kind: "skill", name: "start-job")` 참조), 또는 유휴 Herdr 탭(`relay_tabs`로 조회한 뒤 `relay_send(to_terminal_id, message, context_docs, wake, delegate: true)`로 전달하며, 받은 탭은 결과를 맡긴 탭으로 `relay_send`로 돌려주면 위임이 끝난다) 중 하나로 실행한다.
 - 워커가 작업 중 **전달받은 원인의 불일치, 명세 모호성, 기존 계약 충돌, 소유 경계 밖 수정 필요, 물음 전제 불성립**을 확인하면 임의로 추측 수정하지 않고 즉시 **`contract_conflict`**(조사 워커는 전제·범위 한계 보고)로 중단해 관측 사실과 근거 위치를 HEAD에 반환한다.
 - HEAD는 이를 받으면 원래 문제와 계약을 다시 맞추고, 필요 시 추가 조사나 사용자 확인을 거친 뒤 수정된 Entry Contract로 새 위임을 발행한다.
 

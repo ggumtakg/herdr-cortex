@@ -14,6 +14,9 @@ import {
   isProjectEnabled,
   isProjectTrusted,
   loadConfig,
+  projectPathKey,
+  resolveProjectRoot,
+  resolveWorkSizeConfig,
 } from '../core/config.mjs';
 import { HEAD_CORE_MAX_CHARS, fitOverviewToBudget, resolveHookBudget } from '../core/budget.mjs';
 import { isWorkerSession } from '../core/role.mjs';
@@ -32,18 +35,82 @@ import {
   recordSession,
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
-import { deliverInboxForHook } from '../relay/inbox.mjs';
+import { deliverInboxForHook, hasPendingDelegatedMessage } from '../relay/inbox.mjs';
 import { EMPTY_MEMORY_NOTICE, formatUnindexedNotice, loadHookOverview, resolveHookSyncOptions } from './overview.mjs';
 import { checkApprovalsForSession, pruneApprovalCheckRecords } from './approvals-watch.mjs';
+import {
+  createShellInspectionBudget,
+  formatConfirmCommandAskReason,
+  formatConfirmCommandDenyReason,
+  inspectConfirmableShellCommand,
+} from './confirm-commands.mjs';
 import {
   DEFAULT_MAX_TAIL_BYTES,
   extractAntigravityState,
   formatRecentTurns,
   resolveAntigravityTranscriptPath,
 } from './recent-turns.mjs';
-import { buildCompactInstruction, restoreFailureNote } from './claude.mjs';
+import {
+  ANTIGRAVITY_FILE_READ_TOOL_NAMES,
+  ANTIGRAVITY_FILE_WRITE_TOOL_NAMES,
+  ANTIGRAVITY_SHELL_TOOL_NAMES,
+  resolveAntigravityCortexTool,
+} from './tool-names.mjs';
+import {
+  clearTabDelegation,
+  consumeWorkSizePendingNotices,
+  evaluateWorkSizeEdit,
+  evaluateWorkSizePrompt,
+  evaluateWorkSizeRead,
+  getTabDelegation,
+  getWorkSizeSessionNotice,
+  isPathInsideMemoryDir,
+  recordMemorySaveForWorkSize,
+  recordShellResultForWorkSize,
+  resetWorkSizeTurnCountersOnSessionStart,
+  resolveWorkSizeProjectRoot,
+  resolveWorkSizeScope,
+} from './work-size.mjs';
+import {
+  SUBAGENT_CORTEX_WRITE_DENY_REASON,
+  SUBAGENT_MEMORY_DIR_DENY_REASON,
+  SUBAGENT_TRUST_CHANGE_DENY_REASON,
+  WORK_COMMAND_DENY_REASON,
+  WORK_STATE_SHELL_DENY_REASON,
+  buildCompactInstruction,
+  classifyTrustCommand,
+  classifyWorkCommand,
+  commandReferencesMemoryDir,
+  commandReferencesWorkSizeState,
+  formatOtherProjectWriteReason,
+  formatStateFileWriteAskReason,
+  formatTrustCommandAskReason,
+  formatWorkCommandAskReason,
+  formatWorkSizeStateShellAskReason,
+  inspectStateFilePath,
+  isShellGuardReadOnly,
+  isWriteProtectedCortexBaseName,
+  otherProjectWriteTargetByBaseName,
+  restoreFailureNote,
+} from './claude.mjs';
 
 export { EMPTY_MEMORY_NOTICE, HEAD_CORE_MAX_CHARS };
+
+const ANTIGRAVITY_FILE_WRITE_TOOLS = new Set(ANTIGRAVITY_FILE_WRITE_TOOL_NAMES);
+const ANTIGRAVITY_SHELL_TOOLS = new Set(ANTIGRAVITY_SHELL_TOOL_NAMES);
+const ANTIGRAVITY_FILE_READ_TOOLS = new Set(ANTIGRAVITY_FILE_READ_TOOL_NAMES);
+export const ANTIGRAVITY_PRE_TOOL_SAFE_DECISION = Object.freeze({ decision: 'ask' });
+export const ANTIGRAVITY_MAX_TOOL_PATH_CHARS = 1024;
+const VALID_PRE_TOOL_DECISIONS = new Set(['ask', 'deny', 'force_ask']);
+
+function isUncOrOverlongToolPath(rawPath) {
+  if (typeof rawPath !== 'string') return false;
+  if (rawPath.length > ANTIGRAVITY_MAX_TOOL_PATH_CHARS) return true;
+  const trimmed = rawPath.trimStart();
+  if (trimmed.startsWith('\\\\')) return true;
+  if (process.platform === 'win32' && /^[\\/]{2}/.test(trimmed)) return true;
+  return false;
+}
 
 const SAFE_CONV_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
 const ROLE_PROBE_BYTES = 16 * 1024;
@@ -255,7 +322,7 @@ function resolveCheckpointFile(projectDir, globalDir, convId, projectTrusted) {
 }
 
 function readCheckpointState(cpPaths) {
-  if (!cpPaths) return { started: false, checkpoint: '' };
+  if (!cpPaths) return { started: false, checkpoint: '', lastTurnSig: '' };
   try {
     if (fs.existsSync(cpPaths.jsonPath)) {
       const raw = fs.readFileSync(cpPaths.jsonPath, 'utf8').replace(/^\uFEFF/, '');
@@ -267,17 +334,72 @@ function readCheckpointState(cpPaths) {
           transcriptPath: typeof parsed.transcriptPath === 'string' ? parsed.transcriptPath : '',
           transcriptMtimeMs: typeof parsed.transcriptMtimeMs === 'number' ? parsed.transcriptMtimeMs : 0,
           transcriptSize: typeof parsed.transcriptSize === 'number' ? parsed.transcriptSize : 0,
+          lastTurnSig: typeof parsed.lastTurnSig === 'string' ? parsed.lastTurnSig : '',
         };
       }
     }
     if (fs.existsSync(cpPaths.legacyTxtPath)) {
       const legacyKey = fs.readFileSync(cpPaths.legacyTxtPath, 'utf8').trim();
-      return { started: true, checkpoint: legacyKey };
+      return { started: true, checkpoint: legacyKey, lastTurnSig: '' };
     }
   } catch {
     // ignore corrupt checkpoint state
   }
-  return { started: false, checkpoint: '' };
+  return { started: false, checkpoint: '', lastTurnSig: '' };
+}
+
+function computeTurnSignature(payload, lastInput) {
+  if (!lastInput) return '';
+  const rawInitial = payload?.initialNumSteps ?? payload?.initial_num_steps;
+  const numInitial = typeof rawInitial === 'number' && Number.isFinite(rawInitial) ? Math.floor(rawInitial) : null;
+  return numInitial !== null ? `${numInitial}\0${lastInput}` : `\0${lastInput}`;
+}
+
+function ensureValidPreToolDecision(candidate) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return { decision: 'ask' };
+  }
+  const decision = typeof candidate.decision === 'string' ? candidate.decision.trim() : '';
+  if (!VALID_PRE_TOOL_DECISIONS.has(decision)) {
+    return { decision: 'ask' };
+  }
+  if (decision === 'ask') {
+    return { decision: 'ask' };
+  }
+  const reason = typeof candidate.reason === 'string' && candidate.reason.trim()
+    ? candidate.reason.trim()
+    : '[herdr-cortex] Tool call requires review.';
+  return { decision, reason };
+}
+
+function classifyAntigravityCaller(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { kind: 'unknown', convId: '', lastInput: '', transcriptPath: '' };
+  }
+  if (isSubagentPayload(payload)) {
+    return { kind: 'subagent', convId: extractSessionId(payload), lastInput: '', transcriptPath: '' };
+  }
+  const transcriptPath = extractTranscriptPath(payload);
+  const role = detectAntigravityTranscriptRole(transcriptPath);
+  if (role === 'subagent') {
+    return { kind: 'subagent', convId: extractSessionId(payload), lastInput: '', transcriptPath };
+  }
+  const lastInput = String(payload.lastUserInput ?? payload.userInput ?? '').trim();
+  if (SUBAGENT_MSG_RE.test(lastInput)) {
+    return { kind: 'subagent', convId: extractSessionId(payload), lastInput, transcriptPath };
+  }
+  const convId = extractSessionId(payload);
+  const explicitRoot = isExplicitRootPayload(payload, convId);
+  const isConfirmedRoot =
+    role === 'root'
+    || explicitRoot
+    || (role === 'unknown' && lastInput.length > 0 && !SUBAGENT_MSG_RE.test(lastInput));
+  return {
+    kind: isConfirmedRoot ? 'root' : 'unknown',
+    convId,
+    lastInput,
+    transcriptPath,
+  };
 }
 
 function extractTranscriptPath(payload) {
@@ -349,6 +471,7 @@ export function handleAntigravitySessionStart(
     promptsDir = path.join(repoRoot, 'prompts'),
     startedAt,
     indexBudget,
+    now = Date.now,
   } = {},
 ) {
   if (isSubagentPayload(payload)) {
@@ -427,6 +550,27 @@ export function handleAntigravitySessionStart(
   pruneApprovalCheckRecords(effectiveGlobalDir);
   pushSection(resolveApprovalsWarning(effectiveGlobalDir, convId));
 
+  const startNowMs = Number(typeof now === 'function' ? now() : now) || Date.now();
+  const startNowDate = new Date(startNowMs);
+  const workspacePaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : undefined;
+  const cpPaths = convId ? resolveCheckpointFile(projectDir, effectiveGlobalDir, convId, projectTrusted) : null;
+  const existingCp = readCheckpointState(cpPaths);
+
+  if (!worker && cpPaths && !existingCp.started && isValidTerminalId(terminalId)) {
+    try {
+      clearTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: startNowDate });
+    } catch {
+      // ignore work-size state errors in hook
+    }
+  }
+
+  const delegatedForStart = !worker && isValidTerminalId(terminalId)
+    ? (
+        Boolean(getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: startNowDate }))
+        || hasPendingDelegatedMessage(terminalId, { globalDir: effectiveGlobalDir })
+      )
+    : false;
+
   pushStartupHeadAndNotices({
     pushHeadCore,
     pushSection,
@@ -440,6 +584,41 @@ export function handleAntigravitySessionStart(
     projectDir,
     globalDir: effectiveGlobalDir,
   });
+
+  if (!worker && !delegatedForStart) {
+    try {
+      const loadConfigForRoot = (root) => (
+        projectPathKey(root) === projectPathKey(resolveProjectRoot(projectDir))
+          ? config
+          : loadConfig({ projectDir: root, globalDir: effectiveGlobalDir })
+      );
+      resetWorkSizeTurnCountersOnSessionStart({
+        cwd: projectDir,
+        env,
+        workspacePaths,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId: convId,
+        config,
+        loadConfigForRoot,
+        isEnabledForRoot: isProjectEnabled,
+        now: startNowDate,
+      });
+      pushSection(getWorkSizeSessionNotice({
+        cwd: projectDir,
+        env,
+        workspacePaths,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId: convId,
+        config,
+        loadConfigForRoot,
+        isEnabledForRoot: isProjectEnabled,
+      }));
+    } catch {
+      // ignore work-size state errors in hook
+    }
+  }
 
   pushOverviewSections({
     pushSection,
@@ -462,6 +641,7 @@ export function handleAntigravitySessionStart(
           projectDir,
           maxChars: Math.min(ANTIGRAVITY_INBOX_MAX_CHARS, remaining),
           fullBlockChars: Math.min(ANTIGRAVITY_INBOX_MAX_CHARS, budget),
+          nowMs: startNowMs,
         });
         if (delivered.text) {
           pushSection(delivered.text);
@@ -472,15 +652,11 @@ export function handleAntigravitySessionStart(
     }
   }
 
-  if (convId && sections.length > 0) {
-    const cpPaths = resolveCheckpointFile(projectDir, effectiveGlobalDir, convId, projectTrusted);
-    if (cpPaths) {
-      const existing = readCheckpointState(cpPaths);
-      atomicWriteJson(cpPaths.jsonPath, {
-        ...existing,
-        started: true,
-      });
-    }
+  if (convId && cpPaths && sections.length > 0) {
+    atomicWriteJson(cpPaths.jsonPath, {
+      ...existingCp,
+      started: true,
+    });
   }
 
   return wrapAntigravityInjectSteps(sections);
@@ -509,6 +685,7 @@ export function handleAntigravityPreInvocation(
     startedAt,
     indexBudget,
     turnOptions,
+    now = Date.now,
   } = {},
 ) {
   if (isSubagentPayload(payload)) {
@@ -566,6 +743,32 @@ export function handleAntigravityPreInvocation(
   const cpState = readCheckpointState(cpPaths);
   let stateDirty = false;
 
+  const invokeNowMs = Number(typeof now === 'function' ? now() : now) || Date.now();
+  const invokeNowDate = new Date(invokeNowMs);
+  const workspacePaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : undefined;
+
+  if (!worker && cpPaths && !cpState.started && isValidTerminalId(terminalId)) {
+    try {
+      clearTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: invokeNowDate });
+    } catch {
+      // ignore work-size state errors in hook
+    }
+  }
+
+  const delegatedForTurn = !worker && isValidTerminalId(terminalId)
+    ? (
+        Boolean(getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: invokeNowDate }))
+        || hasPendingDelegatedMessage(terminalId, { globalDir: effectiveGlobalDir })
+      )
+    : false;
+
+  const turnSig = computeTurnSignature(payload, lastInput);
+  const isNewUserTurn = Boolean(turnSig) && turnSig !== cpState.lastTurnSig;
+  if (isNewUserTurn) {
+    cpState.lastTurnSig = turnSig;
+    stateDirty = true;
+  }
+
   const sections = [];
   let used = 0;
 
@@ -588,6 +791,12 @@ export function handleAntigravityPreInvocation(
     }
     return false;
   };
+
+  const loadConfigForRoot = (root) => (
+    projectPathKey(root) === projectPathKey(resolveProjectRoot(projectDir))
+      ? config
+      : loadConfig({ projectDir: root, globalDir: effectiveGlobalDir })
+  );
 
   // 0. Approvals changed without the confirmation dialog (first, so it always fits)
   pushSection(resolveApprovalsWarning(effectiveGlobalDir, convId));
@@ -631,6 +840,35 @@ export function handleAntigravityPreInvocation(
       projectDir,
       globalDir: effectiveGlobalDir,
     });
+    if (!worker && !delegatedForTurn) {
+      try {
+        resetWorkSizeTurnCountersOnSessionStart({
+          cwd: projectDir,
+          env,
+          workspacePaths,
+          globalDir: effectiveGlobalDir,
+          terminalId,
+          sessionId: convId,
+          config,
+          loadConfigForRoot,
+          isEnabledForRoot: isProjectEnabled,
+          now: invokeNowDate,
+        });
+        pushSection(getWorkSizeSessionNotice({
+          cwd: projectDir,
+          env,
+          workspacePaths,
+          globalDir: effectiveGlobalDir,
+          terminalId,
+          sessionId: convId,
+          config,
+          loadConfigForRoot,
+          isEnabledForRoot: isProjectEnabled,
+        }));
+      } catch {
+        // ignore work-size state errors in hook
+      }
+    }
     pushOverviewSections({ pushSection, remaining: () => budget - used, ...overviewArgs });
     cpState.started = true;
     stateDirty = true;
@@ -728,7 +966,49 @@ export function handleAntigravityPreInvocation(
     atomicWriteJson(cpPaths.jsonPath, cpState);
   }
 
-  // 4. Budget-first relay inbox delivery
+  // 4. Work-size non-blocking notices (per-user-input reminders + queued PreToolUse/PostToolUse notices)
+  if (!worker && !delegatedForTurn) {
+    try {
+      if (isNewUserTurn) {
+        const promptEval = evaluateWorkSizePrompt({
+          cwd: projectDir,
+          env,
+          workspacePaths,
+          globalDir: effectiveGlobalDir,
+          terminalId,
+          sessionId: convId,
+          config,
+          loadConfigForRoot,
+          isEnabledForRoot: isProjectEnabled,
+          now: invokeNowDate,
+        });
+        if (promptEval.completedNotice) pushSection(promptEval.completedNotice);
+        if (promptEval.unsavedNotice) pushSection(promptEval.unsavedNotice);
+        if (promptEval.periodicNotice) pushSection(promptEval.periodicNotice);
+      }
+
+      const queuedNotices = consumeWorkSizePendingNotices({
+        cwd: projectDir,
+        env,
+        workspacePaths,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId: convId,
+        config,
+        loadConfigForRoot,
+        isEnabledForRoot: isProjectEnabled,
+        maxChars: budget - used,
+        now: invokeNowDate,
+      });
+      for (const notice of queuedNotices) {
+        pushSection(notice);
+      }
+    } catch {
+      // ignore work-size state errors in hook
+    }
+  }
+
+  // 5. Budget-first relay inbox delivery
   if (!worker && isValidTerminalId(terminalId)) {
     const remaining = budget - used;
     if (remaining >= 120) {
@@ -738,6 +1018,7 @@ export function handleAntigravityPreInvocation(
           projectDir,
           maxChars: Math.min(ANTIGRAVITY_INBOX_MAX_CHARS, remaining),
           fullBlockChars: Math.min(ANTIGRAVITY_INBOX_MAX_CHARS, budget),
+          nowMs: invokeNowMs,
         });
         if (delivered.text) {
           pushSection(delivered.text);
@@ -751,6 +1032,364 @@ export function handleAntigravityPreInvocation(
   return wrapAntigravityInjectSteps(sections);
 }
 
+/**
+ * Antigravity PreToolUse handler:
+ * - Always returns a valid `decision` (`"ask"`, `"deny"`, or `"force_ask"`), NEVER `{}` or `"allow"`.
+ * - Wraps the entire body so any exception, malformed payload, or unwritable state directory falls back
+ *   to `{"decision":"ask"}`.
+ * - Counts and enforces work-size limits on `write_file` (`Content`) and `edit_file` (`Replacement`),
+ *   counts per-turn reads on `read_file` (queuing non-blocking notices for the next `PreInvocation`),
+ *   and enforces hard-to-reverse command confirmation (`force_ask` in main, `deny` in worker/subagent)
+ *   on `run_command` with unknown shell kind (`shell: ''`).
+ */
+export function handleAntigravityPreToolUse(
+  payload = {},
+  {
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
+    globalDir,
+    now = Date.now,
+    dependencyLookupOptions,
+    lockOptions,
+  } = {},
+) {
+  try {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return { decision: 'ask' };
+    }
+    const toolCall = payload.toolCall && typeof payload.toolCall === 'object' && !Array.isArray(payload.toolCall)
+      ? payload.toolCall
+      : null;
+    if (!toolCall) {
+      return { decision: 'ask' };
+    }
+    const toolName = typeof toolCall.name === 'string' ? toolCall.name.trim() : '';
+    if (!toolName) {
+      return { decision: 'ask' };
+    }
+    const rawArgs = toolCall.args && typeof toolCall.args === 'object' && !Array.isArray(toolCall.args)
+      ? toolCall.args
+      : {};
+
+    // Fast-fail UNC (`\\...`) and overlong (>1,024 chars) `Path` inputs before any filesystem/realpath lookup
+    // so Windows SMB network timeouts and deep parent walks cannot stall synchronous `PreToolUse` execution.
+    if (isUncOrOverlongToolPath(rawArgs.Path)) {
+      return { decision: 'ask' };
+    }
+    const cwd = extractCwd(payload, process.cwd());
+    if (typeof rawArgs.Path === 'string' && !path.isAbsolute(rawArgs.Path)) {
+      if (
+        typeof cwd === 'string'
+        && (isUncOrOverlongToolPath(cwd) || path.join(cwd, rawArgs.Path).length > ANTIGRAVITY_MAX_TOOL_PATH_CHARS)
+      ) {
+        return { decision: 'ask' };
+      }
+    }
+
+    const caller = classifyAntigravityCaller(payload);
+    const callerIsSubagent = caller.kind === 'subagent';
+    const isConfirmedRoot = caller.kind === 'root';
+    const worker = isWorkerSession({ env });
+    const workspacePaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : undefined;
+    const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+    const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+    const delegated = !callerIsSubagent && !worker && isValidTerminalId(terminalId)
+      ? Boolean(getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: nowDate }))
+      : false;
+    const actsAsWorker = worker || delegated;
+
+    // 1. This server's MCP tools (direct or via Antigravity `call_mcp_tool`)
+    const cortexCall = resolveAntigravityCortexTool(toolName, rawArgs);
+    if (cortexCall.isCortex) {
+      if (callerIsSubagent && isWriteProtectedCortexBaseName(cortexCall.baseName, cortexCall.args)) {
+        return ensureValidPreToolDecision({ decision: 'deny', reason: SUBAGENT_CORTEX_WRITE_DENY_REASON });
+      }
+      if (isConfirmedRoot) {
+        const scope = resolveWorkSizeScope({ terminalId, sessionId: caller.convId });
+        const wsRoot = resolveWorkSizeProjectRoot({
+          cwd,
+          env,
+          workspacePaths,
+          globalDir: effectiveGlobalDir,
+          scope,
+        });
+        const otherDir = otherProjectWriteTargetByBaseName(cortexCall.baseName, cortexCall.args, wsRoot);
+        if (otherDir) {
+          return ensureValidPreToolDecision({
+            decision: 'force_ask',
+            reason: formatOtherProjectWriteReason(otherDir),
+          });
+        }
+      }
+      return { decision: 'ask' };
+    }
+
+    // 2. File-edit tools (`write_file`, `edit_file`)
+    if (ANTIGRAVITY_FILE_WRITE_TOOLS.has(toolName)) {
+      const filePath = typeof rawArgs.Path === 'string' ? rawArgs.Path : '';
+      if (callerIsSubagent && isPathInsideMemoryDir(filePath, cwd)) {
+        return ensureValidPreToolDecision({ decision: 'deny', reason: SUBAGENT_MEMORY_DIR_DENY_REASON });
+      }
+
+      const stateTarget = inspectStateFilePath(filePath, cwd, effectiveGlobalDir);
+      if (stateTarget) {
+        if (callerIsSubagent) {
+          return ensureValidPreToolDecision({ decision: 'deny', reason: SUBAGENT_TRUST_CHANGE_DENY_REASON });
+        }
+        if (actsAsWorker && commandReferencesWorkSizeState(stateTarget.path, effectiveGlobalDir)) {
+          return ensureValidPreToolDecision({ decision: 'deny', reason: WORK_STATE_SHELL_DENY_REASON });
+        }
+        if (isConfirmedRoot) {
+          return ensureValidPreToolDecision({
+            decision: 'force_ask',
+            reason: formatStateFileWriteAskReason(stateTarget.path, { approvalsFile: stateTarget.approvalsFile }),
+          });
+        }
+      }
+
+      if (!isConfirmedRoot || actsAsWorker) {
+        return { decision: 'ask' };
+      }
+
+      if (filePath.trim()) {
+        const addedChars = toolName === 'write_file'
+          ? (typeof rawArgs.Content === 'string' ? rawArgs.Content.length : 0)
+          : (typeof rawArgs.Replacement === 'string' ? rawArgs.Replacement.length : 0);
+        const evaluated = evaluateWorkSizeEdit({
+          filePath,
+          addedChars,
+          cwd,
+          env,
+          workspacePaths,
+          globalDir: effectiveGlobalDir,
+          terminalId,
+          sessionId: caller.convId,
+          loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+          isEnabledForRoot: isProjectEnabled,
+          dependencyLookupOptions,
+          queueNotice: true,
+          lockOptions,
+          now: nowDate,
+        });
+        if (evaluated.action === 'deny') {
+          return ensureValidPreToolDecision({ decision: 'deny', reason: evaluated.denyReason });
+        }
+      }
+      return { decision: 'ask' };
+    }
+
+    // 3. Shell tool (`run_command`, shell kind unknown -> `shell: ''` inspects both interpretations)
+    if (ANTIGRAVITY_SHELL_TOOLS.has(toolName)) {
+      const command = typeof rawArgs.CommandLine === 'string' ? rawArgs.CommandLine : '';
+      if (callerIsSubagent && commandReferencesMemoryDir(command)) {
+        return ensureValidPreToolDecision({ decision: 'deny', reason: SUBAGENT_MEMORY_DIR_DENY_REASON });
+      }
+
+      const trustKind = classifyTrustCommand(command);
+      if (callerIsSubagent && (trustKind === 'approvals-file' || trustKind === 'runs-cli')) {
+        return ensureValidPreToolDecision({ decision: 'deny', reason: SUBAGENT_TRUST_CHANGE_DENY_REASON });
+      }
+      if (isConfirmedRoot && trustKind === 'approvals-file') {
+        return ensureValidPreToolDecision({ decision: 'force_ask', reason: formatTrustCommandAskReason(command) });
+      }
+
+      const shellBudget = createShellInspectionBudget();
+      if (
+        commandReferencesWorkSizeState(command, effectiveGlobalDir, { shell: '', budget: shellBudget })
+        && !isShellGuardReadOnly(command, '')
+      ) {
+        if (callerIsSubagent || actsAsWorker) {
+          return ensureValidPreToolDecision({ decision: 'deny', reason: WORK_STATE_SHELL_DENY_REASON });
+        }
+        if (isConfirmedRoot) {
+          return ensureValidPreToolDecision({
+            decision: 'force_ask',
+            reason: formatWorkSizeStateShellAskReason(command),
+          });
+        }
+      }
+
+      const workCmdKind = classifyWorkCommand(command, { shell: '', budget: shellBudget });
+      if (workCmdKind === 'runs-cli') {
+        if (callerIsSubagent || actsAsWorker) {
+          return ensureValidPreToolDecision({ decision: 'deny', reason: WORK_COMMAND_DENY_REASON });
+        }
+        if (isConfirmedRoot) {
+          return ensureValidPreToolDecision({
+            decision: 'force_ask',
+            reason: formatWorkCommandAskReason(command),
+          });
+        }
+      }
+
+      const scope = resolveWorkSizeScope({ terminalId, sessionId: caller.convId });
+      const rootDir = resolveWorkSizeProjectRoot({
+        cwd,
+        env,
+        workspacePaths,
+        globalDir: effectiveGlobalDir,
+        scope,
+      });
+      const cfg = loadConfig({ projectDir: rootDir, globalDir: effectiveGlobalDir });
+      if (isProjectEnabled(rootDir, cfg)) {
+        const wsCfg = resolveWorkSizeConfig(cfg);
+        if (wsCfg.confirmCommands) {
+          const confirmMatch = inspectConfirmableShellCommand(command, {
+            confirmCommands: wsCfg.confirmCommands,
+            confirmCommandPatterns: wsCfg.confirmCommandPatterns,
+            env,
+            shell: '',
+            config: cfg,
+            budget: shellBudget,
+          });
+          if (confirmMatch.matched) {
+            if (callerIsSubagent || actsAsWorker) {
+              return ensureValidPreToolDecision({
+                decision: 'deny',
+                reason: formatConfirmCommandDenyReason(confirmMatch),
+              });
+            }
+            if (isConfirmedRoot) {
+              return ensureValidPreToolDecision({
+                decision: 'force_ask',
+                reason: formatConfirmCommandAskReason(confirmMatch, command),
+              });
+            }
+          }
+        }
+      }
+
+      return { decision: 'ask' };
+    }
+
+    // 4. File-read tool (`read_file`; queues non-blocking notice for the next `PreInvocation`)
+    if (ANTIGRAVITY_FILE_READ_TOOLS.has(toolName)) {
+      if (isConfirmedRoot && !actsAsWorker) {
+        evaluateWorkSizeRead({
+          cwd,
+          env,
+          workspacePaths,
+          globalDir: effectiveGlobalDir,
+          terminalId,
+          sessionId: caller.convId,
+          loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+          isEnabledForRoot: isProjectEnabled,
+          queueNotice: true,
+          lockOptions,
+          now: nowDate,
+        });
+      }
+      return { decision: 'ask' };
+    }
+
+    return { decision: 'ask' };
+  } catch {
+    return { decision: 'ask' };
+  }
+}
+
+/**
+ * Antigravity PostToolUse handler:
+ * - Always returns `{}`.
+ * - On `run_command`, counts failure ONLY when `payload.error` is a non-empty string; on success, resets
+ *   failed-retry counts and clears the cumulative window when `CommandLine` ran an in-project `git commit`.
+ * - On this server's `memory_save` (without non-empty `error`), clears the cumulative window and records
+ *   `memorySaved` for active `L` jobs.
+ */
+export function handleAntigravityPostToolUse(
+  payload = {},
+  {
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
+    globalDir,
+    now = Date.now,
+    lockOptions,
+  } = {},
+) {
+  try {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return {};
+    }
+    const caller = classifyAntigravityCaller(payload);
+    if (caller.kind !== 'root' || isWorkerSession({ env })) {
+      return {};
+    }
+
+    const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+    const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+    if (isValidTerminalId(terminalId) && getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: nowDate })) {
+      return {};
+    }
+
+    const toolCall = payload.toolCall && typeof payload.toolCall === 'object' && !Array.isArray(payload.toolCall)
+      ? payload.toolCall
+      : null;
+    if (!toolCall) return {};
+    const toolName = typeof toolCall.name === 'string' ? toolCall.name.trim() : '';
+    if (!toolName) return {};
+    const rawArgs = toolCall.args && typeof toolCall.args === 'object' && !Array.isArray(toolCall.args)
+      ? toolCall.args
+      : {};
+
+    const cwd = extractCwd(payload, process.cwd());
+    const workspacePaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : undefined;
+    const hasError = typeof payload.error === 'string' && payload.error.trim().length > 0;
+
+    if (ANTIGRAVITY_SHELL_TOOLS.has(toolName)) {
+      const command = typeof rawArgs.CommandLine === 'string' ? rawArgs.CommandLine : '';
+      recordShellResultForWorkSize({
+        ok: !hasError,
+        isInterrupt: false,
+        command,
+        shell: '',
+        cwd,
+        env,
+        workspacePaths,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId: caller.convId,
+        loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+        isEnabledForRoot: isProjectEnabled,
+        lockOptions,
+        now: nowDate,
+      });
+      return {};
+    }
+
+    const cortexCall = resolveAntigravityCortexTool(toolName, rawArgs, { allowMemorySaveSuffix: true });
+    if (cortexCall.isCortex && cortexCall.baseName === 'memory_save') {
+      if (hasError) return {};
+      const scope = resolveWorkSizeScope({ terminalId, sessionId: caller.convId });
+      const wsRoot = resolveWorkSizeProjectRoot({
+        cwd,
+        env,
+        workspacePaths,
+        globalDir: effectiveGlobalDir,
+        scope,
+      });
+      if (otherProjectWriteTargetByBaseName('memory_save', cortexCall.args, wsRoot)) {
+        return {};
+      }
+      recordMemorySaveForWorkSize({
+        cwd,
+        env,
+        workspacePaths,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId: caller.convId,
+        loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+        isEnabledForRoot: isProjectEnabled,
+        lockOptions,
+        now: nowDate,
+      });
+    }
+
+    return {};
+  } catch {
+    return {};
+  }
+}
+
 export function runAntigravityHook(eventName, payload = {}, options = {}) {
   const event = String(eventName || '').trim().toLowerCase();
   switch (event) {
@@ -758,6 +1397,19 @@ export function runAntigravityHook(eventName, payload = {}, options = {}) {
       return handleAntigravitySessionStart(payload, options);
     case 'pre-invocation':
       return handleAntigravityPreInvocation(payload, options);
+    case 'pre-tool-use':
+      try {
+        return ensureValidPreToolDecision(handleAntigravityPreToolUse(payload, options));
+      } catch {
+        return { decision: 'ask' };
+      }
+    case 'post-tool-use':
+      try {
+        handleAntigravityPostToolUse(payload, options);
+      } catch {
+        // ignore
+      }
+      return {};
     default:
       return {};
   }
@@ -766,7 +1418,7 @@ export function runAntigravityHook(eventName, payload = {}, options = {}) {
 function parseCliArgs(argv) {
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
+    const arg = String(argv[i] ?? '');
     if (arg === '--id' || arg === '--marker') {
       i++;
       continue;
@@ -779,19 +1431,50 @@ function parseCliArgs(argv) {
 }
 
 if (isMainModule(import.meta.url)) {
-  let output = {};
+  let cliEvent = '';
   try {
-    const { event } = parseCliArgs(process.argv.slice(2));
+    cliEvent = String(parseCliArgs(process.argv.slice(2)).event || '').trim().toLowerCase();
+  } catch {
+    cliEvent = process.argv.slice(2).some((a) => String(a).trim().toLowerCase() === 'pre-tool-use')
+      ? 'pre-tool-use'
+      : '';
+  }
+  const isPreToolUse = cliEvent === 'pre-tool-use';
+  let emitted = false;
+  const emitAndExit = (candidate) => {
+    if (emitted) return;
+    emitted = true;
+    let body = '{}';
+    try {
+      const normalized = isPreToolUse
+        ? ensureValidPreToolDecision(candidate)
+        : (candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? candidate : {});
+      body = JSON.stringify(normalized);
+    } catch {
+      body = isPreToolUse ? '{"decision":"ask"}' : '{}';
+    }
+    try {
+      process.stdout.write(`${body}\n`);
+    } catch {
+      // ignore broken pipe
+    }
+    process.exit(0);
+  };
+
+  process.on('uncaughtException', () => emitAndExit(isPreToolUse ? { decision: 'ask' } : {}));
+  process.on('unhandledRejection', () => emitAndExit(isPreToolUse ? { decision: 'ask' } : {}));
+
+  let output = isPreToolUse ? { decision: 'ask' } : {};
+  try {
     const raw = fs.readFileSync(0, 'utf8').replace(/^\uFEFF/, '');
     let payload = {};
     if (raw && raw.trim()) {
       payload = JSON.parse(raw);
     }
     // The index sync budget counts from the start of this process, not from here.
-    output = runAntigravityHook(event, payload, { startedAt: Math.round(performance.timeOrigin) });
+    output = runAntigravityHook(cliEvent, payload, { startedAt: Math.round(performance.timeOrigin) });
   } catch {
-    output = {};
+    output = isPreToolUse ? { decision: 'ask' } : {};
   }
-  process.stdout.write(`${JSON.stringify(output || {})}\n`);
-  process.exit(0);
+  emitAndExit(output);
 }

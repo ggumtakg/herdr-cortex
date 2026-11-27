@@ -11,6 +11,8 @@ import { isMainModule, projectPathKey, resolveGlobalDir } from '../src/core/conf
 import { isValidTerminalId } from '../src/revive/tracker.mjs';
 import {
   WORK_SIZE_COMMAND,
+  WORK_SIZE_DELEGATION_TTL_MS,
+  getTabDelegation,
   getWorkSizeStatePath,
   listTabWorkSizeStates,
   readWorkSizeScopeState,
@@ -158,14 +160,44 @@ function formatFolderSectionLines(entry, { isCurrent = false, indent = '' } = {}
   return lines;
 }
 
-function formatTabStatusLines(terminalId, entries, currentRoot, currentKey, filePath) {
+function formatRemainingDuration(ms) {
+  const totalMinutes = Math.max(0, Math.ceil(Number(ms || 0) / 60000));
+  const hours = Math.floor(totalMinutes / 60);
+  const mins = totalMinutes % 60;
+  if (hours > 0 && mins > 0) return `${hours}h ${mins}m`;
+  if (hours > 0) return `${hours}h`;
+  return `${mins}m`;
+}
+
+function buildDelegationPayload(delegated, nowMs) {
+  if (!delegated) return null;
+  const elapsed = Math.max(0, nowMs - delegated.delegatedAtMs);
+  const remainingMs = Math.max(0, WORK_SIZE_DELEGATION_TTL_MS - elapsed);
+  return {
+    fromTerminalId: delegated.fromTerminalId || null,
+    delegatedAt: delegated.delegatedAt,
+    remainingMs,
+    remainingText: formatRemainingDuration(remainingMs),
+  };
+}
+
+function formatTabStatusLines(terminalId, entries, currentRoot, currentKey, filePath, delegation = null) {
   const lines = [`Tab       : ${terminalId}`];
+  if (delegation) {
+    lines.push(
+      `Delegated : yes (from ${delegation.fromTerminalId || 'peer'}, `
+      + `since ${delegation.delegatedAt}, remaining ${delegation.remainingText})`,
+    );
+  }
   if (entries.length === 0) {
     lines.push(`Folder    : ${currentRoot} (current)`);
     lines.push('Work size : S (edited files: 0)');
     lines.push('Failures  : none');
     lines.push('Unsaved   : no');
     lines.push('Counters  : prompts=0, turn reads=0');
+    if (delegation) {
+      lines.push(`State file: ${filePath}`);
+    }
     return lines;
   }
 
@@ -224,41 +256,56 @@ export function runWorkCli(
     return WORK_EXIT_ERROR;
   }
 
+  const nowMs = now instanceof Date ? now.getTime() : (Number(typeof now === 'function' ? now() : now) || Date.now());
+
   if (!trimmedTab) {
     if (opts.command === 'status') {
-      const tabs = listTabWorkSizeStates(effectiveGlobalDir);
+      const tabs = listTabWorkSizeStates(effectiveGlobalDir, { now: nowMs });
       if (opts.json) {
         printJson({
           action: 'status',
           terminalId: null,
-          tabs: tabs.map((st) => ({
-            terminalId: st.scopeId,
-            projects: Object.values(st.projects).map((entry) => ({
-              cwd: entry.cwd,
-              size: entry.size,
-              escalatedAt: entry.escalatedAt,
-              escalationReason: entry.escalationReason,
-              files: entry.files,
-              failedRetries: entry.failedRetries,
-              unsaved: entry.unsavedFiles.length > 0 || entry.unsavedCommitted,
-              unsavedFiles: entry.unsavedFiles,
-              unsavedCommitted: entry.unsavedCommitted,
-              unsavedReminded: entry.unsavedReminded,
-              promptTurns: entry.promptTurns,
-              turnReads: entry.turnReads,
-              turnReadNotified: entry.turnReadNotified,
-              reviewAccepted: entry.reviewAccepted,
-              memorySaved: entry.memorySaved,
-            })),
-          })),
+          tabs: tabs.map((st) => {
+            const delegation = buildDelegationPayload(st.delegated, nowMs);
+            return {
+              terminalId: st.scopeId,
+              delegated: Boolean(delegation),
+              delegation,
+              projects: Object.values(st.projects).map((entry) => ({
+                cwd: entry.cwd,
+                size: entry.size,
+                escalatedAt: entry.escalatedAt,
+                escalationReason: entry.escalationReason,
+                files: entry.files,
+                failedRetries: entry.failedRetries,
+                unsaved: entry.unsavedFiles.length > 0 || entry.unsavedCommitted,
+                unsavedFiles: entry.unsavedFiles,
+                unsavedCommitted: entry.unsavedCommitted,
+                unsavedReminded: entry.unsavedReminded,
+                promptTurns: entry.promptTurns,
+                turnReads: entry.turnReads,
+                turnReadNotified: entry.turnReadNotified,
+                reviewAccepted: entry.reviewAccepted,
+                memorySaved: entry.memorySaved,
+              })),
+            };
+          }),
         });
       } else if (tabs.length === 0) {
         print('Not in a Herdr tab (HC_TERMINAL_ID is not set); no recorded tab work-size state. Pass --tab <tabId>.');
       } else {
         print('Not in a Herdr tab (HC_TERMINAL_ID is not set); recorded tabs:');
         for (const st of tabs) {
-          for (const entry of Object.values(st.projects)) {
-            print(`  ${st.scopeId}: ${entry.size} (${Object.keys(entry.files).length} file(s)) in ${entry.cwd}`);
+          const delegation = buildDelegationPayload(st.delegated, nowMs);
+          const delSuffix = delegation
+            ? ` [delegated from ${delegation.fromTerminalId || 'peer'}, remaining ${delegation.remainingText}]`
+            : '';
+          const folderEntries = Object.values(st.projects);
+          if (folderEntries.length === 0 && delegation) {
+            print(`  ${st.scopeId}: delegated from ${delegation.fromTerminalId || 'peer'} (remaining ${delegation.remainingText})`);
+          }
+          for (const entry of folderEntries) {
+            print(`  ${st.scopeId}: ${entry.size} (${Object.keys(entry.files).length} file(s)) in ${entry.cwd}${delSuffix}`);
           }
         }
       }
@@ -279,6 +326,15 @@ export function runWorkCli(
       const scope = tabWorkSizeScope(trimmedTab);
       const filePath = getWorkSizeStatePath(effectiveGlobalDir, scope);
       const scopeState = readWorkSizeScopeState(effectiveGlobalDir, scope);
+      const activeDelegated = getTabDelegation(scope.id, { globalDir: effectiveGlobalDir, now: nowMs });
+      const delegation = activeDelegated
+        ? {
+            fromTerminalId: activeDelegated.fromTerminalId || null,
+            delegatedAt: activeDelegated.delegatedAt,
+            remainingMs: activeDelegated.remainingMs,
+            remainingText: formatRemainingDuration(activeDelegated.remainingMs),
+          }
+        : null;
       const currentRoot = resolveWorkSizeProjectRoot({ cwd: effectiveCwd, scopeState });
       const currentKey = projectPathKey(currentRoot);
       const entries = sortedFolderEntries(scopeState, currentKey);
@@ -289,7 +345,9 @@ export function runWorkCli(
           action: 'status',
           terminalId: scope.id,
           filePath,
-          exists: entries.length > 0,
+          exists: entries.length > 0 || Boolean(delegation),
+          delegated: Boolean(delegation),
+          delegation,
           currentCwd: currentRoot,
           size: currentEntry ? currentEntry.size : 'S',
           cwd: currentEntry ? currentEntry.cwd : currentRoot,
@@ -332,7 +390,7 @@ export function runWorkCli(
           })),
         });
       } else {
-        for (const line of formatTabStatusLines(scope.id, entries, currentRoot, currentKey, filePath)) {
+        for (const line of formatTabStatusLines(scope.id, entries, currentRoot, currentKey, filePath, delegation)) {
           print(line);
         }
       }
@@ -354,6 +412,7 @@ export function runWorkCli(
           all: res.all,
           cwd: res.cwd,
           releasedFolders: res.releasedFolders,
+          releasedDelegation: Boolean(res.releasedDelegation),
           otherLFolders: res.otherLFolders || [],
           previousSize: res.previousSize,
           size: res.size,
@@ -361,12 +420,18 @@ export function runWorkCli(
         });
       } else if (opts.all) {
         if (res.changed) {
-          print(`Released all ${res.releasedFolders.length} folder(s) in tab ${res.terminalId} -> S.`);
+          const delNote = res.releasedDelegation ? ' (relay delegation cleared)' : '';
+          print(`Released all ${res.releasedFolders.length} folder(s) in tab ${res.terminalId} -> S${delNote}.`);
         } else {
           print(`Tab ${res.terminalId} has no recorded folder state to release.`);
         }
       } else if (res.changed) {
-        print(`Released tab ${res.terminalId} (${res.cwd}): ${res.previousSize} -> S (cumulative edits and L records cleared).`);
+        if (res.releasedFolders.length === 0 && res.releasedDelegation) {
+          print(`Released relay delegation for tab ${res.terminalId}.`);
+        } else {
+          const delNote = res.releasedDelegation ? '; relay delegation cleared' : '';
+          print(`Released tab ${res.terminalId} (${res.cwd}): ${res.previousSize} -> S (cumulative edits and L records cleared${delNote}).`);
+        }
       } else {
         print(`Tab ${res.terminalId} (${res.cwd}) is already S with no cumulative edits.`);
         if (Array.isArray(res.otherLFolders) && res.otherLFolders.length > 0) {

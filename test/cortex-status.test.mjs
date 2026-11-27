@@ -181,7 +181,7 @@ test('cortex-status: missing Node path, broken or missing registrations, an unap
     assert.deepEqual(lineOf(goneLines, '  recorded'), [`${vanishedNode} (MISSING)`]);
     assert.deepEqual(lineOf(goneLines, 'Claude hooks'), ['SessionStart=node_missing SessionEnd=node_missing PreCompact=node_missing UserPromptSubmit=node_missing PreToolUse=node_missing PostToolUse=node_missing PostToolUseFailure=node_missing SubagentStop=node_missing']);
     assert.deepEqual(lineOf(goneLines, 'Claude MCP'), ['"herdr-cortex" registered (node MISSING, server.mjs ok)']);
-    assert.deepEqual(lineOf(goneLines, 'Antigravity'), ['SessionStart=node_missing PreInvocation=node_missing | MCP=node_missing | found by: ~/.gemini folder']);
+    assert.deepEqual(lineOf(goneLines, 'Antigravity'), ['SessionStart=node_missing PreInvocation=node_missing PreToolUse=node_missing PostToolUse=node_missing | MCP=node_missing | found by: ~/.gemini folder']);
 
     // Re-installed, then partly undone by hand and by a Claude Code that rewrote its file
     fs.rmSync(path.join(env.homeDir, '.gemini'), { recursive: true });
@@ -246,10 +246,12 @@ test('cortex-status: Antigravity counts as present on the signs the installer go
     // agy on PATH, nothing registered yet: the installer would set it up, so the status says what is missing
     const onPath = await statusWith(withAgy);
     assert.deepEqual([onPath.antigravity.present, onPath.antigravity.detectedBy, onPath.antigravity.ok], [true, 'path', false]);
-    assert.deepEqual(lineOf(formatStatus(onPath), 'Antigravity'), ['SessionStart=missing PreInvocation=missing | MCP=missing | found by: "agy" on PATH']);
+    assert.deepEqual(lineOf(formatStatus(onPath), 'Antigravity'), ['SessionStart=missing PreInvocation=missing PreToolUse=missing PostToolUse=missing | MCP=missing | found by: "agy" on PATH']);
     assert.deepEqual(agyWarnings(onPath), [
       'Antigravity hook SessionStart: not registered (run install.ps1 again).',
       'Antigravity hook PreInvocation: not registered (run install.ps1 again).',
+      'Antigravity hook PreToolUse: not registered (run install.ps1 again).',
+      'Antigravity hook PostToolUse: not registered (run install.ps1 again).',
       `Antigravity MCP: missing in ${path.join(geminiDir, 'antigravity-cli', 'mcp_config.json')} (run install.ps1 again).`,
     ]);
     assert.equal(fs.existsSync(geminiDir), false, 'the check creates nothing');
@@ -260,7 +262,7 @@ test('cortex-status: Antigravity counts as present on the signs the installer go
     for (const envVars of [withAgy, withoutAgy]) {
       const installed = await statusWith(envVars);
       assert.deepEqual([installed.antigravity.present, installed.antigravity.detectedBy, installed.antigravity.ok], [true, 'config-dir', true]);
-      assert.deepEqual(lineOf(formatStatus(installed), 'Antigravity'), ['SessionStart=ok PreInvocation=ok | MCP=ok | found by: ~/.gemini folder']);
+      assert.deepEqual(lineOf(formatStatus(installed), 'Antigravity'), ['SessionStart=ok PreInvocation=ok PreToolUse=ok PostToolUse=ok | MCP=ok | found by: ~/.gemini folder']);
       assert.deepEqual(installed.warnings, []);
     }
   } finally {

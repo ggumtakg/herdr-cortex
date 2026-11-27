@@ -12,7 +12,8 @@ import {
   resolveProjectRoot,
 } from '../core/config.mjs';
 import { UNTRUSTED_MEMORY_PREAMBLE, sanitizeInline } from '../core/budget.mjs';
-import { resolveCortexGlobalDir, validateTerminalId } from '../revive/tracker.mjs';
+import { formatDelegatedRelayNotice, recordTabDelegation } from '../hooks/work-size.mjs';
+import { isValidTerminalId, resolveCortexGlobalDir, validateTerminalId } from '../revive/tracker.mjs';
 
 /**
  * Relay inbox: messages waiting for a terminal are files in the user's global store,
@@ -207,6 +208,7 @@ function parseInboxText(rawText, fileName) {
     // never injected again and is removed after INBOX_DELIVERED_RETENTION_MS or by an explicit ack.
     delivered: Boolean(deliveredAt),
     ...(deliveredAt ? { delivered_at: deliveredAt } : {}),
+    ...(parsed.delegate === true ? { delegate: true } : {}),
     ...(parsed.meta && typeof parsed.meta === 'object' ? { meta: parsed.meta } : {}),
   };
   return { record, raw: parsed };
@@ -214,7 +216,7 @@ function parseInboxText(rawText, fileName) {
 
 /**
  * Atomically enqueue a relay message into `<globalDir>/state/inbox/<terminalId>/`.
- * Stored fields: id, from_terminal_id, to_terminal_id, message, context_docs, created_at, optional meta;
+ * Stored fields: id, from_terminal_id, to_terminal_id, message, context_docs, created_at, optional delegate, optional meta;
  * `announced_at` is added later by a hook that announced the message instead of injecting it, `delivered_at`
  * by a hook that injected it in full (the file then moves to `.delivered/`).
  */
@@ -243,6 +245,7 @@ export function enqueueMessage(terminalId, msg = {}, { globalDir } = {}) {
     created_at: typeof msg.created_at === 'string' && msg.created_at.trim()
       ? msg.created_at.trim()
       : new Date(nowMs).toISOString(),
+    ...(msg.delegate === true ? { delegate: true } : {}),
     ...(msg.meta && typeof msg.meta === 'object' ? { meta: msg.meta } : {}),
   };
 
@@ -264,6 +267,36 @@ export function enqueueMessage(terminalId, msg = {}, { globalDir } = {}) {
  */
 export function countPendingMessages(terminalId, { globalDir } = {}) {
   return listPendingJsonFiles(getTerminalInboxDir(terminalId, { globalDir })).length;
+}
+
+function isIncomingDelegationRecord(record, recipientTerminalId) {
+  if (!record || record.delegate !== true) return false;
+  const sender = typeof record.from_terminal_id === 'string' ? record.from_terminal_id.trim() : '';
+  if (!sender) return false;
+  const recipient = typeof recipientTerminalId === 'string' ? recipientTerminalId.trim() : '';
+  return sender.toLowerCase() !== recipient.toLowerCase();
+}
+
+/**
+ * Fast lock-free check used by hooks before prompt/session work-size notices: returns true only when
+ * `terminalId` has at least one unannounced pending message with `delegate: true` from another tab.
+ * When no pending files exist (the common case), does a single directory listing and zero file reads.
+ */
+export function hasPendingDelegatedMessage(terminalId, { globalDir } = {}) {
+  if (!isValidTerminalId(terminalId)) return false;
+  const cleanId = terminalId.trim();
+  const targetDir = getTerminalInboxDir(cleanId, { globalDir });
+  const files = listPendingJsonFiles(targetDir);
+  if (files.length === 0) return false;
+  for (const fileName of files) {
+    try {
+      const { record } = parseInboxText(fs.readFileSync(path.join(targetDir, fileName), 'utf8'), fileName);
+      if (!record.announced && isIncomingDelegationRecord(record, cleanId)) return true;
+    } catch {
+      // ignore unreadable or concurrently removed files
+    }
+  }
+  return false;
 }
 
 /**
@@ -1204,14 +1237,44 @@ export function deliverInboxForHook(
   };
   if (drained.messages.length === 0) return result;
 
+  const cleanRecipientId = validateTerminalId(terminalId);
   try {
     const fresh = drained.messages.filter((m) => !m.announced);
-    const detailed = formatInboxForHookDetailed(fresh, { maxChars, fullBlockChars });
+    const lastFreshDelegated = [...fresh].reverse().find((m) => isIncomingDelegationRecord(m, cleanRecipientId)) || null;
+    const reserveNotice = lastFreshDelegated
+      ? formatDelegatedRelayNotice(lastFreshDelegated.from_terminal_id)
+      : '';
+    const effectiveMaxChars = reserveNotice
+      ? Math.max(0, maxChars - (reserveNotice.length + 2))
+      : maxChars;
+    const detailed = formatInboxForHookDetailed(fresh, { maxChars: effectiveMaxChars, fullBlockChars });
     if (detailed.text) {
       drained.markAnnounced(detailed.announcedIds);
       drained.markDelivered(detailed.includedIds, new Date(nowMs).toISOString());
       const delivered = new Set(detailed.includedIds);
-      result.text = detailed.text;
+      const handled = new Set([...detailed.includedIds, ...detailed.announcedIds]);
+      const deliveredDelegated = [...fresh]
+        .reverse()
+        .find((m) => handled.has(m.id) && isIncomingDelegationRecord(m, cleanRecipientId)) || null;
+      let finalText = detailed.text;
+      if (deliveredDelegated) {
+        try {
+          recordTabDelegation(cleanRecipientId, {
+            fromTerminalId: deliveredDelegated.from_terminal_id,
+            globalDir,
+            now: new Date(nowMs),
+          });
+        } catch {
+          // ignore work-size state errors during inbox delivery
+        }
+        const delegationNotice = formatDelegatedRelayNotice(deliveredDelegated.from_terminal_id);
+        if (finalText.length + 2 + delegationNotice.length <= maxChars) {
+          finalText = `${finalText}\n\n${delegationNotice}`;
+        }
+        result.delegated = true;
+        result.delegatedFrom = deliveredDelegated.from_terminal_id || '';
+      }
+      result.text = finalText;
       result.deliveredIds = detailed.includedIds;
       result.announcedIds = detailed.announcedIds;
       result.waitingIds = result.waitingIds.filter((id) => !delivered.has(id));

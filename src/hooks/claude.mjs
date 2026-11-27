@@ -74,7 +74,7 @@ import {
   recordSession,
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
-import { deliverInboxForHook } from '../relay/inbox.mjs';
+import { deliverInboxForHook, hasPendingDelegatedMessage } from '../relay/inbox.mjs';
 import {
   EMPTY_MEMORY_NOTICE,
   formatUnindexedNotice,
@@ -91,11 +91,13 @@ import {
 } from './recent-turns.mjs';
 import {
   WORK_SIZE_COMPLETED_NOTICE,
+  clearTabDelegation,
   commandRunsGitCommit,
   consumeWorkSizeCompletedNotice,
   evaluateWorkSizeEdit,
   evaluateWorkSizePrompt,
   evaluateWorkSizeRead,
+  getTabDelegation,
   getWorkSizeDir,
   getWorkSizeSessionNotice,
   isPathInsideMemoryDir,
@@ -204,14 +206,17 @@ const FILE_READ_TOOLS = new Set(FILE_READ_TOOL_NAMES);
 const FILE_WRITE_TOOLS = new Set(FILE_WRITE_TOOL_NAMES);
 const SHELL_TOOLS = new Set(SHELL_TOOL_NAMES);
 
-function isWriteProtectedCortexCall(toolName, rawInput = {}) {
-  const base = cortexToolBaseName(toolName);
-  if (WRITE_PROTECTED_CORTEX_TOOLS.has(base)) return true;
-  if (base === 'relay_inbox') {
+export function isWriteProtectedCortexBaseName(baseName, rawInput = {}) {
+  if (WRITE_PROTECTED_CORTEX_TOOLS.has(baseName)) return true;
+  if (baseName === 'relay_inbox') {
     const action = String(rawInput?.action || 'peek').trim().toLowerCase();
     return action === 'ack';
   }
   return false;
+}
+
+export function isWriteProtectedCortexCall(toolName, rawInput = {}) {
+  return isWriteProtectedCortexBaseName(cortexToolBaseName(toolName), rawInput);
 }
 
 export { isCortexToolName };
@@ -745,7 +750,7 @@ function classifyWorkCommandRecursive(command, { shell = '', depth = 0, budget =
 const SHELL_GUARD_READ_ONLY_VERBS = new Set(READ_ONLY_SHELL_VERBS);
 const SHELL_GUARD_READ_ONLY_GIT = new Set(READ_ONLY_GIT_SUBCOMMANDS);
 
-function isShellGuardReadOnly(command, shell = '') {
+export function isShellGuardReadOnly(command, shell = '') {
   if (!isReadOnlyShellCommand(command)) return false;
   const shellKind = normalizeShellKind(shell);
   // `splitPlainCommands` does not interpret Bash unquoted `\'` / `\"` or ANSI-C `$'...'` escapes;
@@ -910,25 +915,29 @@ function comparablePaths(targetPath) {
   return [...forms];
 }
 
+export function inspectStateFilePath(targetPath, cwd, globalDir) {
+  if (typeof targetPath !== 'string' || !targetPath.trim()) return null;
+  const resolved = path.resolve(cwd || process.cwd(), targetPath.trim());
+  const stateForms = comparablePaths(getTierPaths(globalDir).stateDir);
+  const approvalsForms = new Set([
+    ...comparablePaths(getTrustedProjectsPath(globalDir)),
+    ...comparablePaths(getAcknowledgedApprovalsPath(globalDir)),
+  ]);
+  const forms = comparablePaths(resolved);
+  const approvalsFile = forms.some((form) => approvalsForms.has(form));
+  const insideState = forms.some((form) => stateForms.some((dir) => form === dir || form.startsWith(`${dir}${path.sep}`)));
+  return approvalsFile || insideState ? { path: resolved, approvalsFile } : null;
+}
+
 /**
  * The file a Write / Edit / MultiEdit / NotebookEdit call targets when it lies in <globalDir>/state/
  * ({ path, approvalsFile }), or null. Compared as written and by real path.
  */
 function stateFileWriteTarget(toolName, rawInput, cwd, globalDir) {
   if (!FILE_WRITE_TOOLS.has(typeof toolName === 'string' ? toolName.trim() : '')) return null;
-  const stateForms = comparablePaths(getTierPaths(globalDir).stateDir);
-  const approvalsForms = new Set([
-    ...comparablePaths(getTrustedProjectsPath(globalDir)),
-    ...comparablePaths(getAcknowledgedApprovalsPath(globalDir)),
-  ]);
-
   for (const target of [rawInput.file_path, rawInput.notebook_path]) {
-    if (typeof target !== 'string' || !target.trim()) continue;
-    const resolved = path.resolve(cwd || process.cwd(), target.trim());
-    const forms = comparablePaths(resolved);
-    const approvalsFile = forms.some((form) => approvalsForms.has(form));
-    const insideState = forms.some((form) => stateForms.some((dir) => form === dir || form.startsWith(`${dir}${path.sep}`)));
-    if (approvalsFile || insideState) return { path: resolved, approvalsFile };
+    const hit = inspectStateFilePath(target, cwd, globalDir);
+    if (hit) return hit;
   }
   return null;
 }
@@ -1371,7 +1380,24 @@ export function handleClaudeSessionStart(
     if (text && used + sepCost(0) + text.length <= maxChars) pushSection(text);
   };
 
-  if (!worker) {
+  const sessionNowMs = Number(typeof now === 'function' ? now() : now) || Date.now();
+  const sessionNowDate = new Date(sessionNowMs);
+  if (!worker && isValidTerminalId(terminalId) && (source === 'startup' || source === 'clear')) {
+    try {
+      clearTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: sessionNowDate });
+    } catch {
+      // Never block SessionStart on work-size state errors.
+    }
+  }
+
+  const delegatedForStart = !worker && isValidTerminalId(terminalId)
+    ? (
+        Boolean(getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: sessionNowDate }))
+        || hasPendingDelegatedMessage(terminalId, { globalDir: effectiveGlobalDir })
+      )
+    : false;
+
+  if (!worker && !delegatedForStart) {
     try {
       const sessionId = extractSessionId(payload);
       const loadConfigForRoot = (root) => (
@@ -1380,7 +1406,6 @@ export function handleClaudeSessionStart(
           : loadConfig({ projectDir: root, globalDir: effectiveGlobalDir })
       );
       if (headCoreReinjectedOnStart) {
-        const nowMs = Number(typeof now === 'function' ? now() : now) || Date.now();
         resetWorkSizeTurnCountersOnSessionStart({
           cwd: projectDir,
           env,
@@ -1391,7 +1416,7 @@ export function handleClaudeSessionStart(
           config,
           loadConfigForRoot,
           isEnabledForRoot: isProjectEnabled,
-          now: new Date(nowMs),
+          now: sessionNowDate,
         });
       }
       const workSizeNotice = getWorkSizeSessionNotice({
@@ -1447,6 +1472,7 @@ export function handleClaudeSessionStart(
           maxChars: Math.min(inboxBudget, remaining),
           // UserPromptSubmit gives the inbox the whole hook budget: what fits there waits for it.
           fullBlockChars: maxChars,
+          nowMs: sessionNowMs,
         });
         if (delivered.text) {
           pushSection(delivered.text);
@@ -1656,9 +1682,17 @@ export function handleClaudeUserPrompt(
   };
   if (approvalsNotice) pushContextPart(approvalsNotice.contextText);
 
-  if (!worker) {
+  const promptNowMs = Number(typeof now === 'function' ? now() : now) || Date.now();
+  const promptNowDate = new Date(promptNowMs);
+  const delegatedForPrompt = !worker && isValidTerminalId(terminalId)
+    ? (
+        Boolean(getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: promptNowDate }))
+        || hasPendingDelegatedMessage(terminalId, { globalDir: effectiveGlobalDir })
+      )
+    : false;
+
+  if (!worker && !delegatedForPrompt) {
     try {
-      const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
       const promptEval = evaluateWorkSizePrompt({
         cwd: projectDir,
         env,
@@ -1673,7 +1707,7 @@ export function handleClaudeUserPrompt(
             : loadConfig({ projectDir: root, globalDir: effectiveGlobalDir })
         ),
         isEnabledForRoot: isProjectEnabled,
-        now: nowDate,
+        now: promptNowDate,
       });
       if (promptEval.completedNotice) pushContextPart(promptEval.completedNotice);
       if (promptEval.unsavedNotice) pushContextPart(promptEval.unsavedNotice);
@@ -1694,6 +1728,7 @@ export function handleClaudeUserPrompt(
         maxChars: inboxBudget,
         // A message that fits an ordinary prompt waits for one instead of being announced as too long.
         fullBlockChars: maxChars,
+        nowMs: promptNowMs,
       });
       if (delivered.text) pushContextPart(delivered.text);
     }
@@ -1769,13 +1804,17 @@ function inspectTrustChange(toolName, rawInput, cwd, globalDir) {
  * Folder a `memory_save` / `memory_update` call would write to when its `project_dir` names a different
  * project than the one this session runs in (compared by real path), or '' when it stays in this project.
  */
-function otherProjectWriteTarget(toolName, rawInput, cwd) {
-  if (!PROJECT_WRITE_CORTEX_TOOLS.has(cortexToolBaseName(toolName))) return '';
-  const requested = typeof rawInput.project_dir === 'string' ? rawInput.project_dir.trim() : '';
+export function otherProjectWriteTargetByBaseName(baseName, rawInput, cwd) {
+  if (!PROJECT_WRITE_CORTEX_TOOLS.has(baseName)) return '';
+  const requested = typeof rawInput?.project_dir === 'string' ? rawInput.project_dir.trim() : '';
   if (!requested) return '';
   const currentRoot = resolveProjectRoot(path.resolve(cwd || process.cwd()));
   const targetRoot = resolveProjectRoot(path.resolve(currentRoot, requested));
   return projectPathKey(targetRoot) === projectPathKey(currentRoot) ? '' : targetRoot;
+}
+
+function otherProjectWriteTarget(toolName, rawInput, cwd) {
+  return otherProjectWriteTargetByBaseName(cortexToolBaseName(toolName), rawInput, cwd);
 }
 
 export function formatOtherProjectWriteReason(targetDir) {
@@ -1882,6 +1921,12 @@ export function handleClaudePreToolUse(
     }
 
     const trimmedTool = typeof toolName === 'string' ? toolName.trim() : '';
+    const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+    const delegated = !callerIsSubagent && !worker && isValidTerminalId(terminalId)
+      ? Boolean(getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: nowDate }))
+      : false;
+    const actsAsWorker = worker || delegated;
+
     if (SHELL_TOOLS.has(trimmedTool)) {
       const shellBudget = createShellInspectionBudget();
       if (
@@ -1891,7 +1936,7 @@ export function handleClaudePreToolUse(
         })
         && !isShellGuardReadOnly(rawInput.command, trimmedTool)
       ) {
-        if (callerIsSubagent || worker) {
+        if (callerIsSubagent || actsAsWorker) {
           return preToolUseDecision('deny', WORK_STATE_SHELL_DENY_REASON);
         }
         return preToolUseDecision('ask', formatWorkSizeStateShellAskReason(rawInput.command));
@@ -1902,7 +1947,7 @@ export function handleClaudePreToolUse(
         budget: shellBudget,
       });
       if (workCmdKind === 'runs-cli') {
-        if (callerIsSubagent || worker) {
+        if (callerIsSubagent || actsAsWorker) {
           return preToolUseDecision('deny', WORK_COMMAND_DENY_REASON);
         }
         return preToolUseDecision('ask', formatWorkCommandAskReason(rawInput.command));
@@ -1930,7 +1975,7 @@ export function handleClaudePreToolUse(
               budget: shellBudget,
             });
             if (confirmMatch.matched) {
-              if (callerIsSubagent || worker) {
+              if (callerIsSubagent || actsAsWorker) {
                 return preToolUseDecision('deny', formatConfirmCommandDenyReason(confirmMatch));
               }
               return preToolUseDecision('ask', formatConfirmCommandAskReason(confirmMatch, rawInput.command));
@@ -1943,9 +1988,8 @@ export function handleClaudePreToolUse(
       return {};
     }
 
-    if (!callerIsSubagent && !worker && FILE_READ_TOOLS.has(trimmedTool)) {
+    if (!callerIsSubagent && !actsAsWorker && FILE_READ_TOOLS.has(trimmedTool)) {
       try {
-        const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
         const readEval = evaluateWorkSizeRead({
           cwd,
           env,
@@ -1971,11 +2015,10 @@ export function handleClaudePreToolUse(
       return {};
     }
 
-    if (!callerIsSubagent && !worker && FILE_WRITE_TOOLS.has(trimmedTool)) {
+    if (!callerIsSubagent && !actsAsWorker && FILE_WRITE_TOOLS.has(trimmedTool)) {
       try {
         const editInput = extractClaudeEditInput(trimmedTool, rawInput);
         if (editInput) {
-          const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
           const evaluated = evaluateWorkSizeEdit({
             filePath: editInput.filePath,
             addedChars: editInput.addedChars,
@@ -2094,6 +2137,12 @@ export function handleClaudePostToolUse(
 ) {
   if (isSubagentPayload(payload) || isWorkerSession({ env })) return {};
 
+  const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+  const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+  if (isValidTerminalId(terminalId) && getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: nowDate })) {
+    return {};
+  }
+
   const toolName = String(payload.tool_name || payload.toolName || '').trim();
   const rawInput = payload.tool_input && typeof payload.tool_input === 'object' && !Array.isArray(payload.tool_input)
     ? payload.tool_input
@@ -2106,8 +2155,6 @@ export function handleClaudePostToolUse(
     const failed = isPostToolResponseFailure(toolResponse, { isShell: true });
     try {
       const cwd = extractCwd(payload, process.cwd());
-      const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
-      const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
       recordShellResultForWorkSize({
         ok: !failed,
         isInterrupt: false,
@@ -2133,7 +2180,6 @@ export function handleClaudePostToolUse(
     if (isPostToolResponseFailure(toolResponse, { isShell: false })) return {};
     try {
       const cwd = extractCwd(payload, process.cwd());
-      const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
       const sessionId = extractSessionId(payload);
       const scope = resolveWorkSizeScope({ terminalId, sessionId });
       const wsRoot = resolveWorkSizeProjectRoot({
@@ -2144,7 +2190,6 @@ export function handleClaudePostToolUse(
         scope,
       });
       if (otherProjectWriteTarget(toolName, rawInput, wsRoot)) return {};
-      const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
       recordMemorySaveForWorkSize({
         cwd,
         env,
@@ -2194,6 +2239,9 @@ export function handleClaudePostToolUseFailure(
     const cwd = extractCwd(payload, process.cwd());
     const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
     const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+    if (isValidTerminalId(terminalId) && getTabDelegation(terminalId, { globalDir: effectiveGlobalDir, now: nowDate })) {
+      return {};
+    }
     recordShellResultForWorkSize({
       ok: false,
       isInterrupt: false,

@@ -37,7 +37,7 @@ description: L 작업 절차. 조사와 구현 분리, 워커 위임(서브에�
   node --no-warnings {{HERDR_CORTEX_ROOT}}/scripts/cortex-worker.mjs --role <역할> --agent <antigravity|claude> --model <모델> --brief <지시 파일> [--out <결과 파일>] [--timeout <분>] [--allow <허용 규칙>]... [--cwd <폴더>]
   ```
   헤드리스 워커는 실행 중 권한을 물어볼 수 없으므로 필요한 명령·도구를 `--allow`로 미리 허용하고, 무엇을 허용했는지 사용자에게 알린다.
-- **다른 Herdr 탭**: `relay_tabs`로 유휴 탭을 확인하고 `relay_send`로 지시와 기준선 문서를 전달한다.
+- **다른 Herdr 탭**: `relay_tabs`로 유휴 탭을 확인하고 `relay_send(..., delegate: true)`로 지시와 기준선 문서를 전달한다.
 
 ## 5. 결과 받기
 
@@ -53,5 +53,5 @@ description: L 작업 절차. 조사와 구현 분리, 워커 위임(서브에�
 ## 7. 마무리
 
 - 독립 검수 `ACCEPT`와 `memory_save`(무엇을 했는지, 검수 결과, 남은 미확인 사항) **둘 다** 끝나야 L 작업이 끝난다.
-- 탭의 **L** 상태는 훅에 기록되며, 독립 검수 `ACCEPT`와 `memory_save` 두 조건이 차면 **S**로 풀린다.
+- 탭의 **L** 상태는 훅에 기록되며, 독립 검수 `ACCEPT`와 `memory_save` 두 조건이 차면 **S**로 풀린다(Antigravity에서 서브에이전트로 검수받았으면 판정이 자동 기록되지 않으므로 사용자가 `cortex-work release`로 푼다).
 - 커밋은 사용자가 정한 방침을 따르고, 방침이 없으면 묻는다.

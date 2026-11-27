@@ -57,7 +57,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | **Claude Code 훅** `~\.claude\settings.json` | `SessionStart`에 두 개(`session-start core`, `session-start context`), `SessionEnd`·`PreCompact`·`UserPromptSubmit`·`PreToolUse`·`PostToolUse`·`PostToolUseFailure`·`SubagentStop`에 하나씩(8개 이벤트, 총 아홉 개) 훅을 추가합니다. 각 훅은 `command`에 **Node 실행 파일의 절대 경로**, `args`에 인자 목록을 적는 형식이어서 셸을 거치지 않고 실행되며 `node`가 PATH에 없어도 됩니다. 이 도구의 훅은 인자 끝의 `--id herdr-cortex`(또는 이전 버전의 `--marker herdr-cortex`)로 구분하고, 다시 설치하면 이전 등록을 포함해 그 표시가 있는 훅만 새 등록으로 바꿉니다. 사용자가 등록한 다른 훅은 그대로 둡니다. |
 | **Claude Code MCP 서버** `~\.claude.json` | `claude` 명령을 찾으면 `claude mcp add --scope user --transport stdio herdr-cortex -- <node 경로> --no-warnings <저장소>\src\mcp\server.mjs`로 등록합니다. `claude`를 찾지 못했거나 그 명령이 실패하면 파일을 직접 고치고 그렇게 했다고 알립니다. 예전 이름 `cortex`로 등록된 항목은 이 도구의 것일 때만 지웁니다. 등록 뒤 1.5초를 기다렸다가 다시 읽어, 실행 중인 Claude Code가 파일을 덮어써 등록이 사라졌으면 경고합니다. |
 | **Claude Code 스킬** `~\.claude\skills\cortex-*` | `prompts\skills\`의 스킬 5개를 `cortex-<이름>`으로 복사하며, 하위 파일을 포함해 `{{HERDR_CORTEX_ROOT}}` 자리표시자를 설치된 저장소 루트 경로(`/` 구분자)로 치환합니다. 이 도구가 만든 폴더(표시 파일 `.herdr-cortex-managed`가 있음)만 바꿉니다. |
-| **Antigravity** `~\.gemini\` | `agy`가 PATH에 있거나 `~\.gemini` 폴더가 이미 있을 때만 건드립니다. `config\hooks.json`에 `SessionStart`와 `PreInvocation` 훅을, `antigravity-cli\mcp_config.json`에 MCP 서버를 등록합니다. `config\mcp_config.json`은 이미 있을 때만 갱신합니다. |
+| **Antigravity** `~\.gemini\` | `agy`가 PATH에 있거나 `~\.gemini` 폴더가 이미 있을 때만 건드립니다. `config\hooks.json`에 `SessionStart`·`PreInvocation`(평평한 배열)과 `PreToolUse`·`PostToolUse`(`{ matcher, hooks }` 묶음 배열) 4개 이벤트 훅을, `antigravity-cli\mcp_config.json`에 MCP 서버를 등록합니다. `config\mcp_config.json`은 이미 있을 때만 갱신하며, 사용자의 다른 훅(`herdr` 등)은 그대로 보존합니다. |
 | **PowerShell 실행 정책** | 현재 정책으로는 프로필이 불러와지지 않을 때만 `Set the ExecutionPolicy of the current user to RemoteSigned? [Y/N]`이라고 **묻습니다**. 프로필이 불러와지지 않는 경우는 현재 사용자 범위의 정책이 `Restricted`일 때와, 현재 사용자 범위의 정책이 정해져 있지 않으면서(`Undefined`) 컴퓨터 범위의 정책도 정해져 있지 않거나 `Restricted`일 때입니다. `y`나 `yes`라고 답해야 현재 사용자 범위의 정책을 `RemoteSigned`로 바꾸고, 이전 값을 `<전역 저장소>\state\execution-policy.json`에 적어 둡니다. 물을 수 없는 환경(대화형 콘솔이 아님)에서는 바꾸지 않고 직접 실행할 명령(`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`)을 알려 줍니다. |
 | **PowerShell 프로필** | `문서\WindowsPowerShell\Microsoft.PowerShell_profile.ps1`에, PowerShell 7이 있으면(`문서\PowerShell` 폴더가 있거나 `pwsh`가 PATH에 있으면) `문서\PowerShell\Microsoft.PowerShell_profile.ps1`에도, 설치를 실행한 셸의 `$PROFILE`이 이 둘과 다르면 그 파일에도 `# >>> herdr-cortex >>>`와 `# <<< herdr-cortex <<<` 사이의 블록을 넣습니다. 블록은 `scripts\auto-revive.ps1`을 불러오는 한 줄입니다(`-NoAutoResume`로 설치하면 자동 복구를 끄는 한 줄이 앞에 더 들어갑니다). 파일의 원래 인코딩(UTF-8, UTF-16, 시스템 코드 페이지)을 감지해 그대로 읽고 쓰며, 블록 밖의 바이트는 바꾸지 않습니다. 그렇게 할 수 없는 파일이면 건드리지 않고 직접 넣을 줄을 보여 줍니다. 프로필이 없으면 새로 만듭니다. 인코딩 처리의 세부는 아래 [설치 보조 함수](#설치-보조-함수-install-toolsps1)에 있습니다. |
 
@@ -106,8 +106,8 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 | 명령 | 하는 일 |
 | :--- | :--- |
 | `cortex-status` | 설치 상태와 현재 폴더의 상태를 한 화면에 보여 줍니다(아래 "진단 항목"). |
-| `cortex-work status [--tab <탭 ID>]` | 이 탭(또는 `--tab`으로 지정한 탭)에 기록된 폴더별 작업 규모(`S`/`L`), 누적 편집 파일, 파일별 수정 실패 횟수, 미저장 여부, 사용자 입력 수·이번 구간 읽기 수, 남은 완료 조건을 보여 줍니다(`--json` 지원). |
-| `cortex-work release [--tab <탭 ID>] [--all]` | 기본으로 이 셸의 현재 폴더(하위 폴더에 있으면 그 폴더를 포함하는 기록된 프로젝트 폴더)의 `L` 상태를 끝내고 `S`로 되돌립니다(`--all`을 붙이면 그 탭에 기록된 모든 폴더에 작용하며, 기록이 없는 폴더에서 실행해 아무것도 풀지 못했을 때 같은 탭의 다른 폴더에 `L`이 있으면 그 폴더들과 `--all`을 안내). 에이전트가 직접 실행하려 하면 `PreToolUse`가 사용자 확인(`ask`)을 요구하거나 차단(`deny`)합니다. |
+| `cortex-work status [--tab <탭 ID>]` | 이 탭(또는 `--tab`으로 지정한 탭)의 릴레이 위임받음 상태(맡긴 탭, 시각, 남은 시간)와 기록된 폴더별 작업 규모(`S`/`L`), 누적 편집 파일, 파일별 수정 실패 횟수, 미저장 여부, 사용자 입력 수·이번 구간 읽기 수, 남은 완료 조건을 보여 줍니다(`--json` 지원). |
+| `cortex-work release [--tab <탭 ID>] [--all]` | 기본으로 이 셸의 현재 폴더(하위 폴더에 있으면 그 폴더를 포함하는 기록된 프로젝트 폴더)의 `L` 상태를 끝내고 `S`로 되돌리며, 탭에 걸려 있던 릴레이 위임받음 상태(`delegated`)와 위임 전부터 그 폴더에 있던 `L`·누적도 함께 지웁니다(`--all`을 붙이면 그 탭에 기록된 모든 폴더에 작용하며, 기록이 없는 폴더에서 실행해 아무것도 풀지 못했을 때 같은 탭의 다른 폴더에 `L`이 있으면 그 폴더들과 `--all`을 안내). 에이전트가 직접 실행하려 하면 `PreToolUse`가 사용자 확인(`ask`/`force_ask`)을 요구하거나 차단(`deny`)합니다. |
 | `cortex-work reset [--tab <탭 ID>] [--all]` | 기본으로 현재 폴더(또는 `--all`로 그 탭의 모든 기록된 폴더)에서 작업 규모(`S`/`L`)는 그대로 두고 파일별 편집 누적과 수정 실패 횟수만 비웁니다. |
 | `cortex-worker` | 지시 파일을 읽어 `agy -p` 또는 `claude -p` 헤드리스 워커를 격리된 환경과 세션 한정 권한으로 실행합니다(아래 "`cortex-worker` 워커 실행"). |
 | `cortex-trust approve [폴더]` | 그 폴더 하나를 승인합니다. 확인 대화상자가 먼저 뜨고 "예"를 눌러야 승인됩니다. |
@@ -262,7 +262,7 @@ Herdr는 재부팅하거나 코어를 다시 시작하면 에이전트가 돌던
 **설치**
 
 - Windows 11 전용입니다.
-- Node 설치 위치가 바뀌면 `install.ps1`을 다시 실행해야 합니다(`cortex-status`가 알려 줍니다).
+- 설치된 훅과 MCP 등록은 Node와 저장소 파일의 절대 경로를 직접 실행합니다. 저장소 폴더를 옮기거나 지우거나 Node 설치 위치가 바뀌면 Antigravity 도구 호출 전 훅이 실행되지 않아 편집·읽기·명령 도구가 막힐 수 있으므로, 폴더를 옮기기 전에 `uninstall.ps1`을 먼저 실행하고 이미 옮겼다면 `%USERPROFILE%\.gemini\config\hooks.json`에서 `herdr-cortex` 항목을 지우거나 `"enabled": false`를 넣은 뒤 `install.ps1`을 다시 실행해야 합니다(`cortex-status`가 알려 줍니다).
 - Claude Code가 실행 중일 때 설치하면 MCP 등록이 덮어써져 사라질 수 있습니다. 설치기가 이를 확인해 경고하며, 그때는 Claude Code 창을 모두 닫고 다시 설치합니다.
 - 실행 정책을 바꾸지 않으면 셸 명령과 자동 탭 복구를 쓸 수 없습니다.
 

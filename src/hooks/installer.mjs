@@ -24,6 +24,8 @@ import {
 } from '../core/config.mjs';
 import { describeEmbeddingStatus, formatEmbeddingStatus } from '../embeddings/resolve.mjs';
 import {
+  ANTIGRAVITY_POST_TOOL_USE_MATCHER,
+  ANTIGRAVITY_PRE_TOOL_USE_MATCHER,
   CLAUDE_POST_TOOL_USE_FAILURE_MATCHER,
   CLAUDE_POST_TOOL_USE_MATCHER,
   CLAUDE_PRE_TOOL_USE_MATCHER,
@@ -89,10 +91,17 @@ export const CLAUDE_HOOK_SPECS = Object.freeze([
   { event: 'SubagentStop', arg: 'subagent-stop', matcher: '', timeout: 10 },
 ]);
 
-/** The Antigravity hooks this installer registers under the `herdr-cortex` group of `hooks.json`. */
+/**
+ * The Antigravity hooks this installer registers under the `herdr-cortex` group of `hooks.json`.
+ * `SessionStart` and `PreInvocation` use flat handler arrays pointing at `antigravity.mjs`;
+ * `PreToolUse` and `PostToolUse` use `{ matcher, hooks: [handler] }` groups pointing at
+ * `antigravity-tool-entry.mjs` (built-in-only entry point that turns module-load failures into safe JSON).
+ */
 export const ANTIGRAVITY_HOOK_SPECS = Object.freeze([
-  { event: 'SessionStart', arg: 'session-start', timeout: 10 },
-  { event: 'PreInvocation', arg: 'pre-invocation', timeout: 10 },
+  { event: 'SessionStart', script: 'antigravity.mjs', arg: 'session-start', timeout: 10 },
+  { event: 'PreInvocation', script: 'antigravity.mjs', arg: 'pre-invocation', timeout: 10 },
+  { event: 'PreToolUse', script: 'antigravity-tool-entry.mjs', arg: 'pre-tool-use', matcher: ANTIGRAVITY_PRE_TOOL_USE_MATCHER, timeout: 10 },
+  { event: 'PostToolUse', script: 'antigravity-tool-entry.mjs', arg: 'post-tool-use', matcher: ANTIGRAVITY_POST_TOOL_USE_MATCHER, timeout: 10 },
 ]);
 
 // `embedding` blocks of the `config.json` files earlier installers wrote by default.
@@ -463,7 +472,15 @@ function planJsonFile(filePath, { createIfMissing = true, transform }) {
   const next = clone(data);
   const info = transform(next) || {};
   const changed = JSON.stringify(next) !== JSON.stringify(data);
-  return { path: filePath, existed, changed, missing: false, next, notes: info.notes || [] };
+  return {
+    path: filePath,
+    existed,
+    changed,
+    missing: false,
+    next,
+    notes: info.notes || [],
+    rawNotes: info.rawNotes || [],
+  };
 }
 
 // Write a planned change (after a dated backup of the existing file). Returns the backup path or ''.
@@ -557,8 +574,9 @@ function transformClaudeSettings(filePath, data, { repoRoot, nodePath, isInstall
   return {};
 }
 
-// Antigravity hooks.json: { "<group>": { "<Event>": [handler, ...] } }. Only handlers carrying our marker
-// are replaced or removed in the `herdr-cortex` group; of the predecessor's group only its own handlers go.
+// Antigravity hooks.json: `SessionStart`/`PreInvocation` are flat handler arrays, while `PreToolUse`/
+// `PostToolUse` are `{ matcher, hooks: [handler] }` group arrays. Only handlers carrying our marker are
+// replaced or removed in the `herdr-cortex` group; user groups (e.g. `herdr`) and user handlers stay intact.
 function transformAntigravityHooks(filePath, data, { repoRoot, nodePath, isInstall }) {
   const stripGroup = (key) => {
     if (!Object.prototype.hasOwnProperty.call(data, key)) return;
@@ -577,35 +595,64 @@ function transformAntigravityHooks(filePath, data, { repoRoot, nodePath, isInsta
         }
         continue;
       }
-      const { kept, removed } = stripManagedHandlers(group[event]);
+      const keptItems = [];
+      let removed = 0;
+      for (const item of group[event]) {
+        if (isPlainObject(item) && Array.isArray(item.hooks)) {
+          const stripped = stripManagedHandlers(item.hooks);
+          removed += stripped.removed;
+          if (stripped.removed === 0) keptItems.push(item);
+          else if (stripped.kept.length > 0) keptItems.push({ ...item, hooks: stripped.kept });
+        } else if (isOwnHook(item) || isLegacyReviveHook(item)) {
+          removed++;
+        } else {
+          keptItems.push(item);
+        }
+      }
       if (removed === 0) continue;
       removedAny = true;
-      if (kept.length > 0) group[event] = kept;
+      if (keptItems.length > 0) group[event] = keptItems;
       else delete group[event];
     }
-    if (removedAny && Object.keys(group).length === 0) delete data[key];
+    const remainingKeys = Object.keys(group);
+    if (
+      (removedAny && remainingKeys.length === 0)
+      || (!isInstall && key === AGY_HOOK_KEY && remainingKeys.length === 1 && remainingKeys[0] === 'enabled')
+    ) {
+      delete data[key];
+    }
   };
 
   stripGroup(LEGACY_AGY_HOOK_KEY);
   stripGroup(AGY_HOOK_KEY);
 
+  const rawNotes = [];
   if (isInstall) {
-    const scriptPath = path.join(repoRoot, 'src', 'hooks', 'antigravity.mjs');
     const group = isPlainObject(data[AGY_HOOK_KEY]) ? data[AGY_HOOK_KEY] : {};
+    if (group.enabled === false) {
+      delete group.enabled;
+      rawNotes.push('Antigravity hooks were disabled ("enabled": false in hooks.json); install turned them back on.');
+    }
     for (const spec of ANTIGRAVITY_HOOK_SPECS) {
+      const scriptPath = path.join(repoRoot, 'src', 'hooks', spec.script);
       let command;
       try {
         command = buildShellHookCommand({ nodePath, scriptPath, arg: spec.arg });
       } catch (err) {
         throw new InstallProblem(filePath, `cannot write the Antigravity hook command: ${err.message}`);
       }
+      const handler = { type: 'command', command, timeout: spec.timeout };
       const list = Array.isArray(group[spec.event]) ? group[spec.event] : [];
-      list.push({ type: 'command', command, timeout: spec.timeout });
+      if (spec.matcher !== undefined) {
+        list.push({ matcher: spec.matcher, hooks: [handler] });
+      } else {
+        list.push(handler);
+      }
       group[spec.event] = list;
     }
     data[AGY_HOOK_KEY] = group;
   }
-  return {};
+  return { rawNotes };
 }
 
 // `mcpServers` of an MCP configuration file: drop the old `cortex` entry when it is ours, then (install)
@@ -1325,12 +1372,49 @@ export function checkAntigravity({ homeDir, repoRoot = REPO_ROOT, env = process.
     data = {};
   }
   const group = isPlainObject(data[AGY_HOOK_KEY]) ? data[AGY_HOOK_KEY] : {};
-  const expectedScript = path.join(path.resolve(repoRoot), 'src', 'hooks', 'antigravity.mjs');
+  const groupDisabled = group.enabled === false;
   for (const spec of ANTIGRAVITY_HOOK_SPECS) {
-    const found = (Array.isArray(group[spec.event]) ? group[spec.event] : [])
-      .filter((hook) => isOwnHook(hook))
-      .map((hook) => ({ hook, matcher: '' }));
-    result.events[spec.event] = summarizeHookEvent(found, { expectedScript, expectedArg: spec.arg });
+    const expectedScript = path.join(path.resolve(repoRoot), 'src', 'hooks', spec.script);
+    const rawEntries = Array.isArray(group[spec.event]) ? group[spec.event] : [];
+    const found = [];
+    if (spec.matcher !== undefined) {
+      for (const item of rawEntries) {
+        if (isPlainObject(item) && Array.isArray(item.hooks)) {
+          const matcher = typeof item.matcher === 'string' ? item.matcher : '';
+          for (const hook of item.hooks) {
+            if (isOwnHook(hook)) found.push({ hook, matcher });
+          }
+        } else if (isOwnHook(item)) {
+          found.push({ hook: item, matcher: '' });
+        }
+      }
+      result.events[spec.event] = summarizeHookEvent(found, {
+        expectedScript,
+        expectedArg: spec.arg,
+        expectedMatcher: spec.matcher,
+      });
+    } else {
+      for (const item of rawEntries) {
+        if (isOwnHook(item)) {
+          found.push({ hook: item, matcher: '' });
+        } else if (isPlainObject(item) && Array.isArray(item.hooks)) {
+          for (const hook of item.hooks) {
+            if (isOwnHook(hook)) found.push({ hook, matcher: '(grouped)' });
+          }
+        }
+      }
+      result.events[spec.event] = summarizeHookEvent(found, {
+        expectedScript,
+        expectedArg: spec.arg,
+        expectedMatcher: '',
+      });
+    }
+    if (groupDisabled) {
+      const eventInfo = result.events[spec.event];
+      const disabledProblem = { code: 'disabled', message: 'disabled ("enabled": false in hooks.json)' };
+      eventInfo.problems = [disabledProblem, ...eventInfo.problems];
+      eventInfo.state = 'disabled';
+    }
   }
 
   try {
@@ -1457,6 +1541,7 @@ export function installCortex({
     const backupPath = applyJsonPlan(plan, now);
     if (backupPath) backups.push(backupPath);
     for (const note of plan.notes) notes.push(`${label}: ${note}`);
+    for (const rawNote of plan.rawNotes || []) notes.push(rawNote);
     return { path: plan.path, action: 'installed', changed: plan.changed, backupPath };
   };
   const untouched = (filePath) => ({ path: filePath, action: 'skipped', changed: false, backupPath: '' });
@@ -1555,6 +1640,7 @@ export function uninstallCortex({
       return skipped;
     }
     for (const note of plan.notes) notes.push(`${label}: ${note}`);
+    for (const rawNote of plan.rawNotes || []) notes.push(rawNote);
     if (plan.missing || !plan.changed) return skipped;
     const backupPath = applyJsonPlan(plan, now);
     if (backupPath) backups.push(backupPath);

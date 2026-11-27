@@ -20,8 +20,8 @@ Windows 11의 **Herdr**(탭마다 에이전트를 띄우는 터미널 앱이며,
 | **프로젝트 승인** | 사용자가 승인한 폴더의 `.memory\`만 읽고 쓰고 대화에 넣습니다. 승인은 확인 대화상자를 거칩니다. |
 | **검색** | 메타데이터 필터, 한국어에 맞춘 키워드 검색, (켰을 때) 벡터 검색, 문서 사이의 연결을 합쳐 순위를 매깁니다. |
 | **임베딩** | 기본값은 꺼짐입니다. 켜면 `gemini`, `openai`, `ollama`, `onnx` 중 하나로 문서를 벡터로 바꿉니다. |
-| **훅** | 세션 시작·압축·`/clear` 뒤에 원칙(`HEAD_CORE`, 별도 상한 9,500자)과 기억 요약(0건이면 안내 한 줄)·받은 메시지·직전 대화(최대 5턴, 합산 `hookBudget` 예산 안)를 다시 넣고, Claude Code에서 HEAD의 파일 편집 규모(S/L)·수정 실패 반복·계약 파일 편집을 막으며 미저장·주기 리마인더, 읽기 양 안내, 기억 그래프 의존 파일 안내, 되돌리기 어려운 셸 명령 확인을 제공합니다. |
-| **탭 릴레이** | 같은 PC의 다른 Herdr 탭으로 메시지를 보내고, 쉬고 있는 탭을 한 줄로 깨웁니다. |
+| **훅** | 세션 시작·압축·`/clear` 뒤에 원칙(`HEAD_CORE`, 별도 상한 9,500자)과 기억 요약(0건이면 안내 한 줄)·받은 메시지·직전 대화(최대 5턴, 합산 `hookBudget` 예산 안)를 다시 넣고, Claude Code와 Antigravity에서 HEAD의 파일 편집 규모(S/L)·수정 실패 반복·계약 파일 편집을 막으며 미저장·주기 리마인더, 읽기 양 안내, 기억 그래프 의존 파일 안내, 되돌리기 어려운 셸 명령 확인을 제공합니다. |
+| **탭 릴레이** | 같은 PC의 다른 Herdr 탭으로 메시지를 보내고(`delegate: true`로 일을 맡기면 받는 탭을 위임 워커로 표시), 쉬고 있는 탭을 한 줄로 깨웁니다. |
 | **탭 복구** | 재부팅 뒤 빈 셸로 다시 열린 탭에서 원래 대화를 이어 엽니다. |
 | **작업 원칙(프롬프트)** | `HEAD_CORE.md`, 스킬 5개, 워커 역할 4개를 제공합니다. |
 
@@ -83,7 +83,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 | 명령 | 하는 일 |
 | :--- | :--- |
 | `cortex-status` | Node 경로, 훅과 MCP 등록, 현재 폴더의 승인·제외 여부, 임베딩이 어디로 보내는지와 포기한 문서, 색인 상태(미색인 문서, 중복 ID), 받은편지함, 현재 탭의 작업 규모(S/L), 설정 문제를 한 화면에 보여 줍니다. 고칠 것이 있으면 `Needs attention` 아래에 나열합니다. |
-| `cortex-work status\|release\|reset [--tab <탭 ID>] [--all]` | 탭에 기록된 폴더별 작업 규모(S/L)와 누적 편집을 조회(`status`)하거나, 현재 폴더(`--all`이면 탭 전체)의 `L`을 `S`로 풀거나(`release`), 파일별 편집 누적만 비웁니다(`reset`). |
+| `cortex-work status\|release\|reset [--tab <탭 ID>] [--all]` | 탭에 기록된 릴레이 위임 상태와 폴더별 작업 규모(S/L)·누적 편집을 조회(`status`)하거나, 현재 폴더(`--all`이면 탭 전체)의 `L`과 위임 상태를 풀거나(`release`), 파일별 편집 누적만 비웁니다(`reset`). |
 | `cortex-worker` | 지시 파일을 읽어 `agy -p` 또는 `claude -p` 헤드리스 워커를 격리된 환경과 세션 한정 권한으로 실행합니다. |
 | `cortex-trust approve [폴더]` | 폴더 하나를 승인합니다(확인 대화상자). |
 | `cortex-trust revoke [폴더]` | 승인을 거둡니다. |
@@ -114,7 +114,7 @@ flowchart TB
 
     subgraph Core["herdr-cortex (Node.js 22.13+)"]
         MCP["MCP 서버 herdr-cortex (도구 10개)"]
-        HOOK["훅 (Claude Code 8개 이벤트 / Antigravity 2개 이벤트)"]
+        HOOK["훅 (Claude Code 8개 이벤트 / Antigravity 4개 이벤트)"]
         TRUST["프로젝트 승인 (cortex-trust, 확인 대화상자)"]
         MEM["기억 엔진 (마크다운 + SQLite 색인 + 검색)"]
         EMB["임베딩 (기본 꺼짐: gemini / openai / ollama / onnx)"]
@@ -175,7 +175,7 @@ flowchart TB
 | `src/revive/` | [README](src/revive/README.md) | 탭별 세션 기록의 형식과 기록 규칙 |
 | `prompts/` | [README](prompts/README.md) | [설계 원리](prompts/README.md#설계-원리), `HEAD_CORE.md`, 개발 기준, 스킬 5개, 워커 역할 3개, [`plan-run`의 기준선 규약](prompts/README.md#plan-run의-기준선-규약) |
 | `scripts/` | [README](scripts/README.md) | [설치와 제거의 전 과정](scripts/README.md#설치와-제거), [셸 명령과 `cortex-status`의 출력](scripts/README.md#셸-명령), [탭 복구의 판정 규칙](scripts/README.md#탭-복구), 설치 보조 함수 |
-| `test/` | [README](test/README.md) | 자동 테스트 21개 파일(216개)의 [구성](test/README.md#테스트-스위트-구성), 실제 홈 격리, [실물과 대역](test/README.md#실물과-대역). `npm test`로 실행합니다. |
+| `test/` | [README](test/README.md) | 자동 테스트 21개 파일(224개)의 [구성](test/README.md#테스트-스위트-구성), 실제 홈 격리, [실물과 대역](test/README.md#실물과-대역). `npm test`로 실행합니다. |
 
 루트에는 [`install.ps1`](install.ps1)과 [`uninstall.ps1`](uninstall.ps1)이 있습니다.
 
@@ -210,11 +210,11 @@ flowchart TB
 
 가장 중요한 것만 적습니다. 모듈별 전체 목록은 각 README의 "한계" 절에 있습니다.
 
-- **Windows 11 전용입니다.** Node 설치 위치가 바뀌면 `install.ps1`을 다시 실행해야 합니다([scripts](scripts/README.md#한계)).
+- **Windows 11 전용이며, 설치 뒤 폴더를 옮기거나 지우기 전에는 먼저 제거해야 합니다.** 설치된 훅은 Node 실행 파일과 이 저장소 스크립트의 절대 경로를 직접 가리킵니다. 설치 뒤 저장소 폴더를 옮기거나 지우거나 Node 설치 위치가 바뀌면 훅 명령 자체가 실행되지 않아 Antigravity의 편집·읽기·명령 도구가 막힐 수 있습니다. 폴더를 옮기거나 지우기 전에 `uninstall.ps1`을 먼저 실행하고, 이미 옮겨 도구가 막혔다면 `%USERPROFILE%\.gemini\config\hooks.json`에서 `herdr-cortex` 항목을 지우거나 그 항목에 `"enabled": false`를 넣은 뒤 새 위치에서 `install.ps1`을 다시 실행하세요([hooks](src/hooks/README.md#한계), [scripts](scripts/README.md#한계)).
 - **승인은 그 폴더 하나에만 적용됩니다.** 하위 폴더의 저장소는 따로 승인해야 하고, 승인하기 전에는 그 폴더에 기억을 저장할 수도 없습니다([core](src/core/README.md#한계)).
-- **보안 장치는 실수를 막는 장치이지 보안 경계가 아닙니다.** 서브에이전트 쓰기 차단은 호스트가 호출자 정보를 넘겨줄 때만 동작하고 훅이 실패하면 통과하며, 에이전트의 자기 승인 방지는 화면 조작과 승인 파일 직접 수정을 막지 못합니다. 작업 규모(S/L)·반복 실패 차단도 편집 도구(`Write`·`Edit`·`MultiEdit`·`NotebookEdit`)만 세므로 셸을 통한 파일 쓰기는 잡지 못하고, 상태 폴더·`cortex-work`·되돌리기 어려운 명령 검사는 문자열 판정이라 흔한 꼴만 잡으며 변수나 `cd`를 거친 우회는 잡지 못하고, 리마인더·읽기 양·기억 그래프 안내는 호출을 막지 않습니다([mcp](src/mcp/README.md#서브에이전트-판정-issubagentcaller), [hooks](src/hooks/README.md#한계), [core](src/core/README.md#이-장치의-한계)).
+- **보안 장치는 실수를 막는 장치이지 보안 경계가 아닙니다.** 서브에이전트 쓰기 차단은 호스트가 호출자 정보를 넘겨줄 때만 동작하며(Claude Code는 훅이 실패하면 호출을 진행하고, Antigravity의 도구 호출 전 훅은 유효한 결정을 내지 않으면 호출이 거부되므로 진입 파일이 어떤 실패에서도 `ask`를 내게 만들었습니다), 에이전트의 자기 승인 방지는 화면 조작과 승인 파일 직접 수정을 막지 못합니다. 작업 규모(S/L)·반복 실패 차단도 편집 도구(`Write`·`Edit`·`MultiEdit`·`NotebookEdit`, Antigravity `write_file`·`edit_file`)만 세므로 셸을 통한 파일 쓰기는 잡지 못하고, 상태 폴더·`cortex-work`·되돌리기 어려운 명령 검사는 문자열 판정이라 흔한 꼴만 잡으며 변수나 `cd`를 거친 우회는 잡지 못하고, 리마인더·읽기 양·기억 그래프 안내는 호출을 막지 않습니다([mcp](src/mcp/README.md#서브에이전트-판정-issubagentcaller), [hooks](src/hooks/README.md#한계), [core](src/core/README.md#이-장치의-한계)).
 - **주입 내용의 "기록이며 지시가 아니다" 표시는 보장이 아닙니다.** 승인한 폴더의 기억은 그대로 대화에 들어가므로, 받아 온 저장소를 승인하기 전에 `.memory\`를 살펴보세요([core](src/core/README.md#한계)).
-- **Antigravity에는 도구 호출 전 훅이 없습니다.** 서브에이전트의 `.memory\` 쓰기 거부, 다른 프로젝트 쓰기 확인, 승인 파일 수정 확인이 적용되지 않고, Antigravity 쪽 동작 전체를 실제로 확인하지 못했습니다([hooks](src/hooks/README.md#antigravity-처리기-antigravitymjs)).
+- **Antigravity 도구 훅에는 호스트 고유의 한계가 있습니다.** `PostToolUse`에서 실패한 명령의 `error`가 비어 있으면 수정 실패 반복 차단이 동작하지 않으며, 서브에이전트 종료 훅이 없어 내장 서브에이전트로 검수받았을 때는 사용자가 `cortex-work release`로 `L`을 풀어야 합니다([hooks](src/hooks/README.md#antigravity-처리기-antigravitymjs)).
 - **임베딩을 켜면 문서 내용과 검색어가 선택한 서비스로 전송됩니다**(`onnx`와 이 PC의 `ollama`는 PC 밖으로 나가지 않음). 색인을 지우면 벡터는 임베딩을 다시 해야 채워집니다([embeddings](src/embeddings/README.md#한계)).
 - **직전 대화는 최대 5턴, 최대 4,500자이고 `hookBudget`의 상한은 9,000자입니다.** `/clear` 뒤에 직전 세션을 특정하지 못하면 복원하지 않습니다([hooks](src/hooks/README.md#한계)).
 - **릴레이는 같은 PC의 탭끼리만 됩니다**([relay](src/relay/README.md#한계)).

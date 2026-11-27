@@ -68,10 +68,19 @@ import {
   runClaudeHook,
 } from '../src/hooks/claude.mjs';
 import {
+  ANTIGRAVITY_POST_TOOL_USE_MATCHER,
+  ANTIGRAVITY_PRE_TOOL_USE_MATCHER,
   CLAUDE_POST_TOOL_USE_FAILURE_MATCHER,
   CLAUDE_POST_TOOL_USE_MATCHER,
   CLAUDE_PRE_TOOL_USE_MATCHER,
 } from '../src/hooks/tool-names.mjs';
+import {
+  handleAntigravityPostToolUse,
+  handleAntigravityPreInvocation,
+  handleAntigravityPreToolUse,
+  handleAntigravitySessionStart,
+  runAntigravityHook,
+} from '../src/hooks/antigravity.mjs';
 import { checkClaudeHooks, installCortex, isOwnHook, uninstallCortex } from '../src/hooks/installer.mjs';
 import { WORK_CLI_USAGE, WORK_EXIT_ERROR, WORK_EXIT_OK, runWorkCli } from '../scripts/cortex-work.mjs';
 import { collectStatus, formatStatus } from '../scripts/cortex-status.mjs';
@@ -3096,6 +3105,766 @@ test('fix5: embedded-command subcommands (git submodule foreach/bisect run, yarn
         assert.deepEqual(callShell(tool, cmd, 'subagent'), {}, `[${tool}] subagent must pass: ${cmd}`);
         assert.deepEqual(callShell(tool, cmd, 'worker'), {}, `[${tool}] worker must pass: ${cmd}`);
       }
+    }
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('Antigravity PreToolUse & PostToolUse: unconditional decision safety & exit 0, limits/L escalation, ask-not-allow, non-counting sessions, workspacePaths[0] root, confirmCommands force_ask/deny, error-only failure counting, and MCP memory_save', () => {
+  const env = makeTempEnv('cortex-ws-agy-tools-');
+  const agyHookScript = path.join(REPO_ROOT, 'src', 'hooks', 'antigravity-tool-entry.mjs');
+  try {
+    // 1. Registered matchers match observed Antigravity tools and skip unrelated / other-server tools on PreToolUse
+    const preRe = new RegExp(`^(?:${ANTIGRAVITY_PRE_TOOL_USE_MATCHER})$`);
+    const postRe = new RegExp(`^(?:${ANTIGRAVITY_POST_TOOL_USE_MATCHER})$`);
+    for (const name of ['write_file', 'edit_file', 'run_command', 'read_file', 'call_mcp_tool', 'mcp__herdr-cortex__memory_save', 'mcp__cortex__memory_save', 'herdr-cortex:memory_save', 'memory_save']) {
+      assert.equal(preRe.test(name), true, `PreToolUse matcher must match: ${name}`);
+    }
+    for (const name of ['run_command', 'call_mcp_tool', 'mcp__herdr-cortex__memory_save', 'herdr-cortex:memory_save', 'memory_save', 'mcp__other__memory_save']) {
+      assert.equal(postRe.test(name), true, `PostToolUse matcher must match: ${name}`);
+    }
+    for (const unrelated of ['search_web', 'ask_question', 'update_steps', 'invoke_subagent', 'mcp__other__memory_save', 'other_server:memory_save']) {
+      assert.equal(preRe.test(unrelated), false, `PreToolUse matcher must skip: ${unrelated}`);
+    }
+    for (const unrelated of ['search_web', 'ask_question', 'update_steps', 'invoke_subagent']) {
+      assert.equal(postRe.test(unrelated), false, `PostToolUse matcher must skip: ${unrelated}`);
+    }
+
+    // 2. CLI subprocess safety: ALWAYS emits valid decision JSON + exit code 0 on empty stdin, malformed JSON,
+    //    unknown tools, missing toolCall fields, and unwritable work-size state folder
+    const baseChildEnv = {
+      ...process.env,
+      HERDR_CORTEX_TEST_HOME: env.homeDir,
+      HERDR_CORTEX_HOME: env.globalDir,
+      HC_TERMINAL_ID: 't-agy-safe',
+    };
+    delete baseChildEnv.HERDR_CORTEX_ROLE;
+
+    const runCliPre = (rawInput, extraEnv = {}) => spawnSync(
+      process.execPath,
+      ['--no-warnings', agyHookScript, 'pre-tool-use', '--id', 'herdr-cortex'],
+      {
+        cwd: env.projectDir,
+        env: { ...baseChildEnv, ...extraEnv },
+        input: rawInput,
+        encoding: 'utf8',
+        windowsHide: true,
+      },
+    );
+
+    const brokenGlobalDir = path.join(env.root, 'unwritable-global');
+    fs.mkdirSync(path.join(brokenGlobalDir, 'state'), { recursive: true });
+    // Put a regular file at `<global>/state/work-size` so mkdirSync/lock inside work-size fails!
+    fs.writeFileSync(path.join(brokenGlobalDir, 'state', 'work-size'), 'blocking-file', 'utf8');
+
+    for (const [label, stdinText, extraEnv] of [
+      ['empty stdin', '', {}],
+      ['whitespace stdin', '   \r\n ', {}],
+      ['malformed JSON', '{not valid json', {}],
+      ['JSON array', '[1,2,3]', {}],
+      ['JSON primitive', '"hello"', {}],
+      ['missing toolCall', JSON.stringify({ conversationId: 'c1', rootConversationId: 'c1', cwd: env.projectDir }), {}],
+      ['null toolCall', JSON.stringify({ conversationId: 'c1', rootConversationId: 'c1', toolCall: null }), {}],
+      ['missing toolCall.name', JSON.stringify({ conversationId: 'c1', rootConversationId: 'c1', toolCall: { id: '1', args: {} } }), {}],
+      ['null toolCall.args', JSON.stringify({ conversationId: 'c1', rootConversationId: 'c1', cwd: env.projectDir, toolCall: { id: '1', name: 'write_file', args: null } }), {}],
+      ['unknown tool', JSON.stringify({ conversationId: 'c1', rootConversationId: 'c1', cwd: env.projectDir, toolCall: { id: '1', name: 'search_web', args: { query: 'test' } } }), {}],
+      ['unwritable state directory', JSON.stringify({
+        conversationId: 'c1',
+        rootConversationId: 'c1',
+        cwd: env.projectDir,
+        workspacePaths: [env.projectDir],
+        lastUserInput: 'edit file',
+        toolCall: { id: '1', name: 'write_file', args: { Path: path.join(env.projectDir, 'a.js'), Content: 'x'.repeat(2000) } },
+      }), { HERDR_CORTEX_HOME: brokenGlobalDir }],
+    ]) {
+      const res = runCliPre(stdinText, extraEnv);
+      assert.equal(res.status, 0, `${label}: exit code must be 0 (stderr=${res.stderr})`);
+      const parsed = JSON.parse(res.stdout.trim());
+      assert.deepEqual(parsed, { decision: 'ask' }, `${label}: must fall back to {"decision":"ask"}`);
+    }
+
+    // In-process exception safety: throwing inside options (`now` throwing) still returns {"decision":"ask"}
+    const thrownRes = runAntigravityHook(
+      'pre-tool-use',
+      {
+        conversationId: 'c1',
+        rootConversationId: 'c1',
+        cwd: env.projectDir,
+        workspacePaths: [env.projectDir],
+        toolCall: { id: '1', name: 'write_file', args: { Path: path.join(env.projectDir, 'a.js'), Content: 'abc' } },
+      },
+      {
+        globalDir: env.globalDir,
+        terminalId: 't-agy-safe',
+        now: () => {
+          throw new Error('boom inside clock');
+        },
+      },
+    );
+    assert.deepEqual(thrownRes, { decision: 'ask' });
+    assert.deepEqual(runAntigravityHook('post-tool-use', null, {}), {});
+
+    // 3. Non-counting sessions: worker, subagent, unknown role, excluded project, workSize.enabled=false
+    const hooksConfigDir = path.join(env.homeDir, '.gemini', 'config');
+    fs.mkdirSync(hooksConfigDir, { recursive: true });
+    const opts = { terminalId: 't-agy-main', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 't-agy-main', TEMP: os.tmpdir(), TMP: os.tmpdir() } };
+    const bigWriteCall = { id: 'tc-big', name: 'write_file', args: { Path: path.join(env.projectDir, 'big.js'), Content: 'x'.repeat(2500) } };
+
+    // Unknown role (no rootConversationId, no transcript, empty lastUserInput) -> passes as ask without counting
+    assert.deepEqual(
+      handleAntigravityPreToolUse({ conversationId: 'c-unk', cwd: env.projectDir, workspacePaths: [env.projectDir], toolCall: bigWriteCall }, opts),
+      { decision: 'ask' },
+    );
+    // Subagent (rootConversationId !== conversationId, or subagent message in lastUserInput) -> passes without counting
+    assert.deepEqual(
+      handleAntigravityPreToolUse({ conversationId: 'c-sub', rootConversationId: 'c-root', cwd: env.projectDir, workspacePaths: [env.projectDir], toolCall: bigWriteCall }, opts),
+      { decision: 'ask' },
+    );
+    assert.deepEqual(
+      handleAntigravityPreToolUse({
+        conversationId: 'c-sub2',
+        cwd: env.projectDir,
+        workspacePaths: [env.projectDir],
+        lastUserInput: '[Message] timestamp=2026-11-27T00:00:00Z sender=parent12345 content=do task',
+        toolCall: bigWriteCall,
+      }, opts),
+      { decision: 'ask' },
+    );
+    // Worker session -> passes without counting
+    assert.deepEqual(
+      handleAntigravityPreToolUse(
+        { conversationId: 'c-root', rootConversationId: 'c-root', cwd: env.projectDir, workspacePaths: [env.projectDir], toolCall: bigWriteCall },
+        { ...opts, env: { ...opts.env, HERDR_CORTEX_ROLE: 'worker' } },
+      ),
+      { decision: 'ask' },
+    );
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir }), null);
+
+    // Excluded project & workSize.enabled: false -> passes without counting
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { excludedProjects: [env.projectDir] });
+    assert.deepEqual(
+      handleAntigravityPreToolUse({ conversationId: 'c-root', rootConversationId: 'c-root', cwd: env.projectDir, workspacePaths: [env.projectDir], toolCall: bigWriteCall }, opts),
+      { decision: 'ask' },
+    );
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { workSize: { enabled: false } });
+    assert.deepEqual(
+      handleAntigravityPreToolUse({ conversationId: 'c-root', rootConversationId: 'c-root', cwd: env.projectDir, workspacePaths: [env.projectDir], toolCall: bigWriteCall }, opts),
+      { decision: 'ask' },
+    );
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), DEFAULT_CONFIG);
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir }), null);
+
+    // 4. workspacePaths[0] takes precedence over cwd (e.g. hooks.json folder); missing workspacePaths[0] falls back
+    assert.equal(
+      resolveWorkSizeProjectRoot({ cwd: hooksConfigDir, workspacePaths: [env.projectDir, env.projectB] }),
+      env.projectDir,
+    );
+    assert.equal(
+      resolveWorkSizeProjectRoot({ cwd: env.projectB, workspacePaths: [path.join(env.root, 'no-such-ws'), env.projectDir] }),
+      env.projectB,
+    );
+
+    // 5. Limits, ask-not-allow, S -> L escalation, PostToolUse error-only failure counting, git commit, and MCP memory_save
+    const srcSubdir = path.join(env.projectDir, 'src');
+    fs.mkdirSync(srcSubdir, { recursive: true });
+    const rootBase = {
+      conversationId: 'c-root',
+      cwd: srcSubdir,
+      workspacePaths: [env.projectDir],
+      lastUserInput: 'implement feature',
+    };
+    const fileA = path.join(env.projectDir, 'src', 'a.js');
+    const fileB = path.join(env.projectDir, 'src', 'b.js');
+
+    const w1 = handleAntigravityPreToolUse(
+      { ...rootBase, cwd: hooksConfigDir, toolCall: { id: '1', name: 'write_file', args: { Path: fileA, Content: 'a'.repeat(600), Overwrite: true } } },
+      opts,
+    );
+    assert.deepEqual(w1, { decision: 'ask' }, 'pass must be ask, NEVER allow');
+    const e1 = handleAntigravityPreToolUse(
+      { ...rootBase, cwd: hooksConfigDir, toolCall: { id: '2', name: 'edit_file', args: { Path: fileA, Target: 'a', Replacement: 'b'.repeat(400) } } },
+      opts,
+    );
+    assert.deepEqual(e1, { decision: 'ask' }, 'exact 1,000-char boundary passes as ask');
+
+    const over = handleAntigravityPreToolUse(
+      { ...rootBase, cwd: hooksConfigDir, toolCall: { id: '3', name: 'edit_file', args: { Path: fileA, Target: 'b', Replacement: 'c' } } },
+      opts,
+    );
+    assert.equal(over.decision, 'deny');
+    assert.match(over.reason, /1,001자/);
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir }).size, 'L');
+
+    // PostToolUse on run_command: empty `error: ""` is NOT counted as failure, and `git commit` outside project does NOT clear
+    handleAntigravityPostToolUse(
+      { ...rootBase, error: '', toolCall: { id: '4', name: 'run_command', args: { CommandLine: 'npm test', WaitMsBeforeAsync: 5000, toolSummary: 'Test' } } },
+      opts,
+    );
+    assert.deepEqual(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir }).failedRetries, {});
+
+    handleAntigravityPostToolUse(
+      { ...rootBase, cwd: hooksConfigDir, error: '', toolCall: { id: '5-out', name: 'run_command', args: { CommandLine: 'git commit -m "outside"' } } },
+      opts,
+    );
+    assert.deepEqual(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir }).files, { 'src/a.js': 1000 });
+
+    // In-project `git commit` (from project or subfolder `srcSubdir`) clears cumulative window!
+    handleAntigravityPostToolUse(
+      { ...rootBase, error: '', toolCall: { id: '5', name: 'run_command', args: { CommandLine: 'git commit -m "clear"' } } },
+      opts,
+    );
+    assert.deepEqual(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir }).files, {});
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      assert.deepEqual(
+        handleAntigravityPreToolUse(
+          { ...rootBase, toolCall: { id: `f-${attempt}`, name: 'edit_file', args: { Path: fileB, Target: 'x', Replacement: 'y' } } },
+          opts,
+        ),
+        { decision: 'ask' },
+      );
+      handleAntigravityPostToolUse(
+        { ...rootBase, error: 'Command failed with exit code 1', toolCall: { id: `r-${attempt}`, name: 'run_command', args: { CommandLine: 'npm test' } } },
+        opts,
+      );
+    }
+    const failBlocked = handleAntigravityPreToolUse(
+      { ...rootBase, toolCall: { id: 'f-3', name: 'edit_file', args: { Path: fileB, Target: 'x', Replacement: 'z' } } },
+      opts,
+    );
+    assert.equal(failBlocked.decision, 'deny');
+    assert.match(failBlocked.reason, /명령 실패가 2회 되풀이/);
+
+    // MCP `memory_save` via Antigravity `call_mcp_tool` AND via `*memory_save` suffix clears window & records memorySaved!
+    handleAntigravityPostToolUse(
+      {
+        ...rootBase,
+        error: '',
+        toolCall: {
+          id: 'mcp-1',
+          name: 'call_mcp_tool',
+          args: { ServerName: 'herdr-cortex', ToolName: 'memory_save', Arguments: { type: 'worklog', title: 't', summary: 's' } },
+        },
+      },
+      opts,
+    );
+    const afterMcpSave = readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir });
+    assert.deepEqual(afterMcpSave.files, {});
+    assert.deepEqual(afterMcpSave.failedRetries, {});
+    assert.equal(afterMcpSave.memorySaved, true);
+
+    // Suffix `herdr-cortex_memory_save` with non-empty `error` does NOT clear; empty `error` DOES clear
+    handleAntigravityPreToolUse(
+      { ...rootBase, toolCall: { id: 'w-b', name: 'write_file', args: { Path: fileB, Content: 'hello' } } },
+      opts,
+    );
+    handleAntigravityPostToolUse(
+      { ...rootBase, error: 'MCP tool error', toolCall: { id: 'mcp-err', name: 'custom_memory_save', args: {} } },
+      opts,
+    );
+    assert.deepEqual(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir }).files, { 'src/b.js': 5 });
+    handleAntigravityPostToolUse(
+      { ...rootBase, error: '', toolCall: { id: 'mcp-ok', name: 'custom_memory_save', args: {} } },
+      opts,
+    );
+    assert.deepEqual(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-main'), { cwd: env.projectDir }).files, {});
+
+    // 6. Hard-to-reverse commands on `run_command`: `force_ask` in main, `deny` in subagent & worker, `ask` for safe commands
+    const hardCmd = 'git reset --hard HEAD~1';
+    const mainHard = handleAntigravityPreToolUse(
+      { ...rootBase, toolCall: { id: 'sh-1', name: 'run_command', args: { CommandLine: hardCmd } } },
+      opts,
+    );
+    assert.equal(mainHard.decision, 'force_ask');
+    assert.match(mainHard.reason, /되돌리기 어려운 셸 명령/);
+
+    const subHard = handleAntigravityPreToolUse(
+      { ...rootBase, rootConversationId: 'other-root', toolCall: { id: 'sh-2', name: 'run_command', args: { CommandLine: hardCmd } } },
+      opts,
+    );
+    assert.equal(subHard.decision, 'deny');
+
+    const workerHard = handleAntigravityPreToolUse(
+      { ...rootBase, toolCall: { id: 'sh-3', name: 'run_command', args: { CommandLine: hardCmd } } },
+      { ...opts, env: { ...opts.env, HERDR_CORTEX_ROLE: 'worker' } },
+    );
+    assert.equal(workerHard.decision, 'deny');
+
+    const safeShell = handleAntigravityPreToolUse(
+      { ...rootBase, toolCall: { id: 'sh-4', name: 'run_command', args: { CommandLine: 'git status' } } },
+      opts,
+    );
+    assert.deepEqual(safeShell, { decision: 'ask' });
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('Cross-host state continuity (Claude Code <-> Antigravity) and deferred non-blocking notices in next PreInvocation within hookBudget', () => {
+  const env = makeTempEnv('cortex-ws-cross-host-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  try {
+    // Seed an active decision referencing `src/dep.js` in SQLite index so dependency notice triggers on first edit
+    store.saveDoc({
+      id: 'dec-agy-dep',
+      type: 'decision',
+      title: 'Dep Contract',
+      summary: 'Keep src/dep.js output stable',
+      files: ['src/dep.js'],
+    });
+    store.close();
+
+    const sharedOpts = {
+      terminalId: 't-shared',
+      globalDir: env.globalDir,
+      homeDir: env.homeDir,
+      promptsDir: env.promptsDir,
+      env: { HC_TERMINAL_ID: 't-shared' },
+    };
+
+    // 1. Accumulate 600 chars in Claude Code, then switch to Antigravity in the SAME tab -> state continues seamlessly!
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { session_id: 'cl-1', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'src/dep.js', content: 'x'.repeat(600) } },
+        sharedOpts,
+      ).hookSpecificOutput?.permissionDecision,
+      undefined,
+    );
+
+    const agyDeny = handleAntigravityPreToolUse(
+      {
+        conversationId: 'agy-1',
+        rootConversationId: 'agy-1',
+        cwd: env.projectDir,
+        workspacePaths: [env.projectDir],
+        lastUserInput: 'continue in agy',
+        toolCall: { id: '1', name: 'edit_file', args: { Path: path.join(env.projectDir, 'src', 'dep.js'), Target: 'x', Replacement: 'y'.repeat(500) } },
+      },
+      sharedOpts,
+    );
+    assert.equal(agyDeny.decision, 'deny');
+    assert.match(agyDeny.reason, /1,100자/);
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-shared'), { cwd: env.projectDir }).size, 'L');
+
+    // Switching back to Claude Code in the same tab sees L escalated by Antigravity!
+    const claudeStart = handleClaudeSessionStart({ session_id: 'cl-2', source: 'startup', cwd: env.projectDir }, { ...sharedOpts, part: 'context' });
+    assert.match(claudeStart.hookSpecificOutput?.additionalContext || '', /진행 중인 L 작업/);
+    assert.equal(
+      handleClaudePreToolUse(
+        { session_id: 'cl-2', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'src/second.js', content: 'z' } },
+        sharedOpts,
+      ).hookSpecificOutput?.permissionDecision,
+      'deny',
+    );
+
+    // Antigravity SessionStart ALSO shows the unfinished L notice
+    const agyStart = handleAntigravitySessionStart(
+      { conversationId: 'agy-start-1', rootConversationId: 'agy-start-1', cwd: env.projectDir, workspacePaths: [env.projectDir] },
+      sharedOpts,
+    );
+    const agyStartTexts = (agyStart.injectSteps || []).map((s) => s.systemMessage.systemMessage);
+    assert.ok(agyStartTexts.some((t) => t.includes('진행 중인 L 작업')));
+
+    // 2. Non-blocking notices (dependency notice, read-volume notice, unsaved/periodic reminders, L completion notice)
+    //    are queued and emitted ONCE in the next `PreInvocation` within `hookBudget`, then cleared!
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), {
+      hookBudget: 4000,
+      workSize: { readNoticeThreshold: 2, reminderEveryTurns: 2 },
+    });
+    const noticeOpts = {
+      terminalId: 't-agy-notices',
+      globalDir: env.globalDir,
+      homeDir: env.homeDir,
+      promptsDir: env.promptsDir,
+      env: { HC_TERMINAL_ID: 't-agy-notices' },
+    };
+    const convBase = {
+      conversationId: 'agy-notice-conv',
+      rootConversationId: 'agy-notice-conv',
+      cwd: env.projectDir,
+      workspacePaths: [env.projectDir],
+    };
+
+    // Turn 1 startup PreInvocation
+    handleAntigravityPreInvocation({ ...convBase, initialNumSteps: 0, invocationNum: 0, lastUserInput: 'Turn 1 prompt' }, noticeOpts);
+
+    // Edit `src/dep.js` (queues dependency notice) + 3 `read_file` calls in same turn (3rd > threshold 2 -> queues read notice)
+    assert.deepEqual(
+      handleAntigravityPreToolUse(
+        { ...convBase, lastUserInput: 'Turn 1 prompt', toolCall: { id: 'e1', name: 'write_file', args: { Path: path.join(env.projectDir, 'src', 'dep.js'), Content: 'abc' } } },
+        noticeOpts,
+      ),
+      { decision: 'ask' },
+    );
+    for (let r = 1; r <= 3; r++) {
+      assert.deepEqual(
+        handleAntigravityPreToolUse(
+          { ...convBase, lastUserInput: 'Turn 1 prompt', toolCall: { id: `r-${r}`, name: 'read_file', args: { Path: path.join(env.projectDir, 'src', 'dep.js') } } },
+          noticeOpts,
+        ),
+        { decision: 'ask' },
+      );
+    }
+
+    // Mid-turn PreInvocation (`invocationNum: 1`, same `initialNumSteps: 0` and `lastUserInput`) flushes BOTH queued notices once!
+    const midTurn = handleAntigravityPreInvocation(
+      { ...convBase, initialNumSteps: 0, invocationNum: 1, lastUserInput: 'Turn 1 prompt' },
+      noticeOpts,
+    );
+    const midTexts = (midTurn.injectSteps || []).map((s) => s.systemMessage.systemMessage);
+    assert.ok(midTexts.some((t) => t.includes('dec-agy-dep')), `expected dependency notice in: ${JSON.stringify(midTexts)}`);
+    assert.ok(midTexts.some((t) => t.includes('읽기·검색 도구를 3회 호출')), `expected read notice in: ${JSON.stringify(midTexts)}`);
+    assert.ok(midTexts.reduce((acc, s) => acc + s.length, 0) <= 4000, 'within hookBudget');
+
+    // Immediately following mid-turn PreInvocation (`invocationNum: 2`) does NOT repeat them!
+    const midTurn2 = handleAntigravityPreInvocation(
+      { ...convBase, initialNumSteps: 0, invocationNum: 2, lastUserInput: 'Turn 1 prompt' },
+      noticeOpts,
+    );
+    assert.deepEqual(midTurn2, {});
+
+    // Turn 2 (`initialNumSteps: 5`, new user turn, 2nd prompt -> `reminderEveryTurns: 2`): emits unsaved + periodic reminders!
+    const turn2 = handleAntigravityPreInvocation(
+      { ...convBase, initialNumSteps: 5, invocationNum: 0, lastUserInput: 'Turn 2 prompt' },
+      noticeOpts,
+    );
+    const turn2Texts = (turn2.injectSteps || []).map((s) => s.systemMessage.systemMessage);
+    assert.ok(turn2Texts.some((t) => t.includes('미저장 활동(편집 파일 1개')), `expected unsaved reminder: ${JSON.stringify(turn2Texts)}`);
+    assert.ok(turn2Texts.some((t) => t.includes('지금 상태: S')), `expected periodic reminder: ${JSON.stringify(turn2Texts)}`);
+
+    // Escalate to L, record review ACCEPT + memory_save -> next PreInvocation emits WORK_SIZE_COMPLETED_NOTICE once!
+    const esc = handleAntigravityPreToolUse(
+      { ...convBase, lastUserInput: 'Turn 2 prompt', toolCall: { id: 'e2', name: 'write_file', args: { Path: path.join(env.projectDir, 'src', 'other.js'), Content: 'xyz' } } },
+      noticeOpts,
+    );
+    assert.equal(esc.decision, 'deny');
+    handleClaudeSubagentStop({ cwd: env.projectDir, last_assistant_message: '최종 판정: ACCEPT' }, noticeOpts);
+    handleAntigravityPostToolUse(
+      {
+        ...convBase,
+        error: '',
+        lastUserInput: 'Turn 2 prompt',
+        toolCall: { id: 'ms-1', name: 'call_mcp_tool', args: { ServerName: 'herdr-cortex', ToolName: 'memory_save', Arguments: { type: 'worklog' } } },
+      },
+      noticeOpts,
+    );
+
+    const afterComplete = handleAntigravityPreInvocation(
+      { ...convBase, initialNumSteps: 5, invocationNum: 3, lastUserInput: 'Turn 2 prompt' },
+      noticeOpts,
+    );
+    const completeTexts = (afterComplete.injectSteps || []).map((s) => s.systemMessage.systemMessage);
+    assert.deepEqual(completeTexts, [WORK_SIZE_COMPLETED_NOTICE]);
+    assert.deepEqual(
+      handleAntigravityPreInvocation({ ...convBase, initialNumSteps: 5, invocationNum: 4, lastUserInput: 'Turn 2 prompt' }, noticeOpts),
+      {},
+    );
+  } finally {
+    try { store.close(); } catch { /* already closed */ }
+    env.cleanup();
+  }
+});
+
+test('Antigravity tool entry resilience (broken module copy), UNC/long-path fast guard, MCP server-name scoping, and dual-shell run_command inspection', () => {
+  const env = makeTempEnv('cortex-ws-agy-fix-');
+  try {
+    // 1. `antigravity-tool-entry.mjs` has ONLY `node:` static imports
+    const entrySrcPath = path.join(REPO_ROOT, 'src', 'hooks', 'antigravity-tool-entry.mjs');
+    const entrySrc = fs.readFileSync(entrySrcPath, 'utf8');
+    const staticImports = [...entrySrc.matchAll(/^\s*import\s+(?:[^'"]+?\s+from\s+)?['"]([^'"]+)['"]/gm)].map((m) => m[1]);
+    assert.ok(staticImports.length >= 1, 'expected at least one built-in import');
+    for (const spec of staticImports) {
+      assert.ok(spec.startsWith('node:'), `antigravity-tool-entry.mjs must only statically import node: built-ins, saw "${spec}"`);
+    }
+
+    // 2. Break modules inside an isolated temporary copy of `src/` (syntax error, missing export, top-level throw,
+    //    missing file, invalid return value) and run `antigravity-tool-entry.mjs` as a real child process
+    const copyRoot = path.join(env.root, 'repo-copy');
+    fs.cpSync(path.join(REPO_ROOT, 'src'), path.join(copyRoot, 'src'), { recursive: true });
+    const copyEntry = path.join(copyRoot, 'src', 'hooks', 'antigravity-tool-entry.mjs');
+    const childEnv = {
+      ...process.env,
+      HERDR_CORTEX_TEST_HOME: env.homeDir,
+      HERDR_CORTEX_HOME: env.globalDir,
+      HC_TERMINAL_ID: 't-entry-copy',
+    };
+    delete childEnv.HERDR_CORTEX_ROLE;
+
+    const samplePayload = JSON.stringify({
+      conversationId: 'c1',
+      rootConversationId: 'c1',
+      cwd: env.projectDir,
+      workspacePaths: [env.projectDir],
+      lastUserInput: 'edit file',
+      toolCall: { id: '1', name: 'write_file', args: { Path: path.join(env.projectDir, 'a.js'), Content: 'abc' } },
+    });
+
+    const runCopyEntry = (eventArg, stdinInput = samplePayload, extraEnv = {}) => spawnSync(
+      process.execPath,
+      ['--no-warnings', copyEntry, eventArg, '--id', 'herdr-cortex'],
+      { cwd: env.projectDir, env: { ...childEnv, ...extraEnv }, input: stdinInput, encoding: 'utf8', windowsHide: true },
+    );
+
+    const mutations = [
+      {
+        label: 'syntax error in work-size.mjs',
+        rel: 'src/hooks/work-size.mjs',
+        mutate: (s) => `${s}\nconst = ;\n`,
+      },
+      {
+        label: 'syntax error in confirm-commands.mjs',
+        rel: 'src/hooks/confirm-commands.mjs',
+        mutate: (s) => `${s}\nfunction broken( { \n`,
+      },
+      {
+        label: 'syntax error in antigravity.mjs',
+        rel: 'src/hooks/antigravity.mjs',
+        mutate: (s) => `${s}\nexport const = 1;\n`,
+      },
+      {
+        label: 'missing export in tool-names.mjs',
+        rel: 'src/hooks/tool-names.mjs',
+        mutate: (s) => s.replace('export const ANTIGRAVITY_SHELL_TOOL_NAMES', 'const ANTIGRAVITY_SHELL_TOOL_NAMES'),
+      },
+      {
+        label: 'missing runAntigravityHook export in antigravity.mjs',
+        rel: 'src/hooks/antigravity.mjs',
+        mutate: (s) => s.replace('export function runAntigravityHook', 'function runAntigravityHook'),
+      },
+      {
+        label: 'top-level exception + console.log noise in work-size.mjs',
+        rel: 'src/hooks/work-size.mjs',
+        mutate: (s) => `console.log('STDOUT_POLLUTION_ATTEMPT');\nthrow new Error('top-level module crash');\n${s}`,
+      },
+      {
+        label: 'invalid PreToolUse return shape ({}) from antigravity.mjs',
+        rel: 'src/hooks/antigravity.mjs',
+        mutate: (s) => s.replace('export function runAntigravityHook(', 'export function runAntigravityHook() { return {}; }\nfunction _origRun('),
+      },
+    ];
+
+    for (const m of mutations) {
+      const targetFile = path.join(copyRoot, m.rel);
+      const orig = fs.readFileSync(targetFile, 'utf8');
+      try {
+        fs.writeFileSync(targetFile, m.mutate(orig), 'utf8');
+        const preRes = runCopyEntry('pre-tool-use');
+        assert.equal(preRes.status, 0, `${m.label} (pre): exit 0`);
+        assert.equal(preRes.stdout, '{"decision":"ask"}\n', `${m.label} (pre): exact single-line JSON on stdout`);
+        assert.equal(preRes.stderr.trim().split(/\r?\n/).length, 1, `${m.label} (pre): 1 diagnostic line on stderr`);
+
+        const postRes = runCopyEntry('post-tool-use');
+        assert.equal(postRes.status, 0, `${m.label} (post): exit 0`);
+        assert.equal(postRes.stdout, '{}\n', `${m.label} (post): exact {} on stdout`);
+      } finally {
+        fs.writeFileSync(targetFile, orig, 'utf8');
+      }
+    }
+
+    // Missing `antigravity.mjs` file altogether
+    const agyCopyFile = path.join(copyRoot, 'src', 'hooks', 'antigravity.mjs');
+    const agyOrigBytes = fs.readFileSync(agyCopyFile);
+    try {
+      fs.unlinkSync(agyCopyFile);
+      const preMissing = runCopyEntry('pre-tool-use');
+      assert.equal(preMissing.status, 0);
+      assert.equal(preMissing.stdout, '{"decision":"ask"}\n');
+      assert.equal(preMissing.stderr.trim().split(/\r?\n/).length, 1);
+
+      const postMissing = runCopyEntry('post-tool-use');
+      assert.equal(postMissing.status, 0);
+      assert.equal(postMissing.stdout, '{}\n');
+    } finally {
+      fs.writeFileSync(agyCopyFile, agyOrigBytes);
+    }
+
+    // Hanging Promise (`new Promise(() => {})`) in handler: safety timer stays ref'd and emits fallback JSON with exit 0
+    try {
+      const agyOrigText = agyOrigBytes.toString('utf8');
+      fs.writeFileSync(
+        agyCopyFile,
+        agyOrigText.replace('export function runAntigravityHook(', 'export function runAntigravityHook() { return new Promise(() => {}); }\nfunction _origRun('),
+        'utf8',
+      );
+      const preHang = runCopyEntry('pre-tool-use', samplePayload, { HERDR_CORTEX_ENTRY_TIMEOUT_MS: '300' });
+      assert.equal(preHang.status, 0, 'hanging promise (pre): exit 0');
+      assert.equal(preHang.stdout, '{"decision":"ask"}\n', 'hanging promise (pre): fallback JSON');
+
+      const postHang = runCopyEntry('post-tool-use', samplePayload, { HERDR_CORTEX_ENTRY_TIMEOUT_MS: '300' });
+      assert.equal(postHang.status, 0, 'hanging promise (post): exit 0');
+      assert.equal(postHang.stdout, '{}\n', 'hanging promise (post): fallback {}');
+    } finally {
+      fs.writeFileSync(agyCopyFile, agyOrigBytes);
+    }
+
+    // Dynamic import calling `process.exit(3)` mid-load: exit handler emits fallback JSON and resets exit code to 0
+    try {
+      const agyOrigText = agyOrigBytes.toString('utf8');
+      fs.writeFileSync(agyCopyFile, `process.exit(3);\n${agyOrigText}`, 'utf8');
+      const preExit = runCopyEntry('pre-tool-use');
+      assert.equal(preExit.status, 0, 'mid-import process.exit(3) (pre): exit 0');
+      assert.equal(preExit.stdout, '{"decision":"ask"}\n', 'mid-import process.exit(3) (pre): fallback JSON');
+
+      const postExit = runCopyEntry('post-tool-use');
+      assert.equal(postExit.status, 0, 'mid-import process.exit(3) (post): exit 0');
+      assert.equal(postExit.stdout, '{}\n', 'mid-import process.exit(3) (post): fallback {}');
+    } finally {
+      fs.writeFileSync(agyCopyFile, agyOrigBytes);
+    }
+
+    // 3. UNC (`\\...`) and overlong (>1,024 chars, including 32,000 chars) `Path` inputs bypass path resolution cleanly & fast
+    const opts = {
+      terminalId: 't-agy-fix',
+      globalDir: env.globalDir,
+      env: { HC_TERMINAL_ID: 't-agy-fix', TEMP: os.tmpdir(), TMP: os.tmpdir() },
+    };
+    const rootBase = {
+      conversationId: 'c-fix',
+      rootConversationId: 'c-fix',
+      cwd: env.projectDir,
+      workspacePaths: [env.projectDir],
+      lastUserInput: 'do task',
+    };
+    const uncPath = '\\\\192.0.2.1\\unreachable-share\\f.js';
+    const over1kPath = path.join(env.projectDir, `${'a'.repeat(1100)}.js`);
+    const path32k = `C:\\${'a\\'.repeat(16000)}f.js`;
+
+    for (const slowPath of [uncPath, over1kPath, path32k]) {
+      for (const toolName of ['write_file', 'edit_file', 'read_file']) {
+        const t0 = performance.now();
+        const res = handleAntigravityPreToolUse(
+          {
+            ...rootBase,
+            toolCall: { id: 'slow-1', name: toolName, args: { Path: slowPath, Content: 'x'.repeat(2000), Replacement: 'y'.repeat(2000) } },
+          },
+          opts,
+        );
+        const elapsed = performance.now() - t0;
+        assert.deepEqual(res, { decision: 'ask' }, `${toolName} on len=${slowPath.length}`);
+        assert.ok(elapsed < 50, `${toolName} must skip path resolution immediately, took ${elapsed.toFixed(1)}ms`);
+      }
+    }
+    // Subprocess check on UNC path finishes well within bound (<1500ms) instead of 21s SMB timeout
+    const uncSubStart = performance.now();
+    const uncSub = runCopyEntry('pre-tool-use', JSON.stringify({
+      ...rootBase,
+      toolCall: { id: 'unc-sub', name: 'write_file', args: { Path: uncPath, Content: 'x' } },
+    }));
+    const uncSubElapsed = performance.now() - uncSubStart;
+    assert.equal(uncSub.status, 0);
+    assert.equal(uncSub.stdout, '{"decision":"ask"}\n');
+    assert.ok(uncSubElapsed < 1500, `UNC subprocess must finish fast, took ${uncSubElapsed.toFixed(0)}ms`);
+
+    // Relative `Path` with UNC `cwd` or combined length > 1,024 chars also fast-fails without hitting filesystem
+    const relUncStart = performance.now();
+    const relUncRes = handleAntigravityPreToolUse(
+      {
+        ...rootBase,
+        cwd: '\\\\192.0.2.9\\share\\proj',
+        workspacePaths: ['\\\\192.0.2.9\\share\\proj'],
+        toolCall: { id: 'unc-rel', name: 'write_file', args: { Path: 'src\\f.js', Content: 'x'.repeat(2000) } },
+      },
+      opts,
+    );
+    const relUncElapsed = performance.now() - relUncStart;
+    assert.deepEqual(relUncRes, { decision: 'ask' });
+    assert.ok(relUncElapsed < 500, `relative Path under UNC cwd must finish fast, took ${relUncElapsed.toFixed(1)}ms`);
+
+    const overlongCombinedCwd = path.join(env.projectDir, 'd'.repeat(600));
+    const overlongCombinedRes = handleAntigravityPreToolUse(
+      {
+        ...rootBase,
+        cwd: overlongCombinedCwd,
+        toolCall: { id: 'long-rel', name: 'write_file', args: { Path: `${'s'.repeat(500)}.js`, Content: 'x'.repeat(2000) } },
+      },
+      opts,
+    );
+    assert.deepEqual(overlongCombinedRes, { decision: 'ask' });
+
+    // 4. MCP tool name scoping: other servers' `memory_save` NEVER triggers `deny` (subagent) or `force_ask` (other project),
+    //    while `herdr-cortex`/`cortex` DOES; suffix-only `memory_save` is only accepted by `PostToolUse`
+    const otherProj = path.join(env.root, 'other-project');
+    fs.mkdirSync(otherProj, { recursive: true });
+    for (const foreignCall of [
+      { id: 'f1', name: 'mcp__other-notes__memory_save', args: { project_dir: otherProj } },
+      { id: 'f2', name: 'other_server:memory_save', args: { project_dir: otherProj } },
+      { id: 'f3', name: 'custom_memory_save', args: { project_dir: otherProj } },
+      { id: 'f4', name: 'call_mcp_tool', args: { ServerName: 'other-notes', ToolName: 'memory_save', Arguments: { project_dir: otherProj } } },
+    ]) {
+      assert.deepEqual(
+        handleAntigravityPreToolUse({ ...rootBase, rootConversationId: 'parent-conv', toolCall: foreignCall }, opts),
+        { decision: 'ask' },
+        `foreign ${foreignCall.name} must NOT be denied in subagent`,
+      );
+      assert.deepEqual(
+        handleAntigravityPreToolUse({ ...rootBase, toolCall: foreignCall }, opts),
+        { decision: 'ask' },
+        `foreign ${foreignCall.name} must NOT force_ask in main`,
+      );
+    }
+
+    for (const ownCall of [
+      { id: 'o1', name: 'mcp__herdr-cortex__memory_save', args: { project_dir: otherProj } },
+      { id: 'o2', name: 'mcp__cortex__memory_save', args: { project_dir: otherProj } },
+      { id: 'o3', name: 'herdr-cortex:memory_save', args: { project_dir: otherProj } },
+      { id: 'o4', name: 'memory_save', args: { project_dir: otherProj } },
+      { id: 'o5', name: 'call_mcp_tool', args: { ServerName: 'herdr-cortex', ToolName: 'memory_save', Arguments: { project_dir: otherProj } } },
+    ]) {
+      assert.equal(
+        handleAntigravityPreToolUse({ ...rootBase, rootConversationId: 'parent-conv', toolCall: ownCall }, opts).decision,
+        'deny',
+        `own ${ownCall.name} must be denied in subagent`,
+      );
+      assert.equal(
+        handleAntigravityPreToolUse({ ...rootBase, toolCall: ownCall }, opts).decision,
+        'force_ask',
+        `own ${ownCall.name} must force_ask on other project_dir`,
+      );
+    }
+
+    // `call_mcp_tool` naming another server does NOT clear window on PostToolUse either
+    handleAntigravityPreToolUse(
+      { ...rootBase, toolCall: { id: 'w1', name: 'write_file', args: { Path: path.join(env.projectDir, 'keep.js'), Content: 'abc' } } },
+      opts,
+    );
+    handleAntigravityPostToolUse(
+      {
+        ...rootBase,
+        error: '',
+        toolCall: { id: 'f-post', name: 'call_mcp_tool', args: { ServerName: 'other-notes', ToolName: 'memory_save', Arguments: {} } },
+      },
+      opts,
+    );
+    assert.deepEqual(readWorkSizeState(env.globalDir, tabWorkSizeScope('t-agy-fix'), { cwd: env.projectDir }).files, { 'keep.js': 3 });
+
+    // 5. Dual-shell interpretation on Antigravity `run_command`: both PowerShell backtick and Bash `\'` forms guard
+    const dualShellDangerous = [
+      'Write-Host "a`nb"; git push --force',
+      "echo Don\\'t; git push --force; echo It\\'s",
+    ];
+    for (const cmd of dualShellDangerous) {
+      assert.equal(
+        handleAntigravityPreToolUse({ ...rootBase, toolCall: { id: 'ds-m', name: 'run_command', args: { CommandLine: cmd } } }, opts).decision,
+        'force_ask',
+        `Antigravity main must force_ask: ${cmd}`,
+      );
+      assert.equal(
+        handleAntigravityPreToolUse(
+          { ...rootBase, rootConversationId: 'other-root', toolCall: { id: 'ds-s', name: 'run_command', args: { CommandLine: cmd } } },
+          opts,
+        ).decision,
+        'deny',
+        `Antigravity subagent must deny: ${cmd}`,
+      );
+      assert.equal(
+        handleAntigravityPreToolUse(
+          { ...rootBase, toolCall: { id: 'ds-w', name: 'run_command', args: { CommandLine: cmd } } },
+          { ...opts, env: { ...opts.env, HERDR_CORTEX_ROLE: 'worker' } },
+        ).decision,
+        'deny',
+        `Antigravity worker must deny: ${cmd}`,
+      );
     }
   } finally {
     env.cleanup();

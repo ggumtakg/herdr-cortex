@@ -37,10 +37,28 @@ import {
   formatLongMessageNotice,
   getLegacyProjectInboxDir,
   getTerminalInboxDir,
+  hasPendingDelegatedMessage,
   peekInbox,
 } from '../src/relay/inbox.mjs';
-import { handleClaudeSessionStart, handleClaudeUserPrompt } from '../src/hooks/claude.mjs';
-import { handleAntigravityPreInvocation } from '../src/hooks/antigravity.mjs';
+import {
+  handleClaudePostToolUseFailure,
+  handleClaudePreToolUse,
+  handleClaudeSessionStart,
+  handleClaudeUserPrompt,
+} from '../src/hooks/claude.mjs';
+import {
+  handleAntigravityPreInvocation,
+  handleAntigravityPreToolUse,
+  handleAntigravitySessionStart,
+} from '../src/hooks/antigravity.mjs';
+import {
+  WORK_SIZE_DELEGATION_TTL_MS,
+  getTabDelegation,
+  readWorkSizeState,
+  recordTabDelegation,
+  tabWorkSizeScope,
+} from '../src/hooks/work-size.mjs';
+import { runWorkCli } from '../scripts/cortex-work.mjs';
 import { approveAsUser } from './support/approve.mjs';
 import { UNTRUSTED_MEMORY_PREAMBLE } from '../src/core/budget.mjs';
 
@@ -1682,6 +1700,379 @@ test('P0-3, P0-11, P1-8, P1-11, P2-5 regression: MCP excludedProjects enforcemen
   } finally {
     excludedStore.close();
     enabledStore.close();
+    env.cleanup();
+  }
+});
+
+test('relay_send(delegate: true): delegation lifecycle in Claude Code & Antigravity, 4 end conditions, preservation of prior L & counts, cortex-work status, and non-delegate no-op', async () => {
+  const env = makeTempEnv('cortex-relay-delegate-');
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  const hc = makeFakeHc({
+    get: {
+      t1: hcGetAgent({ address: 't1', cwd: env.projectDir, statusState: 'idle' }),
+      t2: hcGetAgent({ address: 't2', cwd: env.projectDir, statusState: 'idle' }),
+      t3: hcGetAgent({ address: 't3', cwd: env.projectDir, statusState: 'idle' }),
+    },
+  });
+  const makeServerForTab = (tid, extraEnv = {}) => createMcpServer({
+    store,
+    hcClient: hc,
+    env: { ...process.env, HC_TERMINAL_ID: tid, ...extraEnv },
+  });
+
+  try {
+    const serverT1 = makeServerForTab('t1');
+    const serverT2 = makeServerForTab('t2');
+    const serverT3 = makeServerForTab('t3');
+
+    // 1. Subagent and worker session are STILL denied on `relay_send(delegate: true)`
+    const subDenied = await serverT1.handleMessage({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'relay_send', arguments: { to_terminal_id: 't2', message: 'task', delegate: true }, _meta: { agent_id: 'sub-1' } },
+    });
+    assert.equal(subDenied.result.isError, true);
+    assert.equal(JSON.parse(subDenied.result.content[0].text).error, 'SUBAGENT_WRITE_DENIED');
+
+    const workerServer = makeServerForTab('t1', { HERDR_CORTEX_ROLE: 'worker' });
+    const workerDenied = await callTool(workerServer, 'relay_send', { to_terminal_id: 't2', message: 'task', delegate: true });
+    assert.equal(workerDenied.isError, true);
+    assert.equal(workerDenied.data.error, 'SUBAGENT_WRITE_DENIED');
+
+    // 1b. Self-delegation & sender verification: 3 rejection cases on `relay_send(delegate: true)` + receiver double defense
+    const selfDenied = await callTool(serverT2, 'relay_send', {
+      to_terminal_id: 't2',
+      message: 'delegate to myself',
+      delegate: true,
+    });
+    assert.equal(selfDenied.isError, true);
+    assert.equal(selfDenied.data.error, 'SELF_DELEGATION');
+    assert.equal(countPendingMessages('t2', { globalDir: env.globalDir }), 0);
+
+    const spoofedSelfDenied = await callTool(serverT2, 'relay_send', {
+      to_terminal_id: 't2',
+      from_terminal_id: 't1',
+      message: 'spoofed self delegation',
+      delegate: true,
+    });
+    assert.equal(spoofedSelfDenied.isError, true);
+    assert.equal(spoofedSelfDenied.data.error, 'SELF_DELEGATION');
+    assert.equal(countPendingMessages('t2', { globalDir: env.globalDir }), 0);
+
+    const mismatchedFromDenied = await callTool(serverT1, 'relay_send', {
+      to_terminal_id: 't2',
+      from_terminal_id: 't3',
+      message: 'spoofed sender delegation',
+      delegate: true,
+    });
+    assert.equal(mismatchedFromDenied.isError, true);
+    assert.equal(mismatchedFromDenied.data.error, 'INVALID_FROM_TERMINAL_ID');
+    assert.equal(countPendingMessages('t2', { globalDir: env.globalDir }), 0);
+
+    const noTermServer = makeServerForTab('');
+    const missingTermDenied = await callTool(noTermServer, 'relay_send', {
+      to_terminal_id: 't2',
+      message: 'delegation without HC_TERMINAL_ID',
+      delegate: true,
+    });
+    assert.equal(missingTermDenied.isError, true);
+    assert.equal(missingTermDenied.data.error, 'MISSING_TERMINAL_ID');
+    assert.equal(countPendingMessages('t2', { globalDir: env.globalDir }), 0);
+
+    // Ordinary `relay_send` without `delegate` still allows sending a note to oneself
+    const selfPlain = await callTool(serverT2, 'relay_send', {
+      to_terminal_id: 't2',
+      message: 'plain note to self',
+      wake: 'never',
+    });
+    assert.equal(selfPlain.isError, false);
+    assert.equal(selfPlain.data.queued, true);
+    handleClaudeUserPrompt(
+      { session_id: 's-self-plain', cwd: env.projectDir },
+      { terminalId: 't2', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 't2' } },
+    );
+    assert.equal(getTabDelegation('t2', { globalDir: env.globalDir }), null);
+
+    // Receiver double defense: a forged `delegate: true` inbox file whose `from_terminal_id` is the recipient itself
+    // is delivered as an ordinary message and NEVER marks the tab as delegated
+    enqueueMessage(
+      't2',
+      { from_terminal_id: 't2', message: 'Forged self-delegation in inbox', delegate: true },
+      { globalDir: env.globalDir },
+    );
+    assert.equal(hasPendingDelegatedMessage('t2', { globalDir: env.globalDir }), false);
+    const forgedDelivered = handleClaudeUserPrompt(
+      { session_id: 's-forged', cwd: env.projectDir },
+      { terminalId: 't2', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 't2' } },
+    );
+    const forgedCtx = forgedDelivered.hookSpecificOutput?.additionalContext || '';
+    assert.match(forgedCtx, /Forged self-delegation in inbox/);
+    assert.doesNotMatch(forgedCtx, /위임받은 워커/);
+    assert.equal(getTabDelegation('t2', { globalDir: env.globalDir }), null);
+    assert.equal(recordTabDelegation('t2', { fromTerminalId: 't2', globalDir: env.globalDir }).changed, false);
+
+    // 2. Non-delegate `relay_send` (omitted or `delegate: false`) changes nothing: no `delegated` state, no notice line, 2nd file still blocked
+    await callTool(serverT1, 'relay_send', { to_terminal_id: 't2', message: 'FYI: plain message' });
+    const plainDelivered = handleClaudeUserPrompt(
+      { session_id: 's-plain', cwd: env.projectDir },
+      { terminalId: 't2', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 't2' } },
+    );
+    const plainCtx = plainDelivered.hookSpecificOutput?.additionalContext || '';
+    assert.match(plainCtx, /FYI: plain message/);
+    assert.doesNotMatch(plainCtx, /위임받은 워커/);
+    assert.equal(getTabDelegation('t2', { globalDir: env.globalDir }), null);
+
+    // 3. Claude Code tab `t2`: seed pre-existing L state + `pre.js` (600 chars), then deliver `delegate: true` from `t1`
+    const t2Opts = {
+      terminalId: 't2',
+      globalDir: env.globalDir,
+      homeDir: env.homeDir,
+      promptsDir: env.promptsDir,
+      env: { HC_TERMINAL_ID: 't2', TEMP: os.tmpdir(), TMP: os.tmpdir() },
+    };
+    handleClaudePreToolUse({ session_id: 's-pre', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'pre.js', content: 'p'.repeat(600) } }, t2Opts);
+    assert.equal(
+      handleClaudePreToolUse({ session_id: 's-pre', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'pre2.js', content: 'q' } }, t2Opts)
+        .hookSpecificOutput?.permissionDecision,
+      'deny',
+    );
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('t2'), { cwd: env.projectDir }).size, 'L');
+
+    const baseMs = Date.parse('2026-11-27T12:00:00.000Z');
+    const delSend1 = (await callTool(serverT1, 'relay_send', {
+      to_terminal_id: 't2',
+      message: 'Implement worker slice in t2',
+      delegate: true,
+    })).data;
+    assert.equal(delSend1.queued, true);
+    assert.equal(delSend1.delegate, true);
+    // Before hook delivery, `t2` is NOT yet marked delegated
+    assert.equal(getTabDelegation('t2', { globalDir: env.globalDir, now: baseMs }), null);
+
+    // Hook delivery on `t2` records delegation AND appends the 1-line worker notice (without emitting t2's own unsaved notice)
+    const wakeOut = handleClaudeUserPrompt(
+      { session_id: 's-pre', cwd: env.projectDir },
+      { ...t2Opts, now: () => baseMs },
+    );
+    const wakeCtx = wakeOut.hookSpecificOutput?.additionalContext || '';
+    assert.match(wakeCtx, /Implement worker slice in t2/);
+    assert.match(wakeCtx, /\[herdr-cortex\] 이 탭은 지금 탭 t1에서 위임받은 워커입니다\..*relay_send\(to_terminal_id="t1"\)/);
+    assert.doesNotMatch(wakeCtx, /미저장 활동/);
+
+    const delInfo = getTabDelegation('t2', { globalDir: env.globalDir, now: baseMs + 5 * 60 * 1000 });
+    assert.equal(delInfo?.fromTerminalId, 't1');
+
+    // `cortex-work status` (text & --json) displays delegated state (from tab, timestamp, remaining time)
+    const sinkText = [];
+    const sinkJson = [];
+    runWorkCli(['status', '--tab', 't2'], {
+      env: { HC_TERMINAL_ID: 't2' },
+      cwd: env.projectDir,
+      globalDir: env.globalDir,
+      now: new Date(baseMs + 30 * 60 * 1000),
+      stdout: { write: (s) => sinkText.push(s) },
+      stderr: { write: () => {} },
+    });
+    assert.match(sinkText.join(''), /Delegated : yes \(from t1, since 2026-11-27T.*, remaining 23h 30m\)/);
+
+    runWorkCli(['status', '--tab', 't2', '--json'], {
+      env: { HC_TERMINAL_ID: 't2' },
+      cwd: env.projectDir,
+      globalDir: env.globalDir,
+      now: new Date(baseMs + 30 * 60 * 1000),
+      stdout: { write: (s) => sinkJson.push(s) },
+      stderr: { write: () => {} },
+    });
+    const statusJson = JSON.parse(sinkJson.join(''));
+    assert.equal(statusJson.delegated, true);
+    assert.equal(statusJson.delegation.fromTerminalId, 't1');
+    assert.equal(statusJson.delegation.remainingText, '23h 30m');
+
+    // While delegated: multi-file edits pass, failed retries are NOT counted, hard-to-reverse commands are DENIED,
+    // and `memory_save` is STILL allowed (tab owner)!
+    assert.deepEqual(
+      handleClaudePreToolUse({ session_id: 's-pre', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'w1.js', content: 'a'.repeat(2000) } }, { ...t2Opts, now: () => baseMs + 1000 }),
+      {},
+    );
+    assert.deepEqual(
+      handleClaudePreToolUse({ session_id: 's-pre', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'w2.js', content: 'b'.repeat(2000) } }, { ...t2Opts, now: () => baseMs + 2000 }),
+      {},
+    );
+    handleClaudePostToolUseFailure(
+      { session_id: 's-pre', cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit 1' },
+      { ...t2Opts, now: () => baseMs + 3000 },
+    );
+    assert.equal(
+      handleClaudePreToolUse({ session_id: 's-pre', cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'git reset --hard' } }, { ...t2Opts, now: () => baseMs + 4000 })
+        .hookSpecificOutput?.permissionDecision,
+      'deny',
+      'delegated tab blocks hard-to-reverse commands like a worker',
+    );
+    const saveAsOwner = await callTool(serverT2, 'memory_save', { type: 'knowledge', title: 'Tab2 note', summary: 'Still tab owner' });
+    assert.equal(saveAsOwner.isError, false, 'delegated tab can still call memory_save');
+    // Pre-existing L and `pre.js` (600 chars) stayed untouched on disk!
+    const preserved = readWorkSizeState(env.globalDir, tabWorkSizeScope('t2'), { cwd: env.projectDir });
+    assert.equal(preserved.size, 'L');
+    assert.deepEqual(preserved.files, { 'pre.js': 600 });
+
+    // End condition (1): sending `relay_send` to unrelated `t3` keeps delegation; sending back to `t1` ends delegation!
+    await callTool(serverT2, 'relay_send', { to_terminal_id: 't3', message: 'ping t3' });
+    assert.ok(getTabDelegation('t2', { globalDir: env.globalDir, now: baseMs + 5000 }), 'still delegated after messaging t3');
+
+    await callTool(serverT2, 'relay_send', { to_terminal_id: 't1', message: 'Completed delegated task' });
+    assert.equal(getTabDelegation('t2', { globalDir: env.globalDir, now: baseMs + 6000 }), null, 'delegation cleared on reply to t1');
+
+    // Immediately after delegation ends, preserved L + `pre.js` applies again -> 2nd file edit is DENIED!
+    assert.equal(
+      handleClaudePreToolUse({ session_id: 's-pre', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'after.js', content: 'z' } }, { ...t2Opts, now: () => baseMs + 7000 })
+        .hookSpecificOutput?.permissionDecision,
+      'deny',
+    );
+
+    // End condition (2): 24-hour expiry
+    await callTool(serverT1, 'relay_send', { to_terminal_id: 't2', message: 'Task 2', delegate: true });
+    handleClaudeUserPrompt({ session_id: 's-pre', cwd: env.projectDir }, { ...t2Opts, now: () => baseMs });
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { session_id: 's-pre', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'before-24h.js', content: 'z' } },
+        { ...t2Opts, now: () => baseMs + WORK_SIZE_DELEGATION_TTL_MS - 1 },
+      ),
+      {},
+    );
+    assert.equal(
+      handleClaudePreToolUse(
+        { session_id: 's-pre', cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'after-24h.js', content: 'z' } },
+        { ...t2Opts, now: () => baseMs + WORK_SIZE_DELEGATION_TTL_MS },
+      ).hookSpecificOutput?.permissionDecision,
+      'deny',
+      'expired after 24 hours',
+    );
+
+    // End condition (3a): Claude Code SessionStart `clear` / `startup` ends delegation (while `compact` preserves it)
+    await callTool(serverT1, 'relay_send', { to_terminal_id: 't2', message: 'Task 3', delegate: true });
+    handleClaudeUserPrompt({ session_id: 's-pre', cwd: env.projectDir }, { ...t2Opts, now: () => baseMs });
+    handleClaudeSessionStart({ session_id: 's-pre', source: 'compact', cwd: env.projectDir }, { ...t2Opts, part: 'context', now: () => baseMs + 1000 });
+    assert.ok(getTabDelegation('t2', { globalDir: env.globalDir, now: baseMs + 1000 }), 'compact keeps active delegation');
+    handleClaudeSessionStart({ session_id: 's-new', source: 'clear', cwd: env.projectDir }, { ...t2Opts, part: 'context', now: () => baseMs + 2000 });
+    assert.equal(getTabDelegation('t2', { globalDir: env.globalDir, now: baseMs + 2000 }), null, '/clear ends delegation');
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('t2'), { cwd: env.projectDir }).size, 'L', 'prior L preserved across /clear');
+
+    // End condition (4): `cortex-work release` clears delegation
+    await callTool(serverT1, 'relay_send', { to_terminal_id: 't2', message: 'Task 4', delegate: true });
+    handleClaudeUserPrompt({ session_id: 's-new', cwd: env.projectDir }, { ...t2Opts, now: () => baseMs });
+    assert.ok(getTabDelegation('t2', { globalDir: env.globalDir, now: baseMs + 500 }));
+    runWorkCli(['release', '--tab', 't2'], {
+      env: { HC_TERMINAL_ID: 't2' },
+      cwd: env.projectDir,
+      globalDir: env.globalDir,
+      now: new Date(baseMs + 1000),
+      stdout: { write: () => {} },
+      stderr: { write: () => {} },
+    });
+    assert.equal(getTabDelegation('t2', { globalDir: env.globalDir, now: baseMs + 1000 }), null);
+
+    // 4. Antigravity tab `t3`: full delegation round-trip + new-conversation end condition (3b)
+    // Clear the non-delegate ping sent earlier to t3 first
+    handleAntigravityPreInvocation(
+      { conversationId: 'agy-t3-1', rootConversationId: 'agy-t3-1', cwd: env.projectDir, workspacePaths: [env.projectDir], lastUserInput: 'init' },
+      { terminalId: 't3', globalDir: env.globalDir, homeDir: env.homeDir, promptsDir: env.promptsDir, env: { HC_TERMINAL_ID: 't3' }, now: () => baseMs },
+    );
+    const t3Opts = {
+      terminalId: 't3',
+      globalDir: env.globalDir,
+      homeDir: env.homeDir,
+      promptsDir: env.promptsDir,
+      env: { HC_TERMINAL_ID: 't3', TEMP: os.tmpdir(), TMP: os.tmpdir() },
+    };
+    const agyConv1 = {
+      conversationId: 'agy-t3-1',
+      rootConversationId: 'agy-t3-1',
+      cwd: env.projectDir,
+      workspacePaths: [env.projectDir],
+      lastUserInput: 'work',
+    };
+    // Seed 1st file in `t3` (`first.js`, 500 chars)
+    assert.deepEqual(
+      handleAntigravityPreToolUse({ ...agyConv1, toolCall: { id: '1', name: 'write_file', args: { Path: path.join(env.projectDir, 'first.js'), Content: 'x'.repeat(500) } } }, t3Opts),
+      { decision: 'ask' },
+    );
+
+    // Send `delegate: true` from `t1` -> `t3`, deliver via `PreInvocation`
+    await callTool(serverT1, 'relay_send', { to_terminal_id: 't3', message: 'Agy delegated task', delegate: true });
+    const agyWake = handleAntigravityPreInvocation({ ...agyConv1, initialNumSteps: 4, lastUserInput: '[relay] wake' }, { ...t3Opts, now: () => baseMs });
+    const agyWakeSteps = (agyWake.injectSteps || []).map((s) => s.systemMessage.systemMessage).join('\n\n');
+    assert.match(agyWakeSteps, /Agy delegated task/);
+    assert.match(agyWakeSteps, /이 탭은 지금 탭 t1에서 위임받은 워커입니다/);
+
+    // 2nd file edit passes as `ask`, while hard-to-reverse `run_command` is `deny`!
+    assert.deepEqual(
+      handleAntigravityPreToolUse(
+        { ...agyConv1, toolCall: { id: '2', name: 'write_file', args: { Path: path.join(env.projectDir, 'second.js'), Content: 'y'.repeat(1500) } } },
+        { ...t3Opts, now: () => baseMs + 1000 },
+      ),
+      { decision: 'ask' },
+    );
+    assert.equal(
+      handleAntigravityPreToolUse(
+        { ...agyConv1, toolCall: { id: '3', name: 'run_command', args: { CommandLine: 'rm -rf dist' } } },
+        { ...t3Opts, now: () => baseMs + 2000 },
+      ).decision,
+      'deny',
+    );
+
+    // `t3` replies to `t1` -> delegation ends -> subsequent 2nd file edit (`second.js` alongside preserved `first.js`) is DENIED!
+    await callTool(serverT3, 'relay_send', { to_terminal_id: 't1', message: 'Agy done' });
+    const agyAfterReply = handleAntigravityPreToolUse(
+      { ...agyConv1, toolCall: { id: '4', name: 'write_file', args: { Path: path.join(env.projectDir, 'second.js'), Content: 'z' } } },
+      { ...t3Opts, now: () => baseMs + 3000 },
+    );
+    assert.equal(agyAfterReply.decision, 'deny');
+
+    // End condition (3b): Antigravity new conversation (`agy-t3-new`) clears prior delegation while preserving `L`,
+    // whereas `PreInvocation` WITHOUT `conversationId` keeps active delegation (cannot tell if new conversation)
+    await callTool(serverT1, 'relay_send', { to_terminal_id: 't3', message: 'Another agy task', delegate: true });
+    handleAntigravityPreInvocation(
+      { cwd: env.projectDir, workspacePaths: [env.projectDir], lastUserInput: '[relay] wake without convId' },
+      { ...t3Opts, now: () => baseMs + 4000 },
+    );
+    assert.ok(getTabDelegation('t3', { globalDir: env.globalDir, now: baseMs + 4200 }), 'delegated when delivered without conversationId');
+    handleAntigravityPreInvocation(
+      { cwd: env.projectDir, workspacePaths: [env.projectDir], lastUserInput: 'second turn without convId' },
+      { ...t3Opts, now: () => baseMs + 4500 },
+    );
+    assert.ok(
+      getTabDelegation('t3', { globalDir: env.globalDir, now: baseMs + 4500 }),
+      'PreInvocation without conversationId must NOT wipe active delegation',
+    );
+    handleAntigravitySessionStart(
+      { conversationId: 'agy-t3-new', rootConversationId: 'agy-t3-new', cwd: env.projectDir, workspacePaths: [env.projectDir] },
+      { ...t3Opts, now: () => baseMs + 5000 },
+    );
+    assert.equal(getTabDelegation('t3', { globalDir: env.globalDir, now: baseMs + 5000 }), null, 'new Antigravity conversation clears delegation');
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('t3'), { cwd: env.projectDir }).size, 'L', 'L state preserved across new conversation');
+
+    // 5. Delegation requires a non-empty sender tab that differs from recipient (case-insensitive)
+    const delOpts = { globalDir: env.globalDir };
+    enqueueMessage('t4', { id: 'no-sender', from_terminal_id: '', message: 'No sender', delegate: true }, delOpts);
+    assert.equal(hasPendingDelegatedMessage('t4', delOpts), false, 'missing from_terminal_id is not delegation');
+    const noSenderDeliv = deliverInboxForHook('t4', { ...delOpts, nowMs: baseMs + 6000 });
+    assert.equal(noSenderDeliv.delegated, undefined);
+    assert.equal(getTabDelegation('t4', { ...delOpts, now: baseMs + 6000 }), null);
+
+    enqueueMessage('t4', { id: 'same-case', from_terminal_id: 'T4', message: 'Self case diff', delegate: true }, delOpts);
+    assert.equal(hasPendingDelegatedMessage('t4', delOpts), false, 'case-only difference is self, not delegation');
+    const sameCaseDeliv = deliverInboxForHook('t4', { ...delOpts, nowMs: baseMs + 7000 });
+    assert.equal(sameCaseDeliv.delegated, undefined);
+    assert.equal(getTabDelegation('t4', { ...delOpts, now: baseMs + 7000 }), null);
+
+    enqueueMessage('t4', { id: 'other-tab', from_terminal_id: 't1', message: 'From another tab', delegate: true }, delOpts);
+    assert.equal(hasPendingDelegatedMessage('t4', delOpts), true, 'different sender tab is delegation');
+    const otherTabDeliv = deliverInboxForHook('t4', { ...delOpts, nowMs: baseMs + 8000 });
+    assert.equal(otherTabDeliv.delegated, true);
+    assert.equal(getTabDelegation('t4', { ...delOpts, now: baseMs + 8000 })?.fromTerminalId, 't1');
+  } finally {
+    store.close();
     env.cleanup();
   }
 });

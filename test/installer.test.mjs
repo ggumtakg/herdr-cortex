@@ -95,6 +95,7 @@ const IS_WINDOWS = process.platform === 'win32';
 const SERVER_SCRIPT = path.join(REPO_ROOT, 'src', 'mcp', 'server.mjs');
 const CLAUDE_HOOK_SCRIPT = path.join(REPO_ROOT, 'src', 'hooks', 'claude.mjs');
 const AGY_HOOK_SCRIPT = path.join(REPO_ROOT, 'src', 'hooks', 'antigravity.mjs');
+const AGY_TOOL_ENTRY_SCRIPT = path.join(REPO_ROOT, 'src', 'hooks', 'antigravity-tool-entry.mjs');
 const CLAUDE_EVENTS = [
   'SessionStart',
   'SessionEnd',
@@ -255,11 +256,25 @@ test('installer: the Antigravity hook command is one line that cmd.exe, PowerShe
     fs.mkdirSync(path.join(env.homeDir, '.gemini'), { recursive: true });
     assert.equal(installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir }).ok, true);
     const group = readJson(env.agyHooksPath)[AGY_HOOK_KEY];
-    assert.deepEqual(Object.keys(group).sort(), ['PreInvocation', 'SessionStart']);
+    assert.deepEqual(Object.keys(group).sort(), ['PostToolUse', 'PreInvocation', 'PreToolUse', 'SessionStart']);
     const command = group.PreInvocation[0].command;
     assert.equal(command, buildShellHookCommand({ nodePath: process.execPath, scriptPath: AGY_HOOK_SCRIPT, arg: 'pre-invocation' }));
     assert.deepEqual(group.PreInvocation[0], { type: 'command', command, timeout: 10 });
     assert.equal(isOwnHook(group.PreInvocation[0]), true);
+    assert.equal(Array.isArray(group.PreToolUse), true);
+    assert.equal(typeof group.PreToolUse[0].matcher, 'string');
+    assert.equal(isOwnHook(group.PreToolUse[0].hooks[0]), true);
+    assert.equal(
+      group.PreToolUse[0].hooks[0].command,
+      buildShellHookCommand({ nodePath: process.execPath, scriptPath: AGY_TOOL_ENTRY_SCRIPT, arg: 'pre-tool-use' }),
+    );
+    assert.equal(Array.isArray(group.PostToolUse), true);
+    assert.equal(typeof group.PostToolUse[0].matcher, 'string');
+    assert.equal(isOwnHook(group.PostToolUse[0].hooks[0]), true);
+    assert.equal(
+      group.PostToolUse[0].hooks[0].command,
+      buildShellHookCommand({ nodePath: process.execPath, scriptPath: AGY_TOOL_ENTRY_SCRIPT, arg: 'post-tool-use' }),
+    );
     assert.deepEqual(splitCommandLine(command), [
       process.execPath.replace(/\\/g, '/'), '--no-warnings', AGY_HOOK_SCRIPT.replace(/\\/g, '/'), 'pre-invocation', '--id', 'herdr-cortex',
     ]);
@@ -396,11 +411,27 @@ test('installer: a hook is ours only when it carries --id herdr-cortex; the user
     };
     atomicWriteJson(env.settingsPath, original);
     atomicWriteJson(env.agyHooksPath, {
+      herdr: {
+        PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'hc hook agy pre-tool-use' }] }],
+        SessionStart: [{ type: 'command', command: 'hc hook agy session-start' }],
+      },
       'user-group': { SessionStart: [{ type: 'command', command: 'echo custom' }] },
       [AGY_HOOK_KEY]: {
         SessionStart: [
           { type: 'command', command: `node --no-warnings "${AGY_HOOK_SCRIPT}" session-start --id herdr-cortex`, timeout: 10 },
           { type: 'command', command: 'echo user-hook-inside-our-group' },
+        ],
+        PreInvocation: [
+          { type: 'command', command: `node --no-warnings "${AGY_HOOK_SCRIPT}" pre-invocation --id herdr-cortex`, timeout: 10 },
+        ],
+        PreToolUse: [
+          {
+            matcher: '*',
+            hooks: [
+              { type: 'command', command: `node --no-warnings "${AGY_HOOK_SCRIPT}" pre-tool-use --id herdr-cortex`, timeout: 10 },
+              { type: 'command', command: 'echo user-pre-tool-inside-our-group' },
+            ],
+          },
         ],
         PostInvocation: [{ type: 'command', command: 'echo user-event-inside-our-group' }],
       },
@@ -413,7 +444,9 @@ test('installer: a hook is ours only when it carries --id herdr-cortex; the user
     });
 
     assert.equal(installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir }).ok, true);
-    assert.equal(installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir }).ok, true);
+    const secondAgyInstall = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir });
+    assert.equal(secondAgyInstall.ok, true);
+    assert.equal(secondAgyInstall.antigravityHooks.changed, false, 're-install is idempotent');
 
     const installed = readJson(env.settingsPath);
     assert.equal(installed.theme, 'dark');
@@ -430,11 +463,25 @@ test('installer: a hook is ours only when it carries --id herdr-cortex; the user
     assert.deepEqual(installed.hooks.Notification, []);
 
     const agyInstalled = readJson(env.agyHooksPath);
+    assert.deepEqual(agyInstalled.herdr, {
+      PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'hc hook agy pre-tool-use' }] }],
+      SessionStart: [{ type: 'command', command: 'hc hook agy session-start' }],
+    });
     assert.deepEqual(agyInstalled['user-group'], { SessionStart: [{ type: 'command', command: 'echo custom' }] });
     assert.deepEqual(agyInstalled[LEGACY_AGY_HOOK_KEY], { SessionStart: [{ type: 'command', command: 'echo user-hook-inside-the-old-group' }] });
     assert.deepEqual(agyInstalled[AGY_HOOK_KEY].SessionStart.map((hook) => isOwnHook(hook)), [false, true]);
     assert.equal(agyInstalled[AGY_HOOK_KEY].SessionStart[0].command, 'echo user-hook-inside-our-group');
     assert.equal(agyInstalled[AGY_HOOK_KEY].PreInvocation.length, 1);
+    assert.equal(agyInstalled[AGY_HOOK_KEY].PreToolUse.length, 2, 'kept user group + installed matcher group');
+    assert.deepEqual(agyInstalled[AGY_HOOK_KEY].PreToolUse[0], {
+      matcher: '*',
+      hooks: [{ type: 'command', command: 'echo user-pre-tool-inside-our-group' }],
+    });
+    assert.equal(isOwnHook(agyInstalled[AGY_HOOK_KEY].PreToolUse[1].hooks[0]), true);
+    assert.equal(describeOwnHook(agyInstalled[AGY_HOOK_KEY].PreToolUse[1].hooks[0]).scriptPath, AGY_TOOL_ENTRY_SCRIPT.replace(/\\/g, '/'));
+    assert.equal(agyInstalled[AGY_HOOK_KEY].PostToolUse.length, 1);
+    assert.equal(isOwnHook(agyInstalled[AGY_HOOK_KEY].PostToolUse[0].hooks[0]), true);
+    assert.equal(describeOwnHook(agyInstalled[AGY_HOOK_KEY].PostToolUse[0].hooks[0]).scriptPath, AGY_TOOL_ENTRY_SCRIPT.replace(/\\/g, '/'));
     assert.deepEqual(agyInstalled[AGY_HOOK_KEY].PostInvocation, [{ type: 'command', command: 'echo user-event-inside-our-group' }]);
 
     assert.equal(uninstallCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir }).ok, true);
@@ -452,9 +499,14 @@ test('installer: a hook is ours only when it carries --id herdr-cortex; the user
       },
     });
     assert.deepEqual(readJson(env.agyHooksPath), {
+      herdr: {
+        PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'hc hook agy pre-tool-use' }] }],
+        SessionStart: [{ type: 'command', command: 'hc hook agy session-start' }],
+      },
       'user-group': { SessionStart: [{ type: 'command', command: 'echo custom' }] },
       [AGY_HOOK_KEY]: {
         SessionStart: [{ type: 'command', command: 'echo user-hook-inside-our-group' }],
+        PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'echo user-pre-tool-inside-our-group' }] }],
         PostInvocation: [{ type: 'command', command: 'echo user-event-inside-our-group' }],
       },
       [LEGACY_AGY_HOOK_KEY]: { SessionStart: [{ type: 'command', command: 'echo user-hook-inside-the-old-group' }] },
@@ -890,8 +942,17 @@ test('installer: the Antigravity configuration is touched only when Antigravity 
     assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, findCommand: noAgy }).present, false);
     const onPathState = checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: binDir } });
     assert.deepEqual(
-      [onPathState.present, onPathState.detectedBy, onPathState.ok, onPathState.events.SessionStart.state, onPathState.events.PreInvocation.state, onPathState.mcp.state],
-      [true, 'path', false, 'missing', 'missing', 'missing'],
+      [
+        onPathState.present,
+        onPathState.detectedBy,
+        onPathState.ok,
+        onPathState.events.SessionStart.state,
+        onPathState.events.PreInvocation.state,
+        onPathState.events.PreToolUse.state,
+        onPathState.events.PostToolUse.state,
+        onPathState.mcp.state,
+      ],
+      [true, 'path', false, 'missing', 'missing', 'missing', 'missing', 'missing'],
     );
     assert.equal(fs.existsSync(path.join(env.homeDir, '.gemini')), false, 'checking creates nothing');
     assert.equal(readJson(env.settingsPath).hooks.SessionStart.length, 2, 'Claude Code is set up all the same');
@@ -900,6 +961,8 @@ test('installer: the Antigravity configuration is touched only when Antigravity 
     const viaPath = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: binDir } });
     assert.deepEqual([viaPath.antigravityPresent, viaPath.antigravityDetectedBy], [true, 'path']);
     assert.equal(readJson(env.agyHooksPath)[AGY_HOOK_KEY].SessionStart.length, 1);
+    assert.equal(readJson(env.agyHooksPath)[AGY_HOOK_KEY].PreToolUse.length, 1);
+    assert.equal(readJson(env.agyHooksPath)[AGY_HOOK_KEY].PostToolUse.length, 1);
     assert.ok(readJson(env.agyMcpPath).mcpServers[MCP_SERVER_KEY]);
     // the second MCP config file is only updated when it already exists
     assert.equal(fs.existsSync(path.join(env.homeDir, '.gemini', 'config', 'mcp_config.json')), false);
@@ -908,12 +971,84 @@ test('installer: the Antigravity configuration is touched only when Antigravity 
     const viaDir = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
     assert.deepEqual([viaDir.antigravityPresent, viaDir.antigravityDetectedBy], [true, 'config-dir']);
     const agyState = checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: env.root } });
-    assert.deepEqual([agyState.present, agyState.ok, agyState.events.SessionStart.state, agyState.events.PreInvocation.state, agyState.mcp.state], [true, true, 'ok', 'ok', 'ok']);
+    assert.deepEqual(
+      [
+        agyState.present,
+        agyState.ok,
+        agyState.events.SessionStart.state,
+        agyState.events.PreInvocation.state,
+        agyState.events.PreToolUse.state,
+        agyState.events.PostToolUse.state,
+        agyState.mcp.state,
+      ],
+      [true, true, 'ok', 'ok', 'ok', 'ok', 'ok'],
+    );
+    // checkAntigravity flags wrong matcher or old script path (`antigravity.mjs`) on grouped PreToolUse/PostToolUse
+    const tamperedAgy = readJson(env.agyHooksPath);
+    tamperedAgy[AGY_HOOK_KEY].PreToolUse[0].matcher = '*';
+    atomicWriteJson(env.agyHooksPath, tamperedAgy);
+    assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT }).events.PreToolUse.state, 'matcher');
+    installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
+    const freshAgy = readJson(env.agyHooksPath);
+    freshAgy[AGY_HOOK_KEY].PreToolUse[0].hooks[0].command = buildShellHookCommand({
+      nodePath: process.execPath,
+      scriptPath: AGY_HOOK_SCRIPT,
+      arg: 'pre-tool-use',
+    });
+    atomicWriteJson(env.agyHooksPath, freshAgy);
+    assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT }).events.PreToolUse.state, 'other_repo');
+    installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
+    assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT }).ok, true);
     // the folder is the sign that is reported, also when agy is on PATH as well
     assert.equal(agyState.detectedBy, 'config-dir');
     assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: binDir } }).detectedBy, 'config-dir');
 
-    // Uninstall cleans the Antigravity files whenever they exist
+    // Disabled (`"enabled": false`): checkAntigravity flags it as not ok, install removes `enabled` and reports a [NOTE]
+    const disabledHooks = readJson(env.agyHooksPath);
+    disabledHooks[AGY_HOOK_KEY].enabled = false;
+    atomicWriteJson(env.agyHooksPath, disabledHooks);
+    const disabledState = checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: env.root } });
+    assert.equal(disabledState.ok, false);
+    assert.equal(disabledState.events.SessionStart.state, 'disabled');
+    assert.equal(disabledState.events.PreToolUse.state, 'disabled');
+    assert.equal(disabledState.events.PostToolUse.state, 'disabled');
+
+    const reenabledRes = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
+    assert.equal(reenabledRes.ok, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(readJson(env.agyHooksPath)[AGY_HOOK_KEY], 'enabled'), false);
+    assert.ok(
+      formatInstallSummary(reenabledRes).includes(
+        '[NOTE] Antigravity hooks were disabled ("enabled": false in hooks.json); install turned them back on.',
+      ),
+    );
+    assert.equal(checkAntigravity({ homeDir: env.homeDir, repoRoot: REPO_ROOT, env: { PATH: env.root } }).ok, true);
+
+    // Uninstall with `enabled: false` and no user handlers removes the `herdr-cortex` entry completely
+    const disabledNoUser = readJson(env.agyHooksPath);
+    disabledNoUser[AGY_HOOK_KEY].enabled = false;
+    atomicWriteJson(env.agyHooksPath, disabledNoUser);
+    uninstallCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
+    assert.deepEqual(readJson(env.agyHooksPath), {});
+
+    // Uninstall with `enabled: false` and a user handler keeps the `herdr-cortex` entry with `enabled` and the user handler
+    installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
+    const disabledWithUser = readJson(env.agyHooksPath);
+    disabledWithUser[AGY_HOOK_KEY].enabled = false;
+    disabledWithUser[AGY_HOOK_KEY].SessionStart.push({ type: 'command', command: 'echo user-hook' });
+    atomicWriteJson(env.agyHooksPath, disabledWithUser);
+    uninstallCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
+    assert.deepEqual(readJson(env.agyHooksPath), {
+      [AGY_HOOK_KEY]: {
+        enabled: false,
+        SessionStart: [{ type: 'command', command: 'echo user-hook' }],
+      },
+    });
+
+    // Clean up and verify normal uninstall
+    installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
+    const withoutUser = readJson(env.agyHooksPath);
+    withoutUser[AGY_HOOK_KEY].SessionStart = withoutUser[AGY_HOOK_KEY].SessionStart.filter((h) => h.command !== 'echo user-hook');
+    atomicWriteJson(env.agyHooksPath, withoutUser);
     uninstallCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: env.root } });
     assert.deepEqual(readJson(env.agyHooksPath), {});
     assert.deepEqual(readJson(env.agyMcpPath).mcpServers, {});
