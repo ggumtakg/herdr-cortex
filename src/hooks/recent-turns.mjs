@@ -7,6 +7,9 @@ export const DEFAULT_RECENT_TURNS_BUDGET = 4500;
 // records for the requested turns, the window doubles (4 MB, 8 MB, ...) up to MAX_TAIL_BYTES_CAP.
 export const DEFAULT_MAX_TAIL_BYTES = 2 * 1024 * 1024;
 export const MAX_TAIL_BYTES_CAP = 32 * 1024 * 1024;
+// Maximum bytes scanned from the beginning of a transcript when checking whether SessionStart already
+// injected HEAD_CORE (first read is small so ordinary sessions stop within the first few kilobytes).
+export const MAX_HEAD_SCAN_BYTES = MAX_TAIL_BYTES_CAP;
 // A single transcript record (one JSONL line) larger than this is skipped without being decoded or parsed.
 export const MAX_TRANSCRIPT_RECORD_BYTES = 4 * 1024 * 1024;
 
@@ -615,6 +618,149 @@ export const CLAUDE_TRANSCRIPT_ADAPTER = Object.freeze({
 export function extractClaudeRecentTurns(transcriptPath, options = {}) {
   const { rows: _rows, ...result } = extractRecentTurns(transcriptPath, CLAUDE_TRANSCRIPT_ADAPTER, options);
   return result;
+}
+
+const HEAD_SCAN_FIRST_CHUNK_BYTES = 64 * 1024;
+const HEAD_SCAN_CHUNK_BYTES = 512 * 1024;
+const HOOK_ADDITIONAL_CONTEXT_BYTES = Buffer.from('hook_additional_context', 'utf8');
+
+function entryHasClaudeSessionStartMarker(entry, needle) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  if (entry.type !== undefined && entry.type !== 'attachment') return false;
+  const attachment = entry.attachment;
+  if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)) return false;
+  if (attachment.type !== 'hook_additional_context' || attachment.hookEvent !== 'SessionStart') return false;
+
+  const text = extractTextFromBlockContent(attachment.content);
+  if (!text) return false;
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (rawLine.trim() === needle) return true;
+  }
+  return false;
+}
+
+/**
+ * Scan a Claude Code JSONL transcript from the start (up to `maxScanBytes`) and return true as soon as a
+ * SessionStart `hook_additional_context` attachment record contains `marker` as a line.
+ * Returns false when `marker` is not found within the cap, or when the file is missing, empty, or unreadable.
+ */
+export function hasClaudeSessionStartMarker(
+  transcriptPath,
+  marker,
+  {
+    maxScanBytes = MAX_HEAD_SCAN_BYTES,
+    maxRecordBytes = MAX_TRANSCRIPT_RECORD_BYTES,
+  } = {},
+) {
+  const needle = typeof marker === 'string' ? marker.trim() : '';
+  if (!needle || !transcriptPath || typeof transcriptPath !== 'string' || !transcriptPath.trim()) {
+    return false;
+  }
+
+  let size;
+  try {
+    const stat = fs.statSync(transcriptPath);
+    if (!stat.isFile() || stat.size === 0) return false;
+    size = stat.size;
+  } catch {
+    return false;
+  }
+
+  const scanCap = Number(maxScanBytes) > 0 ? Math.min(size, Number(maxScanBytes)) : size;
+  const recordLimit = Number(maxRecordBytes) > 0 ? Number(maxRecordBytes) : Infinity;
+
+  const parseCandidateLine = (buf, start, end) => {
+    const cleanEnd = end > start && buf[end - 1] === 0x0d ? end - 1 : end;
+    const len = cleanEnd - start;
+    if (len <= 0 || len > recordLimit) return false;
+    const line = buf.toString('utf8', start, cleanEnd).replace(/^\uFEFF/, '').trim();
+    if (!line) return false;
+    try {
+      return entryHasClaudeSessionStartMarker(JSON.parse(line), needle);
+    } catch {
+      return false;
+    }
+  };
+
+  let fd;
+  try {
+    fd = fs.openSync(transcriptPath, 'r');
+    let fileOffset = 0;
+    let carry = null;
+    let discardingLine = false;
+    let chunkBuf = null;
+
+    while (fileOffset < scanCap) {
+      const chunkLimit = fileOffset === 0 ? HEAD_SCAN_FIRST_CHUNK_BYTES : HEAD_SCAN_CHUNK_BYTES;
+      const toRead = Math.min(chunkLimit, scanCap - fileOffset);
+      if (!chunkBuf || chunkBuf.length < toRead) {
+        chunkBuf = Buffer.allocUnsafe(toRead);
+      }
+      let bytesRead = 0;
+      while (bytesRead < toRead) {
+        const n = fs.readSync(fd, chunkBuf, bytesRead, toRead - bytesRead, fileOffset + bytesRead);
+        if (n <= 0) break;
+        bytesRead += n;
+      }
+      if (bytesRead <= 0) {
+        if (carry && !discardingLine && carry.indexOf(HOOK_ADDITIONAL_CONTEXT_BYTES) !== -1) {
+          if (parseCandidateLine(carry, 0, carry.length)) return true;
+        }
+        break;
+      }
+      fileOffset += bytesRead;
+      const reachedEof = fileOffset >= size || bytesRead < toRead;
+
+      const slice = chunkBuf.subarray(0, bytesRead);
+      const work = carry ? Buffer.concat([carry, slice]) : slice;
+      carry = null;
+
+      let pos = 0;
+      let nextHookByte = work.indexOf(HOOK_ADDITIONAL_CONTEXT_BYTES, 0);
+      while (pos < work.length) {
+        const nl = work.indexOf(NEWLINE_BYTE, pos);
+        if (nl === -1) break;
+        const cleanEnd = nl > pos && work[nl - 1] === 0x0d ? nl - 1 : nl;
+        const len = cleanEnd - pos;
+        if (!discardingLine && len > 0 && len <= recordLimit && nextHookByte !== -1 && nextHookByte < cleanEnd) {
+          if (parseCandidateLine(work, pos, cleanEnd)) return true;
+        }
+        discardingLine = false;
+        pos = nl + 1;
+        if (nextHookByte !== -1 && nextHookByte < pos) {
+          nextHookByte = work.indexOf(HOOK_ADDITIONAL_CONTEXT_BYTES, pos);
+        }
+      }
+
+      if (pos < work.length) {
+        const remLen = work.length - pos;
+        if (reachedEof) {
+          if (!discardingLine && nextHookByte !== -1 && nextHookByte < work.length) {
+            if (parseCandidateLine(work, pos, work.length)) return true;
+          }
+          break;
+        }
+        if (discardingLine || remLen > recordLimit) {
+          discardingLine = true;
+        } else if (fileOffset < scanCap) {
+          carry = Buffer.from(work.subarray(pos));
+        }
+      } else if (reachedEof) {
+        break;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore close error
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

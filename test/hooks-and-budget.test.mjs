@@ -519,13 +519,281 @@ test('hooks/claude: SessionStart (compact, 9000-char cap, core/context split, su
     // (f) PreCompact skips subagents
     assert.deepEqual(handleClaudePreCompact({ agent_id: 'sub-1', cwd: env.projectDir }, { globalDir: env.globalDir }), {});
 
-    // (g) SessionStart on resume/fork skips duplicate HEAD_CORE while keeping overview
-    const resumeOut = handleClaudeSessionStart(
+    // (g) SessionStart on resume/fork: skips duplicate HEAD_CORE only when transcript has SessionStart
+    //     hook_additional_context carrying the current HEAD_CORE marker; otherwise injects HEAD_CORE.
+    const hookOpts = { terminalId: 'tab-c1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir };
+
+    // (g1) Missing transcript_path -> injects HEAD_CORE + overview
+    const resumeNoPath = handleClaudeSessionStart(
       { session_id: 'head-sess-2', source: 'resume', cwd: env.projectDir },
-      { terminalId: 'tab-c1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+      hookOpts,
     );
-    assert.doesNotMatch(resumeOut.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
-    assert.match(resumeOut.hookSpecificOutput.additionalContext, /Cortex Memory Overview/);
+    assert.match(resumeNoPath.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+    assert.match(resumeNoPath.hookSpecificOutput.additionalContext, /Cortex Memory Overview/);
+
+    // (g2) Missing/nonexistent transcript file -> injects HEAD_CORE
+    const missingTranscript = path.join(env.root, 'does-not-exist.jsonl');
+    const forkMissingFile = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'fork', transcript_path: missingTranscript, cwd: env.projectDir },
+      hookOpts,
+    );
+    assert.match(forkMissingFile.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+
+    // (g3) Pre-install transcript without HEAD_CORE marker -> injects HEAD_CORE
+    const preInstallTranscript = path.join(env.root, 'resume-preinstall.jsonl');
+    writeJsonl(preInstallTranscript, [
+      { type: 'user', message: { role: 'user', content: 'Started before cortex was installed' } },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Working without cortex.' }] } },
+    ]);
+    const resumePreInstall = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: preInstallTranscript, cwd: env.projectDir },
+      hookOpts,
+    );
+    assert.match(resumePreInstall.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+    assert.match(resumePreInstall.hookSpecificOutput.additionalContext, /Cortex Memory Overview/);
+
+    // (g4) Transcript has HEAD_CORE text only in tool_result, user/assistant messages, hook_success, or
+    //      UserPromptSubmit hook_additional_context -> MUST still inject HEAD_CORE
+    const headCoreFull = fs.readFileSync(path.join(env.promptsDir, 'HEAD_CORE.md'), 'utf8');
+    const toolOnlyTranscript = path.join(env.root, 'resume-tool-only.jsonl');
+    writeJsonl(toolOnlyTranscript, [
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_success',
+          hookEvent: 'SessionStart',
+          stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: headCoreFull } }),
+        },
+      },
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'UserPromptSubmit',
+          content: [headCoreFull],
+        },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'read-1', content: headCoreFull }],
+        },
+      },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: headCoreFull }] } },
+    ]);
+    const resumeToolOnly = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: toolOnlyTranscript, cwd: env.projectDir },
+      hookOpts,
+    );
+    assert.match(resumeToolOnly.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+
+    // (g5) Transcript has SessionStart hook_additional_context with current HEAD_CORE marker -> skips HEAD_CORE
+    const injectedTranscript = path.join(env.root, 'resume-injected.jsonl');
+    writeJsonl(injectedTranscript, [
+      { type: 'mode', mode: 'normal', sessionId: 'head-sess-2' },
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookName: 'SessionStart',
+          hookEvent: 'SessionStart',
+          content: [headCoreFull.replace(/\n/g, '\r\n')],
+        },
+      },
+      { type: 'user', message: { role: 'user', content: 'Continue work' } },
+    ]);
+    const resumeInjected = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: injectedTranscript, cwd: env.projectDir },
+      hookOpts,
+    );
+    assert.doesNotMatch(resumeInjected.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+    assert.match(resumeInjected.hookSpecificOutput.additionalContext, /Cortex Memory Overview/);
+
+    const forkInjectedCamel = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'fork', transcriptPath: injectedTranscript, cwd: env.projectDir },
+      hookOpts,
+    );
+    assert.doesNotMatch(forkInjectedCamel.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+    assert.match(forkInjectedCamel.hookSpecificOutput.additionalContext, /Cortex Memory Overview/);
+
+    const coreResumeSkipped = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: injectedTranscript, cwd: env.projectDir },
+      { ...hookOpts, part: 'core' },
+    );
+    assert.deepEqual(coreResumeSkipped, {});
+
+    const coreResumeInjected = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: preInstallTranscript, cwd: env.projectDir },
+      { ...hookOpts, part: 'core' },
+    );
+    assert.match(coreResumeInjected.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+
+    // (g6) Dynamic marker from HEAD_CORE.md (including JSON-escaped quotes/backslashes and title changes):
+    //      changing the title makes an older transcript receive the new HEAD_CORE once; once recorded, skipped.
+    const customPromptsDir = path.join(env.root, 'prompts-custom');
+    fs.mkdirSync(customPromptsDir, { recursive: true });
+    const escapedTitle = '# HEAD "운영" 원칙 \\ v2';
+    atomicWriteText(path.join(customPromptsDir, 'HEAD_CORE.md'), `\n${escapedTitle}\n\n- Updated rule.\n`);
+    const oldTitleReInjected = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: injectedTranscript, cwd: env.projectDir },
+      { ...hookOpts, promptsDir: customPromptsDir },
+    );
+    assert.ok(oldTitleReInjected.hookSpecificOutput.additionalContext.includes(escapedTitle));
+
+    const escapedTranscript = path.join(env.root, 'resume-escaped.jsonl');
+    writeJsonl(escapedTranscript, [
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'SessionStart',
+          content: [`${escapedTitle}\n\n- Updated rule.`],
+        },
+      },
+    ]);
+    const escapedSkipped = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: escapedTranscript, cwd: env.projectDir },
+      { ...hookOpts, promptsDir: customPromptsDir },
+    );
+    assert.equal(escapedSkipped.hookSpecificOutput.additionalContext.includes(escapedTitle), false);
+
+    // Prefix title change (# HEAD_CORE v1 -> # HEAD_CORE): old longer line must not count as the new title
+    const prefixOldTranscript = path.join(env.root, 'resume-prefix-old.jsonl');
+    writeJsonl(prefixOldTranscript, [
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'SessionStart',
+          content: ['# HEAD_CORE v1\n\n- Old rule.'],
+        },
+      },
+    ]);
+    const prefixReInjected = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: prefixOldTranscript, cwd: env.projectDir },
+      hookOpts,
+    );
+    assert.match(prefixReInjected.hookSpecificOutput.additionalContext, /# HEAD_CORE\n/);
+
+    // (g7) Bounded scan & early stop: stops immediately on marker near head, injects when marker lies past cap,
+    //      handles chunk-boundary straddling (>64KB), and respects headCoreEnabled: false.
+    const pastCapTranscript = path.join(env.root, 'resume-past-cap.jsonl');
+    const padEntry = { type: 'user', message: { role: 'user', content: 'P'.repeat(2000) } };
+    writeJsonl(pastCapTranscript, [
+      padEntry,
+      padEntry,
+      padEntry,
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'SessionStart',
+          content: [headCoreFull],
+        },
+      },
+    ]);
+    const pastCapInjected = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: pastCapTranscript, cwd: env.projectDir },
+      { ...hookOpts, turnOptions: { maxScanBytes: 4096 } },
+    );
+    assert.match(pastCapInjected.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+
+    // Records larger than maxRecordBytes (one of them crossing the 64KB first-chunk boundary) are skipped,
+    // and the marker record after them is still found
+    const straddleTranscript = path.join(env.root, 'resume-straddle.jsonl');
+    const filler63k = { type: 'user', message: { role: 'user', content: 'F'.repeat(65_420) } };
+    const oversizedEntry = { type: 'user', message: { role: 'user', content: 'Z'.repeat(8192) } };
+    writeJsonl(straddleTranscript, [
+      oversizedEntry,
+      filler63k,
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'SessionStart',
+          content: [headCoreFull],
+        },
+      },
+    ]);
+    const straddleSkipped = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: straddleTranscript, cwd: env.projectDir },
+      { ...hookOpts, turnOptions: { maxRecordBytes: 4096 } },
+    );
+    assert.doesNotMatch(straddleSkipped.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+
+    // The marker record itself crosses the 64KB first-chunk boundary: it starts in the first chunk and
+    // ends in the second, so it is only found when the unfinished line is carried over to the next read
+    const crossingTranscript = path.join(env.root, 'resume-marker-crossing.jsonl');
+    const fillerFor = (content) => ({ type: 'user', message: { role: 'user', content } });
+    const fillerOverhead = Buffer.byteLength(JSON.stringify(fillerFor('')), 'utf8') + 1;
+    const firstChunkBytes = 64 * 1024;
+    writeJsonl(crossingTranscript, [
+      fillerFor('C'.repeat(firstChunkBytes - 40 - fillerOverhead)),
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'SessionStart',
+          content: [headCoreFull],
+        },
+      },
+    ]);
+    const crossingBytes = fs.readFileSync(crossingTranscript);
+    const markerLineStart = crossingBytes.indexOf(0x0a) + 1;
+    const markerLineEnd = crossingBytes.indexOf(0x0a, markerLineStart);
+    assert.ok(markerLineStart < firstChunkBytes, 'the marker record starts inside the first chunk');
+    assert.ok(
+      (markerLineEnd === -1 ? crossingBytes.length : markerLineEnd) > firstChunkBytes,
+      'the marker record ends past the first chunk',
+    );
+    const crossingSkipped = handleClaudeSessionStart(
+      { session_id: 'head-sess-2', source: 'resume', transcript_path: crossingTranscript, cwd: env.projectDir },
+      hookOpts,
+    );
+    assert.doesNotMatch(crossingSkipped.hookSpecificOutput.additionalContext, /# HEAD_CORE/);
+
+    // Early stop: marker at line 1 of a large file reads only the first chunk, not the whole file
+    const earlyStopTranscript = path.join(env.root, 'resume-early-stop.jsonl');
+    writeJsonl(earlyStopTranscript, [
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'SessionStart',
+          content: [headCoreFull],
+        },
+      },
+      ...Array.from({ length: 120 }, () => ({ type: 'user', message: { role: 'user', content: 'L'.repeat(2000) } })),
+    ]);
+    const realReadSync = fs.readSync;
+    let scannedBytes = 0;
+    try {
+      fs.readSync = (fd, buffer, offset, length, position) => {
+        scannedBytes += length;
+        return realReadSync(fd, buffer, offset, length, position);
+      };
+      const earlyOut = handleClaudeSessionStart(
+        { session_id: 'head-sess-2', source: 'resume', transcript_path: earlyStopTranscript, cwd: env.projectDir },
+        { ...hookOpts, part: 'core' },
+      );
+      assert.deepEqual(earlyOut, {});
+    } finally {
+      fs.readSync = realReadSync;
+    }
+    assert.ok(scannedBytes <= 65_536, `Expected early stop within first 64KB chunk, read ${scannedBytes} bytes`);
+
+    // headCoreEnabled: false still suppresses HEAD_CORE even when transcript has no marker
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { headCoreEnabled: false });
+    try {
+      const disabledResume = handleClaudeSessionStart(
+        { session_id: 'head-sess-2', source: 'resume', transcript_path: preInstallTranscript, cwd: env.projectDir },
+        hookOpts,
+      );
+      assert.doesNotMatch(disabledResume.hookSpecificOutput?.additionalContext || '', /# HEAD_CORE/);
+    } finally {
+      fs.unlinkSync(path.join(env.globalDir, 'config.json'));
+    }
 
     // (h) Without a tab record (no HC_TERMINAL_ID) and without a clear record, another transcript in the
     //     same directory is never guessed to be the previous session: nothing is restored, a note says so

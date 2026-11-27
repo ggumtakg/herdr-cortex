@@ -47,6 +47,7 @@ import {
   RESTORE_FAILURE_RECORD_TOO_LARGE,
   extractClaudeRecentTurns,
   formatRecentTurns,
+  hasClaudeSessionStartMarker,
 } from './recent-turns.mjs';
 
 export const CLAUDE_HOOK_MAX_CHARS = HOOK_MAX_CHARS;
@@ -548,6 +549,15 @@ function readHeadCore(promptsDir, config) {
   }
 }
 
+function extractHeadCoreMarker(headCore) {
+  if (typeof headCore !== 'string') return '';
+  for (const rawLine of headCore.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line) return line;
+  }
+  return '';
+}
+
 function trimLinesToBudget(text, budget) {
   if (!text || text.length <= budget) return text;
   const lines = text.split('\n');
@@ -667,14 +677,24 @@ export function handleClaudeSessionStart(
     used += sep + text.trim().length;
   };
 
-  // 1. HEAD_CORE.md (in 'all' or 'core'); skip duplicate on resume/fork where conversation already has it
-  const skipDuplicateHeadCore = source === 'resume' || source === 'fork';
-  if ((part === 'all' || part === 'core') && !skipDuplicateHeadCore) {
+  // 1. HEAD_CORE.md (in 'all' or 'core'); on resume/fork, skip only when SessionStart already injected it
+  if (part === 'all' || part === 'core') {
     const headCore = readHeadCore(promptsDir, config);
     if (headCore) {
-      const noticeReserve = (notApprovedNotice ? notApprovedNotice.length + 2 : 0)
-        + (approvalsContext ? approvalsContext.length + 2 : 0);
-      pushSection(trimLinesToBudget(headCore, maxChars - noticeReserve));
+      const marker = extractHeadCoreMarker(headCore);
+      const transcriptPath = payload.transcript_path || payload.transcriptPath;
+      const skipDuplicateHeadCore = (source === 'resume' || source === 'fork')
+        && Boolean(marker)
+        && hasClaudeSessionStartMarker(
+          transcriptPath,
+          marker,
+          turnOptions && typeof turnOptions === 'object' ? turnOptions : undefined,
+        );
+      if (!skipDuplicateHeadCore) {
+        const noticeReserve = (notApprovedNotice ? notApprovedNotice.length + 2 : 0)
+          + (approvalsContext ? approvalsContext.length + 2 : 0);
+        pushSection(trimLinesToBudget(headCore, maxChars - noticeReserve));
+      }
     }
     if (part === 'core') {
       if (sections.length === 0) return {};
@@ -685,8 +705,6 @@ export function handleClaudeSessionStart(
         },
       };
     }
-  } else if (part === 'core') {
-    return {};
   }
 
   if (notApprovedNotice) {
