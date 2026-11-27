@@ -108,6 +108,19 @@ function sortedFolderEntries(scopeState, currentKey) {
   });
 }
 
+function formatUnsavedSummary(entry) {
+  const unsavedCount = entry?.unsavedFiles?.length || 0;
+  const committed = Boolean(entry?.unsavedCommitted);
+  if (unsavedCount === 0 && !committed) return 'no';
+  return `yes (edited files: ${unsavedCount}, committed: ${committed ? 'yes' : 'no'}${entry?.unsavedReminded ? ', reminded: yes' : ''})`;
+}
+
+function formatFailuresSummary(failedRetries) {
+  const items = Object.entries(failedRetries || {});
+  if (items.length === 0) return 'none';
+  return items.map(([name, count]) => `${name} (${count})`).join(', ');
+}
+
 function formatFolderSectionLines(entry, { isCurrent = false, indent = '' } = {}) {
   const lines = [];
   const marker = isCurrent ? ' (current)' : '';
@@ -136,6 +149,12 @@ function formatFolderSectionLines(entry, { isCurrent = false, indent = '' } = {}
   } else {
     lines.push(`${indent}Files     : ${fileEntries.map(([name, chars]) => `${name} (${chars} chars)`).join(', ')}`);
   }
+  lines.push(`${indent}Failures  : ${formatFailuresSummary(entry.failedRetries)}`);
+  lines.push(`${indent}Unsaved   : ${formatUnsavedSummary(entry)}`);
+  lines.push(
+    `${indent}Counters  : prompts=${entry.promptTurns || 0}, turn reads=${entry.turnReads || 0}`
+    + `${entry.turnReadNotified ? ' (notice sent)' : ''}`,
+  );
   return lines;
 }
 
@@ -144,12 +163,15 @@ function formatTabStatusLines(terminalId, entries, currentRoot, currentKey, file
   if (entries.length === 0) {
     lines.push(`Folder    : ${currentRoot} (current)`);
     lines.push('Work size : S (edited files: 0)');
+    lines.push('Failures  : none');
+    lines.push('Unsaved   : no');
+    lines.push('Counters  : prompts=0, turn reads=0');
     return lines;
   }
 
   const hasCurrent = entries.some((entry) => entry.cwdKey === currentKey);
   if (!hasCurrent) {
-    lines.push(`Current   : ${currentRoot} -> S (edited files: 0)`);
+    lines.push(`Current   : ${currentRoot} -> S (edited files: 0, unsaved: no, prompts: 0, turn reads: 0)`);
   }
 
   const indent = entries.length > 1 ? '  ' : '';
@@ -217,6 +239,14 @@ export function runWorkCli(
               escalatedAt: entry.escalatedAt,
               escalationReason: entry.escalationReason,
               files: entry.files,
+              failedRetries: entry.failedRetries,
+              unsaved: entry.unsavedFiles.length > 0 || entry.unsavedCommitted,
+              unsavedFiles: entry.unsavedFiles,
+              unsavedCommitted: entry.unsavedCommitted,
+              unsavedReminded: entry.unsavedReminded,
+              promptTurns: entry.promptTurns,
+              turnReads: entry.turnReads,
+              turnReadNotified: entry.turnReadNotified,
               reviewAccepted: entry.reviewAccepted,
               memorySaved: entry.memorySaved,
             })),
@@ -266,6 +296,14 @@ export function runWorkCli(
           escalatedAt: currentEntry ? currentEntry.escalatedAt : null,
           escalationReason: currentEntry ? currentEntry.escalationReason : null,
           files: currentEntry ? currentEntry.files : {},
+          failedRetries: currentEntry ? currentEntry.failedRetries : {},
+          unsaved: Boolean(currentEntry && (currentEntry.unsavedFiles.length > 0 || currentEntry.unsavedCommitted)),
+          unsavedFiles: currentEntry ? currentEntry.unsavedFiles : [],
+          unsavedCommitted: currentEntry ? currentEntry.unsavedCommitted : false,
+          unsavedReminded: currentEntry ? currentEntry.unsavedReminded : false,
+          promptTurns: currentEntry ? currentEntry.promptTurns : 0,
+          turnReads: currentEntry ? currentEntry.turnReads : 0,
+          turnReadNotified: currentEntry ? currentEntry.turnReadNotified : false,
           reviewAccepted: currentEntry ? currentEntry.reviewAccepted : false,
           reviewAcceptedAt: currentEntry ? currentEntry.reviewAcceptedAt : null,
           memorySaved: currentEntry ? currentEntry.memorySaved : false,
@@ -278,6 +316,14 @@ export function runWorkCli(
             escalatedAt: entry.escalatedAt,
             escalationReason: entry.escalationReason,
             files: entry.files,
+            failedRetries: entry.failedRetries,
+            unsaved: entry.unsavedFiles.length > 0 || entry.unsavedCommitted,
+            unsavedFiles: entry.unsavedFiles,
+            unsavedCommitted: entry.unsavedCommitted,
+            unsavedReminded: entry.unsavedReminded,
+            promptTurns: entry.promptTurns,
+            turnReads: entry.turnReads,
+            turnReadNotified: entry.turnReadNotified,
             reviewAccepted: entry.reviewAccepted,
             reviewAcceptedAt: entry.reviewAcceptedAt,
             memorySaved: entry.memorySaved,
@@ -308,6 +354,7 @@ export function runWorkCli(
           all: res.all,
           cwd: res.cwd,
           releasedFolders: res.releasedFolders,
+          otherLFolders: res.otherLFolders || [],
           previousSize: res.previousSize,
           size: res.size,
           changed: res.changed,
@@ -322,6 +369,12 @@ export function runWorkCli(
         print(`Released tab ${res.terminalId} (${res.cwd}): ${res.previousSize} -> S (cumulative edits and L records cleared).`);
       } else {
         print(`Tab ${res.terminalId} (${res.cwd}) is already S with no cumulative edits.`);
+        if (Array.isArray(res.otherLFolders) && res.otherLFolders.length > 0) {
+          print(
+            `Other folder(s) in tab ${res.terminalId} are in L: ${res.otherLFolders.join(', ')}. `
+            + `Use "${WORK_SIZE_COMMAND} release --all" to release all folders in this tab.`,
+          );
+        }
       }
       return WORK_EXIT_OK;
     }
@@ -342,16 +395,24 @@ export function runWorkCli(
         resetFolders: res.resetFolders,
         size: res.size,
         clearedFiles: res.clearedFiles,
+        clearedFailures: res.clearedFailures || 0,
         changed: res.changed,
       });
     } else if (opts.all) {
       if (res.changed) {
-        print(`Reset cumulative file counts across ${res.resetFolders.length} folder(s) in tab ${res.terminalId} (cleared ${res.clearedFiles} file(s)).`);
+        print(
+          `Reset cumulative file/failure counts across ${res.resetFolders.length} folder(s) in tab ${res.terminalId} `
+          + `(cleared ${res.clearedFiles} file(s), ${res.clearedFailures || 0} failure record(s)).`,
+        );
       } else {
         print(`Tab ${res.terminalId} has no cumulative file counts to reset.`);
       }
     } else if (res.changed) {
-      print(`Reset cumulative file counts for tab ${res.terminalId} (${res.cwd}: cleared ${res.clearedFiles} file(s); size stays ${res.size}).`);
+      print(
+        `Reset cumulative file counts for tab ${res.terminalId} `
+        + `(${res.cwd}: cleared ${res.clearedFiles} file(s)`
+        + `${res.clearedFailures ? `, ${res.clearedFailures} failure record(s)` : ''}; size stays ${res.size}).`,
+      );
     } else {
       print(`Tab ${res.terminalId} (${res.cwd}) has no cumulative file counts to reset (size is ${res.size}).`);
     }

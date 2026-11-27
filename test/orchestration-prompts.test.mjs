@@ -93,7 +93,9 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
     // Relay details stay in start-job / delegate, and HEAD_CORE documents hook S/L counting + cortex-work release
     assert.doesNotMatch(coreContent, /relay_tabs/);
     assert.match(coreContent, /아래 기준으로 스스로 판정한다/);
+    assert.match(coreContent, /셸 명령은 훅이 사용자 확인을 띄운다/);
     assert.match(coreContent, /훅이 세며/);
+    assert.match(coreContent, /같은 파일의 수정 실패가 되풀이되면 막히고/);
     assert.match(coreContent, /cortex-work/);
 
     const coreExplicit = await registry.callTool('cortex_prompt', { kind: 'core', name: 'HEAD_CORE' });

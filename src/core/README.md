@@ -153,6 +153,12 @@
     enabled: true,
     maxFilesPerWindow: 1,
     maxCharsPerFile: 1000,
+    reminderEveryTurns: 10,
+    readNoticeThreshold: 25,
+    maxFailedRetries: 2,
+    confirmCommands: true,
+    confirmCommandPatterns: [],
+    contractFiles: [],
   },
   embedding: {
     provider: 'none',       // none | auto | gemini | openai | ollama | onnx
@@ -177,9 +183,15 @@
 | `excludedProjects` | `[]` | 끌 프로젝트 규칙 목록. 어떤 설정으로도 뒤집을 수 없습니다. |
 | `headCoreEnabled` | `true` | 훅이 `HEAD_CORE` 프롬프트를 주입할지 여부([`../hooks/README.md`](../hooks/README.md)) |
 | `hookBudget` | `9000` | 훅 한 번이 주입하는 글자 수 한도. 상한은 9,000자입니다([9. 주입 분량](#9-주입-분량과-주입-표시-budgetmjs)). |
-| `workSize.enabled` | `true` | 훅이 주 대화(HEAD)의 파일 편집 수·글자 수를 세어 한도 초과 시 막고 L 상태를 관리할지 여부. `false`이면 세기·막기·안내·검수 기록을 모두 하지 않고 상태 파일도 건드리지 않습니다([`../hooks/README.md`](../hooks/README.md)). |
+| `workSize.enabled` | `true` | 훅이 주 대화(HEAD)의 파일 편집 수·글자 수·수정 실패 반복·계약 파일을 막고 리마인더·읽기 안내·기억 그래프 의존 안내·검수 기록을 관리할지 여부. `false`이면 이 기능들과 상태 파일 갱신을 하지 않습니다(단, `confirmCommands`는 별도, [`../hooks/README.md`](../hooks/README.md)). |
 | `workSize.maxFilesPerWindow` | `1` | 누적 구간 안에서 HEAD가 직접 고칠 수 있는 최대 파일 수(1 이상의 정수). |
 | `workSize.maxCharsPerFile` | `1000` | 누적 구간 안에서 파일 하나에 새로 쓸 수 있는 최대 누적 글자 수(1 이상의 정수). |
+| `workSize.reminderEveryTurns` | `10` | 주 대화에서 몇 번째 사용자 입력마다 작업 규모·저장 시점 주기 리마인더를 넣을지(0 이상의 정수, `0`이면 끔). |
+| `workSize.readNoticeThreshold` | `25` | 한 사용자 입력 구간에서 읽기·검색 도구(`Read`·`Grep`·`Glob`) 호출 수가 이 값을 넘을 때 안내를 넣는 문턱(0 이상의 정수, `0`이면 끔). |
+| `workSize.maxFailedRetries` | `2` | 같은 파일 수정 후 셸 명령 실패가 이 횟수에 이르면 다음 편집을 막고 `L`로 올리는 한도(0 이상의 정수, `0`이면 끔). |
+| `workSize.confirmCommands` | `true` | 되돌리기 어려운 셸 명령에 대해 주 대화는 확인(`ask`), 워커·서브에이전트는 차단(`deny`)할지 여부(`workSize.enabled`와 독립). |
+| `workSize.confirmCommandPatterns` | `[]` | 되돌리기 어려운 명령 확인에 덧붙일 사용자 지정 정규식 문자열 배열. 잘못된 정규식 원소는 무시하고, 중첩 수량자 등 재앙적 역추적 위험이 있거나 실행 시간 상한(패턴당 50ms·전체 200ms)을 넘긴 패턴은 `invalid_work_size` 설정 문제로 보고합니다(시간 상한 초과 시에는 일치한 것으로 보고 확인을 요청). |
+| `workSize.contractFiles` | `[]` | 프로젝트 루트 기준 계약 파일 glob 문자열 배열. `S` 상태에서 일치하는 파일을 편집하려 하면 막고 `L`로 올립니다(`L`에서는 일반 한도만 적용). |
 | `embedding.provider` | `'none'` | 임베딩 프로바이더. `none`이면 아무것도 임베딩하지 않고 이 PC 밖으로 나가는 것도 없습니다. `auto`는 사용자가 직접 고르는 값이며 기본값이 아닙니다. |
 | `embedding.chunkMaxChars` | `800` | 임베딩할 조각의 최대 글자 수 |
 | `embedding.chunkOverlap` | `100` | 이웃 조각끼리 겹치는 글자 수 |

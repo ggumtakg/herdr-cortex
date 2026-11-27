@@ -102,6 +102,7 @@ const CLAUDE_EVENTS = [
   'UserPromptSubmit',
   'PreToolUse',
   'PostToolUse',
+  'PostToolUseFailure',
   'SubagentStop',
 ];
 
@@ -180,6 +181,7 @@ test('installer: Claude Code hooks are written in exec form with the absolute No
       UserPromptSubmit: [['user-prompt']],
       PreToolUse: [['pre-tool-use']],
       PostToolUse: [['post-tool-use']],
+      PostToolUseFailure: [['post-tool-use-failure']],
       SubagentStop: [['subagent-stop']],
     };
     for (const event of CLAUDE_EVENTS) {
@@ -480,7 +482,10 @@ test('rename: the server, its registration key and the PreToolUse matcher say he
   assert.doesNotMatch(SERVER_INSTRUCTIONS, /mcp__cortex__/);
 
   // Newly registered matcher: the new prefix only
-  assert.equal(CLAUDE_PRE_TOOL_USE_MATCHER, 'mcp__herdr-cortex__.*|Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell');
+  assert.equal(
+    CLAUDE_PRE_TOOL_USE_MATCHER,
+    'mcp__herdr-cortex__.*|Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|Read|Grep|Glob',
+  );
   // Runtime recognition: both prefixes, so a setup that was not re-installed yet keeps working
   assert.deepEqual([...CORTEX_MCP_SERVER_NAMES], ['herdr-cortex', 'cortex']);
   for (const name of ['mcp__herdr-cortex__memory_save', 'mcp__cortex__memory_save']) {
@@ -1340,6 +1345,7 @@ test('status checks: hook registration is verified per event with the strict ide
       UserPromptSubmit: 'node_on_path',
       PreToolUse: 'matcher',
       PostToolUse: 'ok',
+      PostToolUseFailure: 'ok',
       SubagentStop: 'ok',
     });
     assert.match(broken.events.SessionStart.problems[0].message, /the recorded Node path does not exist: .*gone/);

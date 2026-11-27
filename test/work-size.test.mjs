@@ -16,16 +16,24 @@ import {
   projectPathKey,
   resolveWorkSizeConfig,
 } from '../src/core/config.mjs';
+import { CortexStore } from '../src/core/store.mjs';
 import { approveAsUser } from './support/approve.mjs';
 import {
   WORK_SIZE_COMPLETED_NOTICE,
   WORK_SIZE_DENY_MAX_CHARS,
   WORK_SIZE_DIR_NAME,
+  WORK_SIZE_NOTICE_MAX_CHARS,
   WORK_SIZE_SESSION_NOTICE_MAX_CHARS,
   WORK_SIZE_SESSION_STALE_MS,
   WORK_SIZE_STATE_VERSION,
   commandRunsGitCommit,
   evaluateWorkSizeEdit,
+  formatContractFileDenyReason,
+  formatFailedRetryDenyReason,
+  formatFileDependencyNotice,
+  formatPeriodicReminder,
+  formatReadVolumeNotice,
+  formatUnsavedReminder,
   getWorkSizeDir,
   getWorkSizeStatePath,
   parseReviewVerdict,
@@ -36,6 +44,13 @@ import {
   tabWorkSizeScope,
 } from '../src/hooks/work-size.mjs';
 import {
+  CONFIRM_COMMAND_REASON_MAX_CHARS,
+  formatConfirmCommandAskReason,
+  formatConfirmCommandDenyReason,
+  inspectConfirmableShellCommand,
+  isClearlyUnderSystemTemp,
+} from '../src/hooks/confirm-commands.mjs';
+import {
   CLAUDE_PROJECT_DIR_ENV,
   SUBAGENT_MEMORY_DIR_DENY_REASON,
   WORK_COMMAND_DENY_REASON,
@@ -45,13 +60,18 @@ import {
   formatWorkCommandAskReason,
   formatWorkSizeStateShellAskReason,
   handleClaudePostToolUse,
+  handleClaudePostToolUseFailure,
   handleClaudePreToolUse,
   handleClaudeSessionStart,
   handleClaudeSubagentStop,
   handleClaudeUserPrompt,
   runClaudeHook,
 } from '../src/hooks/claude.mjs';
-import { CLAUDE_POST_TOOL_USE_MATCHER, CLAUDE_PRE_TOOL_USE_MATCHER } from '../src/hooks/tool-names.mjs';
+import {
+  CLAUDE_POST_TOOL_USE_FAILURE_MATCHER,
+  CLAUDE_POST_TOOL_USE_MATCHER,
+  CLAUDE_PRE_TOOL_USE_MATCHER,
+} from '../src/hooks/tool-names.mjs';
 import { checkClaudeHooks, installCortex, isOwnHook, uninstallCortex } from '../src/hooks/installer.mjs';
 import { WORK_CLI_USAGE, WORK_EXIT_ERROR, WORK_EXIT_OK, runWorkCli } from '../scripts/cortex-work.mjs';
 import { collectStatus, formatStatus } from '../scripts/cortex-status.mjs';
@@ -535,8 +555,17 @@ test('work-size stale cleanup: removes >30-day session-*.json files and clean em
     assert.equal(fs.existsSync(recentSessionPath), true, 'recent session-*.json kept');
     assert.equal(fs.existsSync(oldTabPath), true, 'tab-*.json is NOT removed by the 30-day session rule');
 
-    // Commit in projectB (S + empty files + no pending notice) removes projectB's folder entry while keeping projectDir (L)
+    // Commit in projectB clears files, and memory_save clears unsaved markers so clean empty S folder entry is removed
     handleClaudePostToolUse({ cwd: env.projectB, tool_name: 'Bash', tool_input: { command: 'git commit -m "clean b"' } }, opts);
+    assert.deepEqual(
+      readWorkSizeScopeState(env.globalDir, tabWorkSizeScope('tab-clean')).projects[projectPathKey(env.projectB)]?.files,
+      {},
+    );
+    assert.equal(
+      readWorkSizeScopeState(env.globalDir, tabWorkSizeScope('tab-clean')).projects[projectPathKey(env.projectB)]?.unsavedCommitted,
+      true,
+    );
+    handleClaudePostToolUse({ cwd: env.projectB, tool_name: 'mcp__herdr-cortex__memory_save', tool_input: { type: 'worklog' } }, opts);
     let scopeState = readWorkSizeScopeState(env.globalDir, tabWorkSizeScope('tab-clean'));
     assert.equal(scopeState.projects[projectPathKey(env.projectB)], undefined, 'clean empty S folder entry removed');
     assert.equal(scopeState.projects[projectPathKey(env.projectDir)]?.size, 'L');
@@ -548,7 +577,8 @@ test('work-size stale cleanup: removes >30-day session-*.json files and clean em
     assert.equal(scopeState.projects[projectPathKey(env.projectDir)]?.size, 'S');
     assert.equal(scopeState.projects[projectPathKey(env.projectDir)]?.completedNoticePending, true, 'entry with pending notice is kept');
 
-    // Emit the completion notice on UserPromptSubmit -> now clean empty S -> folder entry (and empty file) removed!
+    // Emit the completion notice on UserPromptSubmit (with reminderEveryTurns: 0 so promptTurns stays 0) -> clean empty S removed!
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { workSize: { reminderEveryTurns: 0 } });
     const promptOut = handleClaudeUserPrompt({ session_id: 's-p', cwd: env.projectDir }, opts);
     assert.equal(promptOut.hookSpecificOutput?.additionalContext, WORK_SIZE_COMPLETED_NOTICE);
     assert.equal(readWorkSizeScopeState(env.globalDir, tabWorkSizeScope('tab-clean')), null, 'removed after notice emitted');
@@ -562,7 +592,17 @@ test('work-size bypass conditions & config: worker, subagent, excluded project, 
   const origErr = console.error;
   console.error = () => {};
   try {
-    assert.deepEqual(DEFAULT_WORK_SIZE, { enabled: true, maxFilesPerWindow: 1, maxCharsPerFile: 1000 });
+    assert.deepEqual(DEFAULT_WORK_SIZE, {
+      enabled: true,
+      maxFilesPerWindow: 1,
+      maxCharsPerFile: 1000,
+      reminderEveryTurns: 10,
+      readNoticeThreshold: 25,
+      maxFailedRetries: 2,
+      confirmCommands: true,
+      confirmCommandPatterns: [],
+      contractFiles: [],
+    });
     assert.deepEqual(DEFAULT_CONFIG.workSize, DEFAULT_WORK_SIZE);
 
     // 1. Worker session and subagent calls never count or touch state; non-Herdr sessions isolate by session_id
@@ -621,8 +661,8 @@ test('work-size bypass conditions & config: worker, subagent, excluded project, 
     });
     const cfgA = loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir });
     const cfgB = loadConfig({ projectDir: env.projectB, globalDir: env.globalDir });
-    assert.deepEqual(resolveWorkSizeConfig(cfgA), { enabled: true, maxFilesPerWindow: 2, maxCharsPerFile: 300 });
-    assert.deepEqual(resolveWorkSizeConfig(cfgB), { enabled: false, maxFilesPerWindow: 2, maxCharsPerFile: 300 });
+    assert.deepEqual(resolveWorkSizeConfig(cfgA), { ...DEFAULT_WORK_SIZE, enabled: true, maxFilesPerWindow: 2, maxCharsPerFile: 300 });
+    assert.deepEqual(resolveWorkSizeConfig(cfgB), { ...DEFAULT_WORK_SIZE, enabled: false, maxFilesPerWindow: 2, maxCharsPerFile: 300 });
 
     const optsA = { terminalId: 'tab-cfg', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-cfg' } };
     assert.deepEqual(handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'f1.js', content: 'a'.repeat(300) } }, optsA), {});
@@ -1254,6 +1294,7 @@ test('installer & PowerShell cortex-work: registers/upgrades/removes PostToolUse
     const beforeCheck = checkClaudeHooks({ homeDir: env.homeDir, repoRoot: REPO_ROOT });
     assert.equal(beforeCheck.ok, false);
     assert.equal(beforeCheck.events.PostToolUse.state, 'missing');
+    assert.equal(beforeCheck.events.PostToolUseFailure.state, 'missing');
     assert.equal(beforeCheck.events.SubagentStop.state, 'missing');
 
     assert.equal(installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, globalDir: env.globalDir, antigravityPresent: false }).ok, true);
@@ -1264,10 +1305,14 @@ test('installer & PowerShell cortex-work: registers/upgrades/removes PostToolUse
     const installed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
     assert.equal(installed.hooks.PostToolUse.length, 2, 'user hook + our PostToolUse hook');
     assert.equal(installed.hooks.PostToolUse[1].matcher, CLAUDE_POST_TOOL_USE_MATCHER);
+    assert.equal(installed.hooks.PostToolUseFailure.length, 1);
+    assert.equal(installed.hooks.PostToolUseFailure[0].matcher, CLAUDE_POST_TOOL_USE_FAILURE_MATCHER);
+    assert.equal(isOwnHook(installed.hooks.PostToolUseFailure[0].hooks[0]), true);
     assert.equal(installed.hooks.SubagentStop.length, 1);
     assert.equal(isOwnHook(installed.hooks.SubagentStop[0].hooks[0]), true);
 
     assert.deepEqual(runClaudeHook('post-tool-use', {}, { globalDir: env.globalDir }), {});
+    assert.deepEqual(runClaudeHook('post-tool-use-failure', {}, { globalDir: env.globalDir }), {});
     assert.deepEqual(runClaudeHook('subagent-stop', {}, { globalDir: env.globalDir }), {});
 
     // PowerShell `cortex-work` honors PowerShell's Set-Location (`cd`) when releasing a single folder
@@ -1337,6 +1382,1721 @@ test('installer & PowerShell cortex-work: registers/upgrades/removes PostToolUse
         PostToolUse: [{ matcher: 'Bash', hooks: [userPostHook] }],
       },
     });
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('work-size 2-1 & 2-2: unsaved reminder once per span + periodic reminder every N prompts + SessionStart reset', () => {
+  const env = makeTempEnv('cortex-ws-remind-');
+  try {
+    const opts = {
+      terminalId: 'tab-rem',
+      globalDir: env.globalDir,
+      homeDir: env.homeDir,
+      promptsDir: env.promptsDir,
+      env: { HC_TERMINAL_ID: 'tab-rem' },
+    };
+
+    // 1. Prompt 1 on a clean tab: no reminder yet
+    const p1 = handleClaudeUserPrompt({ session_id: 's1', cwd: env.projectDir }, opts);
+    assert.deepEqual(p1, {});
+
+    // Allowed edit during Turn 1
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'src/a.js', content: 'const a = 1;' } }, opts),
+      {},
+    );
+
+    // 2. Prompt 2: emits 1-line unsaved reminder (<= 300 chars, Korean, [herdr-cortex] prefix)
+    const p2 = handleClaudeUserPrompt({ session_id: 's1', cwd: env.projectDir }, opts);
+    const ctx2 = p2.hookSpecificOutput?.additionalContext || '';
+    const expectedUnsaved1 = formatUnsavedReminder({ editedFileCount: 1, committed: false });
+    assert.equal(ctx2, expectedUnsaved1);
+    assert.ok(ctx2.startsWith('[herdr-cortex]'), ctx2);
+    assert.ok(!ctx2.includes('\n'), 'unsaved reminder must be a single line');
+    assert.ok(ctx2.length <= WORK_SIZE_NOTICE_MAX_CHARS, `len=${ctx2.length}`);
+    assert.match(ctx2, /편집 파일 1개/);
+    assert.match(ctx2, /커밋 없음/);
+    assert.match(ctx2, /memory_save/);
+
+    // 3. Prompts 3..9 in the same unsaved span (including a git commit during Turn 5 without memory_save): no duplicate unsaved reminder!
+    for (let turn = 3; turn <= 9; turn++) {
+      if (turn === 6) {
+        handleClaudePostToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'git commit -m "feat"' } }, opts);
+      }
+      const pt = handleClaudeUserPrompt({ session_id: 's1', cwd: env.projectDir }, opts);
+      assert.deepEqual(pt, {}, `turn ${turn} must not repeat unsaved reminder before periodic turn`);
+    }
+
+    // 4. Prompt 10 (periodic turn): repeats unsaved reminder (now with committed=true) AND 2-line periodic reminder!
+    const p10 = handleClaudeUserPrompt({ session_id: 's1', cwd: env.projectDir }, opts);
+    const ctx10 = p10.hookSpecificOutput?.additionalContext || '';
+    const parts10 = ctx10.split('\n\n');
+    assert.equal(parts10.length, 2, ctx10);
+    assert.equal(parts10[0], formatUnsavedReminder({ editedFileCount: 1, committed: true }));
+    assert.match(parts10[0], /커밋 있음/);
+    assert.equal(parts10[1], formatPeriodicReminder(readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-rem'), { cwd: env.projectDir })));
+    assert.ok(parts10[1].startsWith('[herdr-cortex]'));
+    assert.equal(parts10[1].split('\n').length, 2, 'periodic reminder must be two lines');
+    assert.ok(parts10[1].length <= WORK_SIZE_NOTICE_MAX_CHARS, `periodic len=${parts10[1].length}`);
+    assert.match(parts10[1], /지금 상태: S/);
+    assert.match(parts10[1], /memory_save/);
+
+    // 5. Successful memory_save clears unsaved markers; next prompt (11) emits nothing, and prompt 20 emits ONLY periodic reminder!
+    handleClaudePostToolUse(
+      { cwd: env.projectDir, tool_name: 'mcp__herdr-cortex__memory_save', tool_input: { type: 'worklog', title: 't', summary: 's' } },
+      opts,
+    );
+    assert.deepEqual(handleClaudeUserPrompt({ session_id: 's1', cwd: env.projectDir }, opts), {});
+
+    // Escalate to L so periodic reminder on turn 20 reflects L + remaining conditions
+    handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'big.js', content: 'x'.repeat(1001) } }, opts);
+    for (let turn = 12; turn <= 19; turn++) {
+      assert.deepEqual(handleClaudeUserPrompt({ session_id: 's1', cwd: env.projectDir }, opts), {});
+    }
+    const p20 = handleClaudeUserPrompt({ session_id: 's1', cwd: env.projectDir }, opts);
+    const ctx20 = p20.hookSpecificOutput?.additionalContext || '';
+    assert.ok(ctx20.startsWith('[herdr-cortex]'));
+    assert.ok(ctx20.length <= WORK_SIZE_NOTICE_MAX_CHARS);
+    assert.match(ctx20, /지금 상태: L\(남은 조건: 검수 ACCEPT, memory_save\)/);
+
+    // 6. SessionStart (`startup`, `clear`, `compact`) resets promptTurns to 0 because HEAD_CORE is re-injected;
+    //    `resume` when HEAD_CORE marker is already in transcript does NOT reset promptTurns!
+    for (let i = 0; i < 4; i++) {
+      handleClaudeUserPrompt({ session_id: 's1', cwd: env.projectDir }, opts);
+    }
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-rem'), { cwd: env.projectDir }).promptTurns, 24);
+
+    const transcriptWithCore = path.join(env.root, 'resume-with-core.jsonl');
+    fs.writeFileSync(
+      transcriptWithCore,
+      `${JSON.stringify({ type: 'attachment', attachment: { type: 'hook_additional_context', hookEvent: 'SessionStart', content: '# HEAD 운영 원칙\n본문' } })}\n`,
+      'utf8',
+    );
+    handleClaudeSessionStart(
+      { session_id: 's1', source: 'resume', transcript_path: transcriptWithCore, cwd: env.projectDir },
+      { ...opts, part: 'context' },
+    );
+    assert.equal(
+      readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-rem'), { cwd: env.projectDir }).promptTurns,
+      24,
+      'resume with existing HEAD_CORE marker keeps promptTurns',
+    );
+
+    handleClaudeSessionStart({ session_id: 's2', source: 'clear', cwd: env.projectDir }, { ...opts, part: 'context' });
+    assert.equal(
+      readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-rem'), { cwd: env.projectDir }).promptTurns,
+      0,
+      'SessionStart(clear) resets promptTurns to 0',
+    );
+
+    // 7. reminderEveryTurns: 0 disables periodic reminder while still emitting unsaved reminder once
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { workSize: { reminderEveryTurns: 0 } });
+    handleClaudePostToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'git commit -m "only commit"' } }, opts);
+    const pCommitUnsaved = handleClaudeUserPrompt({ session_id: 's2', cwd: env.projectDir }, opts);
+    assert.match(pCommitUnsaved.hookSpecificOutput?.additionalContext || '', /편집 파일 0개, 커밋 있음/);
+    for (let i = 0; i < 15; i++) {
+      assert.deepEqual(handleClaudeUserPrompt({ session_id: 's2', cwd: env.projectDir }, opts), {});
+    }
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('work-size 2-3: read volume notice on 26th Read/Grep/Glob, per-turn reset, and zero state I/O when threshold is 0', () => {
+  const env = makeTempEnv('cortex-ws-reads-');
+  try {
+    const opts = { terminalId: 'tab-rd', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-rd' } };
+    const statePath = getWorkSizeStatePath(env.globalDir, tabWorkSizeScope('tab-rd'));
+
+    // 1. Threshold = 0: returns {} immediately and never creates or touches state file
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { workSize: { readNoticeThreshold: 0 } });
+    for (const tool of ['Read', 'Grep', 'Glob']) {
+      assert.deepEqual(handleClaudePreToolUse({ cwd: env.projectDir, tool_name: tool, tool_input: { path: 'a.js' } }, opts), {});
+    }
+    assert.equal(fs.existsSync(statePath), false, 'readNoticeThreshold=0 must not touch state file');
+
+    // 2. Default threshold = 25: calls 1..25 are silent, 26th notifies once via additionalContext (no permissionDecision), 27th+ silent
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), DEFAULT_CONFIG);
+    const tools = ['Read', 'Grep', 'Glob'];
+    for (let i = 1; i <= 25; i++) {
+      const res = handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: tools[i % 3], tool_input: { file_path: 'a.js' } },
+        opts,
+      );
+      assert.deepEqual(res, {}, `call ${i} <= 25 should be quiet`);
+    }
+
+    // Worker and subagent calls do not increment or trigger the counter
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, agent_id: 'sub-r', tool_name: 'Read', tool_input: { file_path: 'a.js' } },
+        opts,
+      ),
+      {},
+    );
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: 'Grep', tool_input: { pattern: 'x' } },
+        { ...opts, env: { HC_TERMINAL_ID: 'tab-rd', HERDR_CORTEX_ROLE: 'worker' } },
+      ),
+      {},
+    );
+
+    const res26 = handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Read', tool_input: { file_path: 'a.js' } }, opts);
+    assert.equal(res26.hookSpecificOutput?.hookEventName, 'PreToolUse');
+    assert.equal(res26.hookSpecificOutput?.permissionDecision, undefined, 'must not block or set permissionDecision');
+    const notice26 = res26.hookSpecificOutput?.additionalContext || '';
+    assert.equal(notice26, formatReadVolumeNotice({ readCount: 26, threshold: 25 }));
+    assert.ok(notice26.startsWith('[herdr-cortex]'));
+    assert.ok(notice26.length <= WORK_SIZE_NOTICE_MAX_CHARS, `len=${notice26.length}`);
+    assert.match(notice26, /26회/);
+    assert.match(notice26, /researcher/);
+    assert.match(notice26, /원래 목적/);
+
+    for (let i = 27; i <= 30; i++) {
+      assert.deepEqual(
+        handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Glob', tool_input: { pattern: '*.js' } }, opts),
+        {},
+        `call ${i} in same turn must not repeat notice`,
+      );
+    }
+
+    // 3. Next UserPromptSubmit resets turnReads to 0 so a new 26-read burst notifies once again
+    handleClaudeUserPrompt({ session_id: 's-r', cwd: env.projectDir }, opts);
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-rd'), { cwd: env.projectDir }).turnReads, 0);
+    for (let i = 1; i <= 25; i++) {
+      assert.deepEqual(handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Read', tool_input: { file_path: 'a.js' } }, opts), {});
+    }
+    const resAgain = handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Grep', tool_input: { pattern: 'foo' } }, opts);
+    assert.ok(resAgain.hookSpecificOutput?.additionalContext?.includes('26회'));
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('work-size 2-4: repeated failed-edit blocking via PostToolUseFailure and resets on success, commit, memory_save, and cortex-work', () => {
+  const env = makeTempEnv('cortex-ws-retry-');
+  try {
+    const opts = { terminalId: 'tab-fail', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-fail' } };
+    const readF = () => readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-fail'), { cwd: env.projectDir });
+
+    // 1. Shell failures with zero prior file edits are ignored
+    handleClaudePostToolUseFailure(
+      { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' },
+      opts,
+    );
+    assert.equal(readF(), null);
+
+    // 2. Edit F -> user interrupt (`is_interrupt: true`) is NOT counted -> subsequent failure counts once,
+    //    and a 2nd failure with NO edit in between does NOT double-increment!
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/f.js', old_string: 'a', new_string: 'b' } }, opts),
+      {},
+    );
+    handleClaudePostToolUseFailure(
+      { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 130', is_interrupt: true },
+      opts,
+    );
+    assert.deepEqual(readF().failedRetries, {}, 'is_interrupt must not increment failedRetries');
+
+    handleClaudePostToolUseFailure(
+      { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1\nAssertionError' },
+      opts,
+    );
+    assert.deepEqual(readF().failedRetries, { 'src/f.js': 1 });
+
+    // Second failing command without editing F again -> still 1!
+    handleClaudePostToolUseFailure(
+      { cwd: env.projectDir, tool_name: 'PowerShell', tool_input: { command: 'npm test' }, error: 'Exit code 1' },
+      opts,
+    );
+    assert.deepEqual(readF().failedRetries, { 'src/f.js': 1 }, 'failure with no edit since previous shell result is ignored');
+
+    // 3. Edit F again -> fail again (count=2) -> 3rd edit of F is DENIED and escalates S -> L!
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/f.js', old_string: 'b', new_string: 'c' } }, opts),
+      {},
+    );
+    handleClaudePostToolUseFailure(
+      { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' },
+      opts,
+    );
+    assert.deepEqual(readF().failedRetries, { 'src/f.js': 2 });
+
+    const blocked = handleClaudePreToolUse(
+      { cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/f.js', old_string: 'c', new_string: 'd' } },
+      opts,
+    );
+    assert.equal(blocked.hookSpecificOutput?.permissionDecision, 'deny');
+    const reason = blocked.hookSpecificOutput.permissionDecisionReason;
+    assert.equal(reason, formatFailedRetryDenyReason({ file: 'src/f.js', failedCount: 2, escalated: true }));
+    assert.ok(reason.startsWith('[herdr-cortex]'));
+    assert.ok(reason.length <= WORK_SIZE_NOTICE_MAX_CHARS, `len=${reason.length}`);
+    assert.match(reason, /2회/);
+    assert.match(reason, /원래 문제/);
+    assert.match(reason, /researcher/);
+    assert.match(reason, /start-job/);
+    assert.match(reason, /cortex-work/);
+    assert.equal(readF().size, 'L');
+    assert.equal(readF().escalationReason?.rule, 'max_failed_retries');
+
+    // 4. Read-only shell commands (`grep`, `git diff --exit-code`, `ls`) neither increment nor reset failedRetries!
+    handleClaudePostToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'git status' } }, opts);
+    assert.deepEqual(readF().failedRetries, { 'src/f.js': 2 }, 'read-only shell success must NOT reset failedRetries');
+
+    // Successful non-read-only shell command (`PostToolUse`) resets all failedRetries to {} (while keeping L)
+    handleClaudePostToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' } }, opts);
+    assert.deepEqual(readF().failedRetries, {});
+    assert.equal(readF().size, 'L');
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/f.js', old_string: 'c', new_string: 'd' } }, opts),
+      {},
+      'allowed again after shell command succeeded',
+    );
+
+    // Read-only failures (`grep` exit 1, `git diff --exit-code` exit 1, `ls nonexistent` exit 2) after an edit
+    // must NOT increment failedRetries AND must NOT wipe `editedSinceShell` before a real test command runs!
+    for (const roFailCmd of ['grep -n nonexistent_symbol src/f.js', 'git diff --exit-code', 'ls no_such_file']) {
+      handleClaudePostToolUseFailure(
+        { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: roFailCmd }, error: 'Exit code 1' },
+        opts,
+      );
+      assert.deepEqual(readF().failedRetries, {}, `read-only failure must not count: ${roFailCmd}`);
+    }
+
+    // 5. Commit, memory_save, cortex-work reset, and maxFailedRetries=0 each clear/disable failure blocking
+    handleClaudePostToolUseFailure({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' }, opts);
+    assert.deepEqual(readF().failedRetries, { 'src/f.js': 1 }, 'editedSinceShell survived intervening read-only failures');
+    handleClaudePostToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'git commit -m "wip"' } }, opts);
+    assert.deepEqual(readF().failedRetries, {}, 'git commit clears failedRetries');
+
+    handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/f.js', old_string: 'd', new_string: 'e' } }, opts);
+    handleClaudePostToolUseFailure({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' }, opts);
+    assert.deepEqual(readF().failedRetries, { 'src/f.js': 1 });
+    handleClaudePostToolUse({ cwd: env.projectDir, tool_name: 'mcp__herdr-cortex__memory_save', tool_input: { type: 'worklog' } }, opts);
+    assert.deepEqual(readF().failedRetries, {}, 'memory_save clears failedRetries');
+
+    handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/f.js', old_string: 'e', new_string: 'f' } }, opts);
+    handleClaudePostToolUseFailure({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' }, opts);
+    runWorkCli(['reset', '--tab', 'tab-fail'], { env: { HC_TERMINAL_ID: 'tab-fail' }, cwd: env.projectDir, globalDir: env.globalDir, stdout: makeSink(), stderr: makeSink() });
+    assert.deepEqual(readF().failedRetries, {}, 'cortex-work reset clears failedRetries');
+
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { workSize: { maxFailedRetries: 0 } });
+    for (let i = 0; i < 3; i++) {
+      assert.deepEqual(handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/f.js', old_string: 'a', new_string: 'b' } }, opts), {});
+      handleClaudePostToolUseFailure({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' }, opts);
+    }
+    assert.deepEqual(handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/f.js', old_string: 'a', new_string: 'b' } }, opts), {});
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('work-size 2-5: hard-to-reverse shell commands ask in main, deny in worker/subagent, exempt temp deletes, and respect config/precedence', () => {
+  const env = makeTempEnv('cortex-ws-confirm-');
+  const origErr = console.error;
+  console.error = () => {};
+  try {
+    const opts = { terminalId: 'tab-cmd', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-cmd', TEMP: os.tmpdir(), TMP: os.tmpdir() } };
+    const tempSub = path.join(os.tmpdir(), 'herdr-cortex-safe-del-sub');
+
+    const mustConfirmCommands = [
+      'git push --force origin main',
+      'git push -f origin main',
+      'git push --force-with-lease origin feat',
+      'git push --delete origin old-branch',
+      'git push --mirror',
+      'git push origin :old-branch',
+      'git push origin +main',
+      'git push origin +HEAD:refs/heads/main',
+      'git reset --hard HEAD~1',
+      'git clean -fd',
+      'git checkout -- src/a.js',
+      'git restore src/a.js',
+      'git restore -SW src/a.js',
+      'git branch -D feat/old',
+      'git stash drop',
+      'git stash clear',
+      'git rebase main',
+      'git rebase -i HEAD~3',
+      'git filter-branch -- --all',
+      'git reflog expire --expire=now --all',
+      'git gc --prune=now',
+      'npm publish',
+      'gh release create v1.2.0',
+      'gh pr merge 42 --squash',
+      'gh repo delete org/repo --yes',
+      'docker push myorg/app:latest',
+      'rm -rf dist',
+      'rm -r build',
+      'Remove-Item -Recurse -Force dist',
+      'cmd /c "rmdir /s /q build"',
+      'cmd /c "del /s /q build"',
+      'xargs rm -rf < list.txt',
+      'find . -name dist -exec rm -rf {} +',
+      'find . -name dist -exec rm {} -rf \\;',
+      'find ./build -delete',
+      'npx rimraf dist',
+      'rimraf coverage',
+      `rm -rf "${os.tmpdir()}"`,
+      `rm -rf "${tempSub}" ./dist`,
+      'sqlite3 app.db "DROP TABLE users;"',
+      'psql -c "DROP DATABASE staging"',
+      'echo "TRUNCATE TABLE audit_logs;" | psql mydb',
+      'sh -c "git reset --hard"',
+    ];
+
+    const mustPassCommands = [
+      'git push',
+      'git push origin main',
+      'git push -u origin HEAD:feat',
+      'git push origin main:main',
+      'git reset --soft HEAD~1',
+      'git reset HEAD src/a.js',
+      'git clean -nd',
+      'git clean -fd --dry-run',
+      'git checkout main',
+      'git checkout -b feat/new',
+      'git restore --staged src/a.js',
+      'git restore -S src/a.js',
+      'git branch -d feat/merged',
+      'git stash',
+      'git stash pop',
+      'git rebase --abort',
+      'git rebase --continue',
+      'git rebase --skip',
+      'git rebase --quit',
+      'git rebase --edit-todo',
+      'git rebase --show-current-patch',
+      'npm publish --dry-run',
+      'rm single-file.txt',
+      'rm -f single-file.txt',
+      'find . -name "*.tmp" -exec rm {} +',
+      'rmdir /c/Users/x/emptydir',
+      'echo "git push --force && rm -rf / && DROP TABLE users"',
+      'git commit -m "docs: warn against git reset --hard and DROP TABLE"',
+      `rm -rf "${tempSub}"`,
+      `rimraf "${tempSub}"`,
+      `find "${tempSub}" -delete`,
+      'cmd /c "rmdir /s /q %TEMP%\\cortex-temp-dir"',
+    ];
+
+    for (const cmd of mustConfirmCommands) {
+      const match = inspectConfirmableShellCommand(cmd, { env: opts.env });
+      assert.equal(match.matched, true, `expected match for: ${cmd}`);
+
+      // Main conversation -> ask
+      const mainRes = handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: cmd } }, opts);
+      assert.equal(mainRes.hookSpecificOutput?.permissionDecision, 'ask', `main should ask for: ${cmd}`);
+      const askReason = mainRes.hookSpecificOutput.permissionDecisionReason;
+      assert.equal(askReason, formatConfirmCommandAskReason(match, cmd));
+      assert.ok(askReason.startsWith('[herdr-cortex]'));
+      assert.ok(askReason.length <= CONFIRM_COMMAND_REASON_MAX_CHARS, `ask len=${askReason.length}`);
+
+      // Subagent -> deny
+      const subRes = handleClaudePreToolUse(
+        { cwd: env.projectDir, agent_id: 'sub-c', tool_name: 'Bash', tool_input: { command: cmd } },
+        opts,
+      );
+      assert.equal(subRes.hookSpecificOutput?.permissionDecision, 'deny', `subagent should deny for: ${cmd}`);
+      const subReason = subRes.hookSpecificOutput.permissionDecisionReason;
+      assert.equal(subReason, formatConfirmCommandDenyReason(match));
+      assert.ok(subReason.startsWith('[herdr-cortex]'));
+      assert.ok(subReason.length <= CONFIRM_COMMAND_REASON_MAX_CHARS, `deny len=${subReason.length}`);
+      assert.match(subReason, /HEAD를 거쳐 사용자 확인/);
+
+      // Worker -> deny
+      const workerRes = handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: 'PowerShell', tool_input: { command: cmd } },
+        { ...opts, env: { ...opts.env, HERDR_CORTEX_ROLE: 'worker' } },
+      );
+      assert.equal(workerRes.hookSpecificOutput?.permissionDecision, 'deny', `worker should deny for: ${cmd}`);
+      assert.equal(workerRes.hookSpecificOutput.permissionDecisionReason, subReason);
+    }
+
+    for (const cmd of mustPassCommands) {
+      assert.equal(inspectConfirmableShellCommand(cmd, { env: opts.env }).matched, false, `must NOT match: ${cmd}`);
+      assert.deepEqual(handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: cmd } }, opts), {}, `must pass: ${cmd}`);
+    }
+
+    assert.equal(isClearlyUnderSystemTemp(tempSub, { env: opts.env }), true);
+    assert.equal(isClearlyUnderSystemTemp(os.tmpdir(), { env: opts.env }), false, 'temp root itself is NOT exempted');
+
+    // Shell-specific temp variable rules & `rmdir /s` cmd-context scoping:
+    // - PowerShell `$env:TEMP\sub` passes, while `$TEMP\sub` / `$TMP\sub` is NOT an env var in PowerShell -> asks!
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: 'PowerShell', tool_input: { command: 'Remove-Item -Recurse -Force "$env:TEMP\\cortex-temp-dir"' } },
+        opts,
+      ),
+      {},
+    );
+    assert.equal(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: 'PowerShell', tool_input: { command: 'Remove-Item -Recurse -Force "$TEMP\\cortex-temp-dir"' } },
+        opts,
+      ).hookSpecificOutput?.permissionDecision,
+      'ask',
+    );
+    assert.equal(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: 'PowerShell', tool_input: { command: 'rm -rf "$TMP/cortex-temp-dir"' } },
+        opts,
+      ).hookSpecificOutput?.permissionDecision,
+      'ask',
+    );
+    // - Bash unset `$TMPDIR` is NOT exempted (expands to `/...` in bash!), whereas set `TMPDIR` IS exempted
+    assert.equal(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'rm -rf "$TMPDIR/cortex-temp-dir"' } },
+        { ...opts, env: { HC_TERMINAL_ID: 'tab-cmd', TEMP: os.tmpdir(), TMP: os.tmpdir() } },
+      ).hookSpecificOutput?.permissionDecision,
+      'ask',
+    );
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'rm -rf "$TMPDIR/cortex-temp-dir"' } },
+        { ...opts, env: { HC_TERMINAL_ID: 'tab-cmd', TEMP: os.tmpdir(), TMP: os.tmpdir(), TMPDIR: os.tmpdir() } },
+      ),
+      {},
+    );
+    // - `rmdir /s`: standalone switch in unknown/`cmd` asks, while POSIX paths in Bash (`rmdir /s`, `rmdir /c/Users/x/emptydir`) pass!
+    assert.equal(inspectConfirmableShellCommand('rmdir /s /q build', { env: opts.env }).matched, true);
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'rmdir /s' } }, opts),
+      {},
+    );
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'rmdir /c/Users/x/emptydir' } }, opts),
+      {},
+    );
+
+    // ReDoS protection on `confirmCommandPatterns`: `^(a+)+$` on `'a'.repeat(32) + '!'` finishes quickly,
+    // is treated as matched (`ask` in main, `deny` in subagent), and is reported as a config problem!
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), {
+      workSize: {
+        confirmCommands: true,
+        confirmCommandPatterns: ['^(a+)+$'],
+      },
+    });
+    const redosCfg = loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir });
+    assert.equal(
+      getConfigProblems(redosCfg).some((p) => p.code === 'invalid_work_size' && p.message.includes('confirmCommandPatterns')),
+      true,
+    );
+    const evilInput = `${'a'.repeat(32)}!`;
+    const redosStart = performance.now();
+    const redosMain = handleClaudePreToolUse(
+      { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: evilInput } },
+      opts,
+    );
+    const redosMs = performance.now() - redosStart;
+    assert.ok(redosMs < 500, `ReDoS pattern must be bounded (<500ms), took ${redosMs.toFixed(1)}ms`);
+    assert.equal(redosMain.hookSpecificOutput?.permissionDecision, 'ask');
+    assert.equal(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, agent_id: 'sub-redos', tool_name: 'Bash', tool_input: { command: evilInput } },
+        opts,
+      ).hookSpecificOutput?.permissionDecision,
+      'deny',
+    );
+    // Overlapping alternation (`(a|aa)+$`) also times out -> asks and records runtime config problem on `cfg`
+    const altCfg = loadConfig({
+      projectDir: env.projectDir,
+      globalDir: env.globalDir,
+      overrides: { workSize: { confirmCommandPatterns: ['^(a|aa)+$'] } },
+    });
+    const altMatch = inspectConfirmableShellCommand(evilInput, {
+      confirmCommandPatterns: altCfg.workSize.confirmCommandPatterns,
+      config: altCfg,
+    });
+    assert.equal(altMatch.matched, true);
+    assert.equal(altMatch.timedOut, true);
+    assert.equal(
+      getConfigProblems(altCfg).some((p) => p.code === 'invalid_work_size' && p.message.includes('exceeded')),
+      true,
+    );
+
+    // `workSize.enabled: false` still enforces `confirmCommands: true`, while `confirmCommands: false` disables it
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), {
+      workSize: {
+        enabled: false,
+        confirmCommands: true,
+        confirmCommandPatterns: ['^deploy-prod\\b', '[invalid-regex'],
+      },
+    });
+    const cfgWithCustom = loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir });
+    const cfgProblems = getConfigProblems(cfgWithCustom);
+    assert.equal(cfgProblems.some((p) => p.code === 'invalid_work_size' && p.message.includes('confirmCommandPatterns[1]')), true);
+    assert.equal(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'git push --force' } }, opts)
+        .hookSpecificOutput?.permissionDecision,
+      'ask',
+      'confirmCommands stays active when workSize.enabled is false',
+    );
+    assert.equal(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'deploy-prod --now' } }, opts)
+        .hookSpecificOutput?.permissionDecision,
+      'ask',
+      'valid custom pattern still works alongside invalid regex',
+    );
+
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { workSize: { confirmCommands: false } });
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'git reset --hard' } }, opts),
+      {},
+      'confirmCommands=false turns off 2-5',
+    );
+
+    // Precedence: an earlier PreToolUse guard (`subagentTouchesMemoryDir`, `state/work-size`) wins over 2-5
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), DEFAULT_CONFIG);
+    const subMemCmd = handleClaudePreToolUse(
+      { cwd: env.projectDir, agent_id: 'sub-1', tool_name: 'Bash', tool_input: { command: 'rm -rf .memory' } },
+      opts,
+    );
+    assert.equal(subMemCmd.hookSpecificOutput?.permissionDecision, 'deny');
+    assert.equal(subMemCmd.hookSpecificOutput?.permissionDecisionReason, SUBAGENT_MEMORY_DIR_DENY_REASON);
+  } finally {
+    console.error = origErr;
+    env.cleanup();
+  }
+});
+
+test('work-size 2-6: contractFiles glob blocks S and escalates to L; memory-graph dependency notice emits once per window in approved projects', async () => {
+  const env = makeTempEnv('cortex-ws-deps-');
+  try {
+    // 1. Contract files: blocked in S (escalating to L), ordinary limits in L
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), {
+      workSize: { contractFiles: ['schema/**', 'src/public/*.mjs'] },
+    });
+    const opts = { terminalId: 'tab-dep', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-dep' } };
+
+    const deniedContract = handleClaudePreToolUse(
+      { cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/public/api.mjs', old_string: 'a', new_string: 'b' } },
+      opts,
+    );
+    assert.equal(deniedContract.hookSpecificOutput?.permissionDecision, 'deny');
+    const cReason = deniedContract.hookSpecificOutput.permissionDecisionReason;
+    assert.equal(
+      cReason,
+      formatContractFileDenyReason({ file: 'src/public/api.mjs', pattern: 'src/public/*.mjs', commandName: 'cortex-work' }),
+    );
+    assert.ok(cReason.startsWith('[herdr-cortex]'));
+    assert.ok(cReason.length <= WORK_SIZE_NOTICE_MAX_CHARS, `len=${cReason.length}`);
+    assert.match(cReason, /src\/public\/\*\.mjs/);
+    assert.equal(readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-dep'), { cwd: env.projectDir }).size, 'L');
+
+    // Now in L, editing the contract file within ordinary 1-file / 1,000-char limit is allowed!
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'src/public/api.mjs', old_string: 'a', new_string: 'b' } },
+        opts,
+      ),
+      {},
+    );
+
+    // 2. Memory graph dependency notice: approved project with active decision/baseline docs
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), DEFAULT_CONFIG);
+    const store = new CortexStore({ projectDir: env.projectB, globalDir: env.globalDir, disableVec: true });
+    let decDoc;
+    let baseDoc;
+    try {
+      decDoc = store.saveDoc({
+        scope: 'project',
+        type: 'decision',
+        title: '공개 설정 형식 계약',
+        summary: '설정 키 이름과 기본값 유지',
+        content: '본문',
+        files: ['src/config-schema.mjs'],
+      });
+      baseDoc = store.saveDoc({
+        scope: 'project',
+        type: 'baseline',
+        title: 'P0 아키텍처 기준선',
+        summary: '기준선 요약',
+        content: '본문',
+        files: ['src/config-schema.mjs'],
+      });
+      // Superseded decision and worklog must NOT appear in notice
+      const oldDec = store.saveDoc({
+        scope: 'project',
+        type: 'decision',
+        title: '폐기된 옛 결정',
+        summary: '옛 요약',
+        content: '본문',
+        files: ['src/config-schema.mjs'],
+      });
+      store.updateDoc({ id: oldDec.id, scope: 'project', status: 'superseded' });
+      store.saveDoc({
+        scope: 'project',
+        type: 'worklog',
+        title: '일반 작업 로그',
+        summary: '작업 로그',
+        content: '본문',
+        files: ['src/config-schema.mjs'],
+      });
+      store.saveDoc({
+        scope: 'project',
+        type: 'decision',
+        title: '대소문자 경로 결정',
+        summary: 'Mixed case 경로 검증',
+        content: '본문',
+        files: ['src/Mixed.mjs'],
+      });
+    } finally {
+      store.close();
+    }
+
+    const optsB = { terminalId: 'tab-graph', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-graph' } };
+    // Unlinked file -> no notice
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectB, tool_name: 'Write', tool_input: { file_path: 'src/unlinked.mjs', content: '1' } }, optsB),
+      {},
+    );
+    handleClaudePostToolUse({ cwd: env.projectB, tool_name: 'Bash', tool_input: { command: 'git commit -m "clear"' } }, optsB);
+
+    // First edit of linked file -> attaches additionalContext once (<= 300 chars, active decision + baseline only)
+    const firstEdit = handleClaudePreToolUse(
+      { cwd: env.projectB, tool_name: 'Edit', tool_input: { file_path: 'src/config-schema.mjs', old_string: 'x', new_string: 'y' } },
+      optsB,
+    );
+    assert.equal(firstEdit.hookSpecificOutput?.hookEventName, 'PreToolUse');
+    assert.equal(firstEdit.hookSpecificOutput?.permissionDecision, undefined);
+    const depNotice = firstEdit.hookSpecificOutput?.additionalContext || '';
+    assert.ok(depNotice.startsWith('[herdr-cortex]'));
+    assert.ok(depNotice.length <= WORK_SIZE_NOTICE_MAX_CHARS, `len=${depNotice.length}`);
+    assert.ok(depNotice.includes(decDoc.id), depNotice);
+    assert.ok(depNotice.includes(baseDoc.id), depNotice);
+    assert.ok(!depNotice.includes('폐기된'), depNotice);
+    assert.ok(!depNotice.includes('일반 작업 로그'), depNotice);
+    assert.match(depNotice, /공개 인터페이스, 설정 형식, 저장 데이터 구조, 훅 동작/);
+
+    // Second edit of same file in same cumulative window -> no duplicate notice
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { cwd: env.projectB, tool_name: 'Edit', tool_input: { file_path: 'src/config-schema.mjs', old_string: 'y', new_string: 'z' } },
+        optsB,
+      ),
+      {},
+    );
+
+    // Slow (>200ms) or throwing graph lookup is skipped without blocking the edit
+    handleClaudePostToolUse({ cwd: env.projectB, tool_name: 'Bash', tool_input: { command: 'git commit -m "clear 2"' } }, optsB);
+    let clock = 0;
+    const timedOutEval = evaluateWorkSizeEdit({
+      filePath: 'src/config-schema.mjs',
+      addedChars: 5,
+      cwd: env.projectB,
+      globalDir: env.globalDir,
+      terminalId: 'tab-graph',
+      dependencyLookupOptions: {
+        timeoutMs: 200,
+        nowMs: () => {
+          clock += 250;
+          return clock;
+        },
+      },
+    });
+    assert.equal(timedOutEval.action, 'allow');
+    assert.equal(timedOutEval.additionalContext, undefined, 'lookup exceeding 200ms is skipped');
+
+    // Unapproved project never reads .memory/index.sqlite even if one exists on disk
+    const unapprovedProj = path.join(env.root, 'unapproved-with-db');
+    fs.mkdirSync(unapprovedProj, { recursive: true });
+    fs.cpSync(path.join(env.projectB, '.memory'), path.join(unapprovedProj, '.memory'), { recursive: true });
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { cwd: unapprovedProj, tool_name: 'Edit', tool_input: { file_path: 'src/config-schema.mjs', old_string: 'a', new_string: 'b' } },
+        { terminalId: 'tab-unapp', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-unapp' } },
+      ),
+      {},
+    );
+
+    // Windows case-insensitive lookup: doc `files: ['src/Mixed.mjs']` is found when editing `src/mixed.mjs`
+    if (process.platform === 'win32') {
+      atomicWriteJson(path.join(env.globalDir, 'config.json'), {
+        workSize: { maxFilesPerWindow: 10, maxCharsPerFile: 10000 },
+      });
+      handleClaudePostToolUse({ cwd: env.projectB, tool_name: 'Bash', tool_input: { command: 'git commit -m "clear case"' } }, optsB);
+      const mixedEdit = handleClaudePreToolUse(
+        { cwd: env.projectB, tool_name: 'Edit', tool_input: { file_path: 'src/mixed.mjs', old_string: 'a', new_string: 'b' } },
+        optsB,
+      );
+      assert.match(mixedEdit.hookSpecificOutput?.additionalContext || '', /대소문자 경로 결정/);
+    }
+
+    // Exclusively locked `.memory/index.sqlite`: edit hook finishes fast (<500ms) instead of waiting 5s,
+    // without modifying or deleting index files!
+    const dbPathB = path.join(env.projectB, '.memory', 'index.sqlite');
+    const lockerScript = path.join(env.outsideDir, 'hold-exclusive-lock.mjs');
+    fs.writeFileSync(
+      lockerScript,
+      [
+        "import { DatabaseSync } from 'node:sqlite';",
+        'const db = new DatabaseSync(process.argv[2]);',
+        "db.exec('PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS _lock_probe(x); INSERT INTO _lock_probe VALUES (1);');",
+        "process.stdout.write('LOCKED\\n');",
+        "setTimeout(() => { try { db.exec('ROLLBACK'); db.close(); } catch {} }, 10000);",
+      ].join('\n'),
+      'utf8',
+    );
+    const locker = spawn(process.execPath, ['--no-warnings', lockerScript, dbPathB], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        locker.stdout.once('data', resolve);
+        locker.once('error', reject);
+      });
+      handleClaudePostToolUse({ cwd: env.projectB, tool_name: 'Bash', tool_input: { command: 'git commit -m "clear lock"' } }, optsB);
+      const tLock0 = performance.now();
+      const lockedEdit = handleClaudePreToolUse(
+        { cwd: env.projectB, tool_name: 'Edit', tool_input: { file_path: 'src/config-schema.mjs', old_string: 'a', new_string: 'b' } },
+        optsB,
+      );
+      const lockElapsedMs = performance.now() - tLock0;
+      assert.deepEqual(lockedEdit, {}, 'locked index skips notice without blocking edit');
+      assert.ok(lockElapsedMs < 500, `locked index lookup must finish well under 500ms, took ${lockElapsedMs.toFixed(1)}ms`);
+    } finally {
+      locker.kill();
+      await new Promise((resolve) => locker.once('close', resolve));
+    }
+
+    // Unexpected SQLite schema skips cleanly without creating/modifying/unlinking files
+    const oddProj = path.join(env.root, 'odd-schema-proj');
+    fs.mkdirSync(path.join(oddProj, '.memory'), { recursive: true });
+    approveAsUser(oddProj, { globalDir: env.globalDir });
+    const oddDbPath = path.join(oddProj, '.memory', 'index.sqlite');
+    const oddInit = spawnSync(
+      process.execPath,
+      ['--no-warnings', '-e', "import('node:sqlite').then(({DatabaseSync})=>{const d=new DatabaseSync(process.argv[1]);d.exec('CREATE TABLE unrelated(a INT)');d.close();})", oddDbPath],
+      { windowsHide: true },
+    );
+    assert.equal(oddInit.status, 0);
+    const oddBeforeStat = fs.statSync(oddDbPath);
+    assert.deepEqual(
+      handleClaudePreToolUse(
+        { cwd: oddProj, tool_name: 'Write', tool_input: { file_path: 'src/a.mjs', content: '1' } },
+        { terminalId: 'tab-odd', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-odd' } },
+      ),
+      {},
+    );
+    assert.equal(fs.existsSync(oddDbPath), true);
+    assert.equal(fs.statSync(oddDbPath).size, oddBeforeStat.size);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('Addendum 1..3 & cortex-work status: narrow classifyWorkCommand, parseReviewVerdict boundaries, release --all hint, and status fields', () => {
+  const env = makeTempEnv('cortex-ws-addendum-');
+  try {
+    const opts = { terminalId: 'tab-add', globalDir: env.globalDir, env: { HC_TERMINAL_ID: 'tab-add' } };
+
+    // Addendum 1: file-mention dev commands pass in main, subagent, and worker
+    const devFileCommands = [
+      'git add scripts/cortex-work.mjs',
+      'node --check scripts/cortex-work.mjs',
+      'Get-Content scripts\\cortex-work.mjs',
+      'git commit -m "cortex-work release fix"',
+    ];
+    for (const cmd of devFileCommands) {
+      assert.notEqual(classifyWorkCommand(cmd), 'runs-cli', `must not be runs-cli: ${cmd}`);
+      assert.deepEqual(
+        handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: cmd } }, opts),
+        {},
+        `main must pass: ${cmd}`,
+      );
+      assert.deepEqual(
+        handleClaudePreToolUse({ cwd: env.projectDir, agent_id: 'sub-a', tool_name: 'PowerShell', tool_input: { command: cmd } }, opts),
+        {},
+        `subagent must pass: ${cmd}`,
+      );
+      assert.deepEqual(
+        handleClaudePreToolUse(
+          { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: cmd } },
+          { ...opts, env: { HC_TERMINAL_ID: 'tab-add', HERDR_CORTEX_ROLE: 'worker' } },
+        ),
+        {},
+        `worker must pass: ${cmd}`,
+      );
+    }
+
+    // Actual release/reset invocations still ask/deny
+    for (const cmd of ['cortex-work release', 'node scripts/cortex-work.mjs reset', 'npm run work -- release']) {
+      assert.equal(classifyWorkCommand(cmd), 'runs-cli', cmd);
+      assert.equal(
+        handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: cmd } }, opts)
+          .hookSpecificOutput?.permissionDecision,
+        'ask',
+      );
+      assert.equal(
+        handleClaudePreToolUse({ cwd: env.projectDir, agent_id: 'sub-a', tool_name: 'Bash', tool_input: { command: cmd } }, opts)
+          .hookSpecificOutput?.permissionDecision,
+        'deny',
+      );
+    }
+
+    // Addendum 2 + 2-4: declarative Korean copula endings, negations, glued ASCII words, comma commentary, and rubric lines
+    assert.equal(parseReviewVerdict('판정: NEEDS_FIX입니다'), 'NEEDS_FIX');
+    assert.equal(parseReviewVerdict('판정: ACCEPT입니다'), 'ACCEPT');
+    assert.equal(parseReviewVerdict('최종 판정: `ACCEPT`입니다.'), 'ACCEPT');
+    assert.equal(parseReviewVerdict('판정: ACCEPT임'), 'ACCEPT');
+    assert.equal(parseReviewVerdict('판정: ACCEPT하지 않음'), null);
+    assert.equal(parseReviewVerdict('최종 판정: `ACCEPT`하지 않음'), null);
+    assert.equal(parseReviewVerdict('판정: ACCEPT 불가'), null);
+    assert.equal(parseReviewVerdict('판정: ACCEPT 아님'), null);
+    assert.equal(parseReviewVerdict('판정: not ACCEPT'), null);
+    assert.equal(parseReviewVerdict('Verdict: ACCEPTED'), null);
+    assert.equal(parseReviewVerdict('Verdict: ACCEPTABLE'), null);
+    assert.equal(parseReviewVerdict('판정: NEEDS_FIX이나 추가 확인 필요'), null);
+    assert.equal(parseReviewVerdict('Verdict: NEEDS_FIX, ACCEPT after fix'), 'NEEDS_FIX');
+    assert.equal(parseReviewVerdict('Verdict: NEEDS_FIX (ACCEPT 불가)'), 'NEEDS_FIX');
+    assert.equal(parseReviewVerdict('판정: ACCEPT (이전 NEEDS_FIX 지적 모두 해소)'), 'ACCEPT');
+    assert.equal(parseReviewVerdict('- **판정**: `NEEDS_FIX` — 현 상태로는 `ACCEPT` 불가'), 'NEEDS_FIX');
+    // Rubric lines remain null
+    assert.equal(parseReviewVerdict('Verdict: ACCEPT | NEEDS_FIX'), null);
+    assert.equal(parseReviewVerdict('최종 판정: `ACCEPT` 또는 `NEEDS_FIX`'), null);
+    assert.equal(parseReviewVerdict('Verdict: ACCEPT / NEEDS_FIX'), null);
+    assert.equal(parseReviewVerdict('Verdict: ACCEPT or NEEDS_FIX'), null);
+
+    // 2-1 shell-aware backtick & unclosed-quote non-swallowing across PowerShell and Bash:
+    // (a) Five blocking-regression PowerShell inputs + two-backtick & unclosed-quote variants
+    for (const pwshWorkCmd of [
+      'Write-Host "`n"; cortex-work release',
+      'Write-Host "`n"; cortex-work release; Write-Host "`n"',
+      'cortex-work `\n  release',
+      'Write-Host "unclosed; cortex-work release',
+      "Write-Host 'unclosed; cortex-work release",
+    ]) {
+      assert.equal(
+        handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'PowerShell', tool_input: { command: pwshWorkCmd } }, opts)
+          .hookSpecificOutput?.permissionDecision,
+        'ask',
+        `PowerShell main must ask: ${pwshWorkCmd}`,
+      );
+      assert.equal(
+        handleClaudePreToolUse({ cwd: env.projectDir, agent_id: 'sub-ps', tool_name: 'PowerShell', tool_input: { command: pwshWorkCmd } }, opts)
+          .hookSpecificOutput?.permissionDecision,
+        'deny',
+        `PowerShell subagent must deny: ${pwshWorkCmd}`,
+      );
+    }
+
+    for (const pwshCommitCmd of [
+      'Write-Host "x`n"; git commit -m y',
+      'Write-Host "x`n"; git commit -m y; Write-Host "z`n"',
+      'git commit `\n  -m y',
+      'Write-Host "unclosed; git commit -m y',
+    ]) {
+      assert.equal(commandRunsGitCommit(pwshCommitCmd, { shell: 'PowerShell' }), true, `PowerShell commit must be detected: ${pwshCommitCmd}`);
+    }
+
+    for (const pwshConfirmCmd of [
+      'Write-Host "a`nb"; git push --force',
+      'Write-Host "a`nb"; git push --force; Write-Host "c`nd"',
+      'Remove-Item -Path dist `\n -Recurse -Force',
+      'Remove-Item -Path dist `\n -Recurse `\n -Force',
+      'git push `\n --force origin main',
+      'Write-Host "unclosed; git push --force',
+      "Write-Host 'unclosed; Remove-Item -Recurse dist",
+    ]) {
+      assert.equal(
+        handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'PowerShell', tool_input: { command: pwshConfirmCmd } }, opts)
+          .hookSpecificOutput?.permissionDecision,
+        'ask',
+        `PowerShell main must ask: ${pwshConfirmCmd}`,
+      );
+      assert.equal(
+        handleClaudePreToolUse({ cwd: env.projectDir, agent_id: 'sub-ps', tool_name: 'PowerShell', tool_input: { command: pwshConfirmCmd } }, opts)
+          .hookSpecificOutput?.permissionDecision,
+        'deny',
+        `PowerShell subagent must deny: ${pwshConfirmCmd}`,
+      );
+    }
+
+    // State folder guard with PowerShell backticks & unclosed quotes
+    for (const stateShellCmd of [
+      'Write-Host "`n"; Remove-Item state/work-size; Write-Host "`n"',
+      'Remove-Item st`ate/work-size',
+      'echo "unclosed; rm -rf state/work-size',
+    ]) {
+      assert.equal(
+        handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'PowerShell', tool_input: { command: stateShellCmd } }, opts)
+          .hookSpecificOutput?.permissionDecision,
+        'ask',
+        `state folder guard must ask: ${stateShellCmd}`,
+      );
+    }
+
+    // (b) Bash normal backtick command substitution (`date` passes, `` `git reset --hard` `` asks/denies) & unclosed quote/backtick
+    assert.deepEqual(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'echo `date`' } }, opts),
+      {},
+    );
+    assert.equal(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'echo `git reset --hard`' } }, opts)
+        .hookSpecificOutput?.permissionDecision,
+      'ask',
+    );
+    assert.equal(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'echo "unclosed; git push --force' } }, opts)
+        .hookSpecificOutput?.permissionDecision,
+      'ask',
+    );
+    assert.equal(
+      handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'echo `git push --force' } }, opts)
+        .hookSpecificOutput?.permissionDecision,
+      'ask',
+    );
+
+    // 2-6: Direct `node scripts/cortex-work.mjs status` emits NO `ExperimentalWarning` on stderr
+    const directWorkRun = spawnSync(
+      process.execPath,
+      [path.join(REPO_ROOT, 'scripts', 'cortex-work.mjs'), 'status'],
+      {
+        cwd: env.projectDir,
+        env: {
+          ...process.env,
+          HERDR_CORTEX_TEST_HOME: env.homeDir,
+          HERDR_CORTEX_HOME: env.globalDir,
+          HC_TERMINAL_ID: 'tab-add',
+        },
+        encoding: 'utf8',
+        windowsHide: true,
+      },
+    );
+    assert.equal(directWorkRun.status, 0);
+    assert.doesNotMatch(directWorkRun.stderr, /ExperimentalWarning/);
+
+    // Addendum 3 + 2-7 status fields: seed state in projectDir, then run `cortex-work release` from unrecorded projectB
+    handleClaudeUserPrompt({ session_id: 's-st', cwd: env.projectDir }, opts);
+    handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Read', tool_input: { file_path: 'a.js' } }, opts);
+    handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Edit', tool_input: { file_path: 'a.js', old_string: '1', new_string: '2' } }, opts);
+    handleClaudePostToolUseFailure({ cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' }, opts);
+    handleClaudePreToolUse({ cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'b.js', content: 'z'.repeat(100) } }, opts); // escalates projectDir to L
+
+    const stOut = makeSink();
+    assert.equal(
+      runWorkCli(['status'], { env: { HC_TERMINAL_ID: 'tab-add' }, cwd: env.projectDir, globalDir: env.globalDir, stdout: stOut, stderr: makeSink() }),
+      WORK_EXIT_OK,
+    );
+    assert.match(stOut.text, /Failures\s*:\s*a\.js \(1\)/);
+    assert.match(stOut.text, /Unsaved\s*:\s*yes \(edited files: 1, committed: no\)/);
+    assert.match(stOut.text, /Counters\s*:\s*prompts=1, turn reads=1/);
+
+    const stJsonOut = makeSink();
+    runWorkCli(['status', '--json'], { env: { HC_TERMINAL_ID: 'tab-add' }, cwd: env.projectDir, globalDir: env.globalDir, stdout: stJsonOut, stderr: makeSink() });
+    const stJson = JSON.parse(stJsonOut.text);
+    assert.deepEqual(stJson.failedRetries, { 'a.js': 1 });
+    assert.equal(stJson.unsaved, true);
+    assert.equal(stJson.promptTurns, 1);
+    assert.equal(stJson.turnReads, 1);
+
+    // Run `cortex-work release` from unrecorded `projectB` -> nothing released, guides user to `projectDir` + `--all`!
+    const relOut = makeSink();
+    assert.equal(
+      runWorkCli(['release'], { env: { HC_TERMINAL_ID: 'tab-add' }, cwd: env.projectB, globalDir: env.globalDir, stdout: relOut, stderr: makeSink() }),
+      WORK_EXIT_OK,
+    );
+    assert.ok(relOut.text.includes(env.projectDir), relOut.text);
+    assert.match(relOut.text, /cortex-work release --all/);
+
+    const relJsonOut = makeSink();
+    runWorkCli(['release', '--json'], { env: { HC_TERMINAL_ID: 'tab-add' }, cwd: env.projectB, globalDir: env.globalDir, stdout: relJsonOut, stderr: makeSink() });
+    const relJson = JSON.parse(relJsonOut.text);
+    assert.equal(relJson.changed, false);
+    assert.deepEqual(relJson.otherLFolders, [env.projectDir]);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('fix2: Bash ANSI-C quoting & unquoted backslash invariants, substitution git commit, verdict negations, cmd //c, and PowerShell ${env:TEMP}', () => {
+  const env = makeTempEnv('cortex-ws-fix2-');
+  try {
+    const opts = {
+      terminalId: 'tab-fix2',
+      globalDir: env.globalDir,
+      env: { HC_TERMINAL_ID: 'tab-fix2', TEMP: os.tmpdir(), TMP: os.tmpdir() },
+    };
+
+    const callShell = (tool, command, role = 'main') => {
+      const payload = {
+        session_id: 's-fix2',
+        cwd: env.projectDir,
+        tool_name: tool,
+        tool_input: { command },
+        ...(role === 'subagent' ? { agent_id: 'sub-fix2' } : {}),
+      };
+      const callOpts = role === 'worker'
+        ? { ...opts, env: { ...opts.env, HERDR_CORTEX_ROLE: 'worker' } }
+        : opts;
+      return handleClaudePreToolUse(payload, callOpts);
+    };
+
+    // 1 & 2. Bash ANSI-C `$'...'`, unquoted backslash escapes, and non-hiding invariants
+    const bashMustGuard = [
+      "echo Don\\'t; cortex-work release; echo It\\'s",
+      "echo Don\\'t; git push --force; echo It\\'s",
+      "echo Don\\'t && rm -rf src && echo It\\'s",
+      "git commit -m Don\\'t && git push --force origin main && echo It\\'s",
+      'echo \\"; git push --force; echo \\"',
+      "echo $'a\\'b'; cortex-work release; echo 'x'",
+      "echo $'a\\'b'; git push --force; echo 'x'",
+      'echo a\\ b; git reset --hard',
+      "echo $'unclosed; git push --force",
+      "echo $'unclosed\\'; cortex-work release",
+      'echo $"unclosed; git push --force',
+      'echo $"a\\"b"; git push --force; echo "x"',
+      'echo "${x:-"a\\"b"}"; git push --force; echo "x"',
+      'echo ${#x}; git push --force',
+      'rm <(echo ok) -rf src',
+      "git commit -m \"$(cat <<'EOF'\nDon't worry\nEOF\n)\" && git push --force && echo \"It's done)\"",
+      "ls \\'; rm -rf state/work-size; ls \\'",
+      "ls $'a\\'b'; git push --force; ls $'c\\'d'",
+      'echo "`echo \\"Don\'t\\" && git push --force && echo \\"It\'s\\"`"',
+    ];
+
+    for (const cmd of bashMustGuard) {
+      assert.equal(
+        callShell('Bash', cmd, 'main').hookSpecificOutput?.permissionDecision,
+        'ask',
+        `Bash main must ask: ${cmd}`,
+      );
+      assert.equal(
+        callShell('Bash', cmd, 'subagent').hookSpecificOutput?.permissionDecision,
+        'deny',
+        `Bash subagent must deny: ${cmd}`,
+      );
+      assert.equal(
+        callShell('Bash', cmd, 'worker').hookSpecificOutput?.permissionDecision,
+        'deny',
+        `Bash worker must deny: ${cmd}`,
+      );
+    }
+
+    const bashMustPass = [
+      "echo Don\\'t",
+      "echo It\\'s done",
+      'git commit -m "it\'s"',
+      "echo 'a;b'; ls",
+      'find . -name x -exec echo {} \\;',
+      "echo $'git push --force'",
+      "echo $'it\\'s git push --force'",
+      'echo $"git push --force"',
+    ];
+
+    for (const cmd of bashMustPass) {
+      assert.deepEqual(callShell('Bash', cmd, 'main'), {}, `Bash main must pass: ${cmd}`);
+      assert.deepEqual(callShell('Bash', cmd, 'subagent'), {}, `Bash subagent must pass: ${cmd}`);
+      assert.deepEqual(callShell('Bash', cmd, 'worker'), {}, `Bash worker must pass: ${cmd}`);
+    }
+
+    // 3. `$(...)` and backtick substitutions in `commandRunsGitCommit`, `confirm-commands`, and `cortex-work`
+    for (const commitSubCmd of [
+      'echo $(git commit -m y)',
+      'x=$(git commit -m y)',
+      'echo `git commit -m y`',
+      'x=`git commit -m y`',
+      'echo "$(git commit -m y)"',
+    ]) {
+      assert.equal(commandRunsGitCommit(commitSubCmd), true, `commit expected (default shell): ${commitSubCmd}`);
+      assert.equal(commandRunsGitCommit(commitSubCmd, { shell: 'Bash' }), true, `commit expected (Bash): ${commitSubCmd}`);
+    }
+    assert.equal(commandRunsGitCommit('echo $(git commit --dry-run -m y)', { shell: 'Bash' }), false);
+    assert.equal(
+      commandRunsGitCommit('echo $(git -C .. commit -m y)', {
+        cwd: env.projectDir,
+        projectRoot: env.projectDir,
+        shell: 'Bash',
+      }),
+      false,
+    );
+
+    // End-to-end PostToolUse clears window when `git commit` runs inside `$(...)`
+    handleClaudePreToolUse(
+      { cwd: env.projectDir, tool_name: 'Write', tool_input: { file_path: 'src/sub-commit.js', content: 'abc' } },
+      opts,
+    );
+    assert.deepEqual(
+      readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-fix2'), { cwd: env.projectDir }).files,
+      { 'src/sub-commit.js': 3 },
+    );
+    handleClaudePostToolUse(
+      { cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'out=$(git commit -m "sub commit")' } },
+      opts,
+    );
+    const afterSubCommit = readWorkSizeState(env.globalDir, tabWorkSizeScope('tab-fix2'), { cwd: env.projectDir });
+    assert.deepEqual(afterSubCommit.files, {});
+    assert.equal(afterSubCommit.unsavedCommitted, true);
+
+    for (const subGuardCmd of [
+      'echo $(git push --force)',
+      'x=`rm -rf src`',
+      'x=$(cortex-work release)',
+      'echo `cortex-work reset`',
+    ]) {
+      assert.equal(callShell('Bash', subGuardCmd, 'main').hookSpecificOutput?.permissionDecision, 'ask', subGuardCmd);
+      assert.equal(callShell('Bash', subGuardCmd, 'subagent').hookSpecificOutput?.permissionDecision, 'deny', subGuardCmd);
+    }
+
+    // 4. `parseReviewVerdict` trailing Korean/English negations vs affirmative sentences
+    for (const negated of [
+      '판정: ACCEPT 하지 않음',
+      '판정: ACCEPT 하지 않습니다',
+      '판정: ACCEPT 할 수 없음',
+      '판정: ACCEPT 할 수 없습니다',
+      '판정: ACCEPT 어렵다',
+      '판정: ACCEPT 어렵습니다',
+      '판정: ACCEPT 어려움',
+      '판정: ACCEPT 아니다',
+      '판정: ACCEPT 안 함',
+      '판정: ACCEPT 못 함',
+      '판정: ACCEPT 불가능',
+      '판정: `ACCEPT` 하지 않습니다',
+      'Verdict: ACCEPT is not possible',
+      'Verdict: ACCEPT cannot be given',
+    ]) {
+      assert.equal(parseReviewVerdict(negated), null, `must NOT read negated verdict as ACCEPT: ${negated}`);
+    }
+
+    for (const [input, expected] of [
+      ['- **Verdict (판정)**: `ACCEPT (Clean Evaluation)`', 'ACCEPT'],
+      ['판정: ACCEPT. 차단 결함은 없습니다', 'ACCEPT'],
+      ['판정: ACCEPT — 문제는 없습니다.', 'ACCEPT'],
+      ['판정: ACCEPT입니다', 'ACCEPT'],
+      ['판정: ACCEPT입니다. 더 고칠 부분은 없습니다.', 'ACCEPT'],
+      ['Verdict: NEEDS_FIX (ACCEPT 할 수 없음)', 'NEEDS_FIX'],
+    ]) {
+      assert.equal(parseReviewVerdict(input), expected, `expected ${expected} for: ${input}`);
+    }
+
+    // 5. Git Bash `cmd //c` and `cmd //k` nested command extraction + `cmd` quote/caret rules
+    for (const cmdSlashCmd of [
+      'cmd //c "rmdir /s /q x"',
+      'cmd.exe //c rd /s /q x',
+      'cmd //k "del /s /q x"',
+      'cmd //c "cortex-work release"',
+      'cmd //c "echo Don\'t & rmdir /s /q x & echo It\'s"',
+      'cmd //c "echo ^" & git push --force & echo ^""',
+    ]) {
+      assert.equal(callShell('Bash', cmdSlashCmd, 'main').hookSpecificOutput?.permissionDecision, 'ask', cmdSlashCmd);
+      assert.equal(callShell('Bash', cmdSlashCmd, 'subagent').hookSpecificOutput?.permissionDecision, 'deny', cmdSlashCmd);
+      assert.equal(callShell('Bash', cmdSlashCmd, 'worker').hookSpecificOutput?.permissionDecision, 'deny', cmdSlashCmd);
+    }
+    assert.deepEqual(callShell('Bash', 'cmd //c "rmdir /s /q %TEMP%\\cortex-temp-dir"', 'main'), {});
+
+    // 6. PowerShell `${env:TEMP}` braced variable exemption + PowerShell here-strings and block comments
+    for (const pwshSafeTemp of [
+      'Remove-Item -Recurse ${env:TEMP}\\build',
+      'Remove-Item -Recurse -Force "${env:TEMP}\\build"',
+      'Remove-Item -Recurse ${env:TMP}/build',
+    ]) {
+      assert.deepEqual(callShell('PowerShell', pwshSafeTemp, 'main'), {}, `PowerShell temp must pass: ${pwshSafeTemp}`);
+    }
+    assert.equal(
+      callShell('PowerShell', 'Remove-Item -Recurse ${TEMP}\\build', 'main').hookSpecificOutput?.permissionDecision,
+      'ask',
+    );
+    for (const pwshNonHiding of [
+      "Write-Host @'\nDon't worry\n'@; git push --force; Write-Host 'x'",
+      'Write-Host @"\nSay "hello\n"@; git push --force; Write-Host "x"',
+      "Write-Host <# Don't #> hi; git push --force; Write-Host 'x'",
+      'Write-Host ${#x}; git push --force',
+    ]) {
+      assert.equal(callShell('PowerShell', pwshNonHiding, 'main').hookSpecificOutput?.permissionDecision, 'ask', pwshNonHiding);
+      assert.equal(callShell('PowerShell', pwshNonHiding, 'subagent').hookSpecificOutput?.permissionDecision, 'deny', pwshNonHiding);
+    }
+    assert.deepEqual(callShell('PowerShell', "Write-Host @'\nDon't:\ngit push --force\n'@", 'main'), {});
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('fix3: conservative unquoted-word shell inspection, cortex-work HEAD-default + safe exceptions, heredoc closing-line check, PowerShell typography, and non-leading git commit', async () => {
+  const shellTokensMod = await import('../src/hooks/shell-tokens.mjs');
+  assert.equal('findSegmentCommandIndex' in shellTokensMod, false, 'findSegmentCommandIndex dead code removed');
+
+  const env = makeTempEnv('cortex-ws-fix3-');
+  try {
+    const opts = {
+      terminalId: 'tab-fix3',
+      globalDir: env.globalDir,
+      env: { HC_TERMINAL_ID: 'tab-fix3', TEMP: os.tmpdir(), TMP: os.tmpdir() },
+    };
+
+    const callShell = (tool, command, role = 'main') => {
+      const payload = {
+        session_id: 's-fix3',
+        cwd: env.projectDir,
+        tool_name: tool,
+        tool_input: { command },
+        ...(role === 'subagent' ? { agent_id: 'sub-fix3' } : {}),
+      };
+      const callOpts = role === 'worker'
+        ? { ...opts, env: { ...opts.env, HERDR_CORTEX_ROLE: 'worker' } }
+        : opts;
+      return handleClaudePreToolUse(payload, callOpts);
+    };
+
+    // 1. Must NOT miss (main -> ask, subagent -> deny, worker -> deny)
+    const mustGuardPairs = [
+      // Six background cases from 3rd review
+      ['Bash', 'for f in build dist; do rm -rf "$f"; done'],
+      ['Bash', 'if git diff --quiet; then git push --force; fi'],
+      ['PowerShell', '$out = git push --force 2>&1'],
+      ['Bash', '! cortex-work reset'],
+      ['PowerShell', '! cortex-work reset'],
+      ['Bash', 'exec cortex-work release'],
+      ['Bash', 'cat <<< hello\ncortex-work release'],
+      // Loops, keywords, wrappers, redirections
+      ['Bash', 'while true; do git reset --hard; done'],
+      ['Bash', 'time -p git push --force'],
+      ['Bash', 'nice rm -rf x'],
+      ['Bash', 'timeout 5 git clean -fd'],
+      ['Bash', '2>/dev/null rm -rf x'],
+      ['Bash', '>out git push --force'],
+      ['Bash', 'env X=1 git push -f'],
+      ['Bash', 'sudo rm -rf x'],
+      ['Bash', 'nohup git push --force &'],
+      // PowerShell assignments, call operator, curly quotes & en/em-dashes, iex, -EncodedCommand, aliases
+      ['PowerShell', '$null = git push --force'],
+      ['PowerShell', '$r = cortex-work release'],
+      ['PowerShell', '& git push --force'],
+      ['PowerShell', 'Remove-Item \u2013Recurse src'],
+      ['PowerShell', 'Remove-Item \u2014Recurse src'],
+      ['PowerShell', "Write-Host 'a\u2019; git push --force; Write-Host 'b'"],
+      ['PowerShell', 'Write-Host "a\u201d; git push --force; Write-Host "b"'],
+      ['PowerShell', 'iex "git push --force"'],
+      ['PowerShell', "Invoke-Expression 'rm -rf src'"],
+      ['PowerShell', 'powershell -enc AAAA'],
+      ['Bash', 'powershell -enc AAAA'],
+      ['PowerShell', 'pwsh -e AAAA'],
+      ['PowerShell', 'powershell -ExecutionPolicy Bypass -EncodedCommand AAAA'],
+      ['PowerShell', 'del -Recurse src'],
+      ['PowerShell', 'rd -Recurse src'],
+      ['PowerShell', 'erase -Recurse src'],
+      ['PowerShell', 'rmdir src -Recurse'],
+      // Publish (npm / pnpm / yarn)
+      ['Bash', 'pnpm publish'],
+      ['Bash', 'yarn publish'],
+      // Nested shells: eval, bash -c, cmd /c (including attached /c"..." and @)
+      ['Bash', 'eval "git push --force"'],
+      ['Bash', 'bash -c "for f in a; do rm -rf \\$f; done"'],
+      ['Bash', 'cmd /c "call cortex-work release"'],
+      ['PowerShell', 'cmd /c "call cortex-work release"'],
+      ['Bash', 'cmd /c"git push --force"'],
+      ['PowerShell', 'cmd /c"git push --force"'],
+      ['Bash', 'cmd /c "if 1==1 git push --force"'],
+      ['PowerShell', 'cmd /c "if 1==1 git push --force"'],
+      ['PowerShell', 'cmd /c "@cortex-work release"'],
+      // Here-strings `<<<` and arithmetic shifts `<<` without closing heredoc line
+      ['Bash', 'grep foo <<< "$x"\ngit push --force'],
+      ['Bash', 'cat <<<x; echo y\ngit push --force'],
+      ['Bash', '((y = 1<<2))\ngit push --force'],
+      // `cortex-work` conservative default (including unquoted echo / xargs / Start-Process)
+      ['Bash', 'echo cortex-work release'],
+      ['Bash', 'echo release | xargs cortex-work'],
+      ['PowerShell', 'Start-Process cortex-work -ArgumentList release'],
+      // All 1st & 2nd review regressions (PowerShell backticks x5, Bash \' x7, $'...')
+      ['PowerShell', 'Write-Host "`n"; cortex-work release'],
+      ['PowerShell', 'Write-Host "a`nb"; git push --force'],
+      ['PowerShell', 'Remove-Item -Path dist `\n -Recurse -Force'],
+      ['PowerShell', 'git push `\n --force origin main'],
+      ['Bash', "echo Don\\'t; cortex-work release; echo It\\'s"],
+      ['Bash', "echo Don\\'t; git push --force; echo It\\'s"],
+      ['Bash', "echo Don\\'t && rm -rf src && echo It\\'s"],
+      ['Bash', "git commit -m Don\\'t && git push --force origin main && echo It\\'s"],
+      ['Bash', 'echo \\"; git push --force; echo \\"'],
+      ['Bash', "echo $'a\\'b'; cortex-work release; echo 'x'"],
+      ['Bash', 'echo a\\ b; git reset --hard'],
+    ];
+
+    for (const [tool, cmd] of mustGuardPairs) {
+      const mainRes = callShell(tool, cmd, 'main');
+      assert.equal(
+        mainRes.hookSpecificOutput?.permissionDecision,
+        'ask',
+        `[${tool}] main must ask: ${cmd}`,
+      );
+      const subRes = callShell(tool, cmd, 'subagent');
+      assert.equal(
+        subRes.hookSpecificOutput?.permissionDecision,
+        'deny',
+        `[${tool}] subagent must deny: ${cmd}`,
+      );
+      const workerRes = callShell(tool, cmd, 'worker');
+      assert.equal(
+        workerRes.hookSpecificOutput?.permissionDecision,
+        'deny',
+        `[${tool}] worker must deny: ${cmd}`,
+      );
+    }
+
+    // PowerShell -EncodedCommand reason states that encoded commands cannot be inspected
+    const encAsk = callShell('PowerShell', 'powershell -enc AAAA', 'main');
+    assert.match(encAsk.hookSpecificOutput.permissionDecisionReason, /인코딩된 명령은 검사할 수 없/);
+    const encDeny = callShell('PowerShell', 'powershell -enc AAAA', 'worker');
+    assert.match(encDeny.hookSpecificOutput.permissionDecisionReason, /인코딩된 명령은 검사할 수 없/);
+
+    // 2. Must NOT ask (harmless commands + quoted literals + explicit cortex-work safe exceptions)
+    const mustPassPairs = [
+      ['Bash', 'git push'],
+      ['Bash', 'git push origin main'],
+      ['Bash', 'git status'],
+      ['Bash', 'git add -A'],
+      ['Bash', 'git diff'],
+      ['Bash', 'git log --grep="git push --force"'],
+      ['Bash', 'git stash'],
+      ['Bash', 'git checkout -b x'],
+      ['Bash', 'git rebase --continue'],
+      ['Bash', 'git commit -m "fix: git push --force 버그"'],
+      ['Bash', "git commit -m \"$(cat <<'EOF'\nrm -rf build\ncortex-work release\nEOF\n)\""],
+      ['Bash', 'grep -rn "rm -rf" .'],
+      ['Bash', 'rg "git reset --hard"'],
+      ['Bash', 'echo "cortex-work release"'],
+      ['Bash', 'rm file.txt'],
+      ['Bash', 'rm -f a.txt'],
+      ['Bash', 'rm -rf "$TEMP/x"'],
+      ['Bash', 'node --test test/x.test.mjs'],
+      ['Bash', 'npm test'],
+      ['Bash', 'npm install'],
+      ['Bash', 'pnpm publish --dry-run'],
+      ['Bash', 'yarn publish --dry-run'],
+      ['Bash', 'node --no-warnings scripts/cortex-worker.mjs --role developer --agent antigravity --model m --brief b.md'],
+      ['Bash', 'git add scripts/cortex-work.mjs'],
+      ['Bash', 'node --check scripts/cortex-work.mjs'],
+      ['Bash', 'code scripts/cortex-work.mjs'],
+      ['Bash', 'cortex-work status'],
+      ['Bash', 'cortex-work --help'],
+      ['PowerShell', 'Get-ChildItem | Where-Object { $_.Name -like "*.mjs" }'],
+      ['PowerShell', 'Select-String -Pattern "git push --force" -Path x'],
+      ['PowerShell', 'Write-Host "a`nb"'],
+    ];
+
+    for (const [tool, cmd] of mustPassPairs) {
+      assert.deepEqual(callShell(tool, cmd, 'main'), {}, `[${tool}] main must pass: ${cmd}`);
+      assert.deepEqual(callShell(tool, cmd, 'subagent'), {}, `[${tool}] subagent must pass: ${cmd}`);
+      assert.deepEqual(callShell(tool, cmd, 'worker'), {}, `[${tool}] worker must pass: ${cmd}`);
+    }
+
+    // 3. `commandRunsGitCommit` with conservative unquoted-word rule anywhere in segment / nested shell
+    for (const [sh, cmd] of [
+      ['Bash', 'if true; then git commit -m "ok"; fi'],
+      ['Bash', 'timeout 5 git commit -m "ok"'],
+      ['Bash', 'cat <<< hello\ngit commit -m "ok"'],
+      ['Bash', '((y = 1<<2))\ngit commit -m "ok"'],
+      ['Bash', 'eval "git commit -m ok"'],
+      ['PowerShell', 'Write-Host "x`n"; git commit -m y'],
+      ['PowerShell', '$out = git commit -m "ok"'],
+      ['PowerShell', "Write-Host 'a\u2019; git commit -m ok; Write-Host 'b'"],
+      ['PowerShell', 'cmd /c "call git commit -m ok"'],
+    ]) {
+      assert.equal(commandRunsGitCommit(cmd, { shell: sh }), true, `[${sh}] commit expected: ${cmd}`);
+    }
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('fix4: argument-position words after non-destructive git/pkg-manager/grep pass, exec/dlx/wrappers still guard, and inspection/nesting bounds fail closed under 500ms', async () => {
+  const shellTokensMod = await import('../src/hooks/shell-tokens.mjs');
+  assert.equal('skipCommandSubstitution' in shellTokensMod, false, 'unused skipCommandSubstitution removed');
+  assert.equal('extractNestedShellScripts' in shellTokensMod, false, 'unused extractNestedShellScripts removed');
+  assert.equal(shellTokensMod.PWSH_FLAGS_WITH_VALUE instanceof Set, true, 'shared PWSH_FLAGS_WITH_VALUE exported');
+
+  const env = makeTempEnv('cortex-ws-fix4-');
+  try {
+    const opts = {
+      terminalId: 'tab-fix4',
+      globalDir: env.globalDir,
+      env: { HC_TERMINAL_ID: 'tab-fix4', TEMP: os.tmpdir(), TMP: os.tmpdir() },
+    };
+
+    const callShell = (tool, command, role = 'main', extraOpts = {}) => {
+      const payload = {
+        session_id: 's-fix4',
+        cwd: env.projectDir,
+        tool_name: tool,
+        tool_input: { command },
+        ...(role === 'subagent' ? { agent_id: 'sub-fix4' } : {}),
+      };
+      const baseEnv = role === 'worker'
+        ? { ...opts.env, HERDR_CORTEX_ROLE: 'worker' }
+        : opts.env;
+      return handleClaudePreToolUse(payload, { ...opts, env: baseEnv, ...extraOpts });
+    };
+
+    // 1. Fix 1: 13 required harmless commands (+ script-name / path-qualified / sibling grep verbs) pass in Bash & PowerShell
+    const mustPass13 = [
+      'git rm -r --cached node_modules',
+      'git rm -r old_dir',
+      'git rm -q -r --cached build',
+      'pnpm rm -r lodash',
+      'npm i -D rimraf cross-env',
+      'npm install --save-dev rimraf typescript',
+      'yarn add -D rimraf typescript',
+      'pnpm add -D rimraf tsx',
+      'npm view rimraf version',
+      'grep -rn rimraf package.json',
+      'grep rimraf -r .',
+      'Select-String rimraf package.json',
+      'grep -rn docker push .',
+    ];
+    const extraMustPass = [
+      '"C:\\Program Files\\Git\\cmd\\git.exe" rm -r old_dir',
+      'pnpm -r rm lodash',
+      'npm rm -g rimraf',
+      'npm run rm',
+      'yarn rimraf',
+      'bun add -d rimraf',
+      'bun run rm',
+      'rg -n rimraf package.json',
+      'egrep -rn rimraf .',
+      'fgrep rimraf package.json',
+      'findstr /s rimraf package.json',
+      'sls rimraf package.json',
+      // Normal command with hundreds of words and 4 levels of nested substitutions
+      `echo ${'word '.repeat(350)}$($($($(echo ok))))`,
+      'bash -c "bash -c \'bash -c \\"bash -c echo\\" \'"',
+    ];
+
+    for (const cmd of [...mustPass13, ...extraMustPass]) {
+      for (const tool of ['Bash', 'PowerShell']) {
+        assert.deepEqual(callShell(tool, cmd, 'main'), {}, `[${tool}] main must pass: ${cmd}`);
+        assert.deepEqual(callShell(tool, cmd, 'subagent'), {}, `[${tool}] subagent must pass: ${cmd}`);
+        assert.deepEqual(callShell(tool, cmd, 'worker'), {}, `[${tool}] worker must pass: ${cmd}`);
+      }
+    }
+
+    // 2. Fix 1: 15 required dangerous commands (+ remaining tool-executing subcommands & substitutions) ask/deny in Bash & PowerShell
+    const mustGuard15 = [
+      'sudo rm -rf x',
+      'xargs rm -rf',
+      'find . -exec rm -rf {} +',
+      'then rm -rf x',
+      'nice rm -rf x',
+      'timeout 5 rm -rf x',
+      'docker exec c rm -rf /data',
+      'npx rimraf build',
+      'pnpm dlx rimraf x',
+      'npm exec rimraf x',
+      'yarn dlx rimraf x',
+      'bunx rimraf x',
+      'git status && rm -rf x',
+      'git status; rm -rf x',
+      'grep foo x | xargs rm -rf',
+    ];
+    const extraMustGuard = [
+      'npm x rimraf x',
+      'pnpm exec rimraf x',
+      'yarn exec rimraf x',
+      'bun x rimraf x',
+      'pnpm --filter git dlx rimraf x',
+      'npm exec -- rimraf dist',
+      'git push --force',
+      'git reset --hard',
+      'npm publish',
+      // `cortex-work` conservative rule remains unchanged
+      'cp scripts/cortex-work.mjs backup/',
+    ];
+
+    for (const cmd of [...mustGuard15, ...extraMustGuard]) {
+      for (const tool of ['Bash', 'PowerShell']) {
+        assert.equal(
+          callShell(tool, cmd, 'main').hookSpecificOutput?.permissionDecision,
+          'ask',
+          `[${tool}] main must ask: ${cmd}`,
+        );
+        assert.equal(
+          callShell(tool, cmd, 'subagent').hookSpecificOutput?.permissionDecision,
+          'deny',
+          `[${tool}] subagent must deny: ${cmd}`,
+        );
+        assert.equal(
+          callShell(tool, cmd, 'worker').hookSpecificOutput?.permissionDecision,
+          'deny',
+          `[${tool}] worker must deny: ${cmd}`,
+        );
+      }
+    }
+    // Command substitution inside `grep` / `git` argument is still inspected
+    assert.equal(callShell('Bash', 'grep "$(rm -rf src)" package.json', 'main').hookSpecificOutput?.permissionDecision, 'ask');
+    assert.equal(callShell('Bash', 'grep "$(rm -rf src)" package.json', 'subagent').hookSpecificOutput?.permissionDecision, 'deny');
+
+    // 3. Fix 2: 5+ layer nesting and excessive inspection work fail closed (ask in main, deny in subagent/worker)
+    //    with reason mentioning complexity/length, and finishhook process under 500ms; `confirmCommands: false` passes.
+    const fiveDeepSubst = `${'$('.repeat(5)}echo ok${')'.repeat(5)}`;
+    const fiveDeepEval = 'eval "eval \\"eval \'eval `echo ok`\'\\""';
+    for (const deepCmd of [fiveDeepSubst, fiveDeepEval]) {
+      const mainDeep = callShell('Bash', deepCmd, 'main');
+      assert.equal(mainDeep.hookSpecificOutput?.permissionDecision, 'ask', deepCmd);
+      assert.match(mainDeep.hookSpecificOutput.permissionDecisionReason, /명령이 너무 길거나 복잡해 검사를 끝내지 못했다/);
+      const subDeep = callShell('Bash', deepCmd, 'subagent');
+      assert.equal(subDeep.hookSpecificOutput?.permissionDecision, 'deny', deepCmd);
+      assert.match(subDeep.hookSpecificOutput.permissionDecisionReason, /명령이 너무 길거나 복잡해 검사를 끝내지 못했다/);
+    }
+
+    const boundedInputs = [
+      'xargs echo a '.repeat(80),
+      'find . -exec '.repeat(80),
+      'a '.repeat(50000),
+    ];
+
+    const childEnv = {
+      ...process.env,
+      USERPROFILE: env.homeDir,
+      HOME: env.homeDir,
+      HERDR_CORTEX_TEST_HOME: env.homeDir,
+      HERDR_CORTEX_HOME: env.globalDir,
+      HC_TERMINAL_ID: 'tab-fix4',
+    };
+    delete childEnv.HERDR_CORTEX_ROLE;
+    delete childEnv.CLAUDE_PROJECT_DIR;
+
+    // Warm one child process so OS file cache is hot before measuring 500ms process budget
+    await spawnPreToolUseHook(
+      { session_id: 's-warm', cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: 'echo ok' } },
+      childEnv,
+    );
+
+    for (const heavyCmd of boundedInputs) {
+      const mainInProc = callShell('Bash', heavyCmd, 'main');
+      assert.equal(mainInProc.hookSpecificOutput?.permissionDecision, 'ask');
+      assert.match(mainInProc.hookSpecificOutput.permissionDecisionReason, /명령이 너무 길거나 복잡해 검사를 끝내지 못했다/);
+      assert.equal(callShell('Bash', heavyCmd, 'subagent').hookSpecificOutput?.permissionDecision, 'deny');
+      assert.equal(callShell('Bash', heavyCmd, 'worker').hookSpecificOutput?.permissionDecision, 'deny');
+
+      const tMain = performance.now();
+      const procMain = await spawnPreToolUseHook(
+        { session_id: 's-heavy', cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: heavyCmd } },
+        childEnv,
+      );
+      const mainElapsed = performance.now() - tMain;
+      assert.equal(procMain.code, 0);
+      assert.equal(procMain.decision, 'ask');
+      assert.ok(mainElapsed < 500, `main hook exceeded 500ms (${mainElapsed.toFixed(1)}ms) on len=${heavyCmd.length}`);
+
+      const tSub = performance.now();
+      const procSub = await spawnPreToolUseHook(
+        { session_id: 's-heavy', agent_id: 'sub-h', cwd: env.projectDir, tool_name: 'Bash', tool_input: { command: heavyCmd } },
+        childEnv,
+      );
+      const subElapsed = performance.now() - tSub;
+      assert.equal(procSub.code, 0);
+      assert.equal(procSub.decision, 'deny');
+      assert.ok(subElapsed < 500, `subagent hook exceeded 500ms (${subElapsed.toFixed(1)}ms) on len=${heavyCmd.length}`);
+    }
+
+    // `confirmCommands: false` passes even when exceeding inspection/nesting limits
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { workSize: { confirmCommands: false } });
+    for (const cmd of [...boundedInputs, fiveDeepSubst]) {
+      assert.deepEqual(callShell('Bash', cmd, 'main'), {});
+      assert.deepEqual(callShell('Bash', cmd, 'subagent'), {});
+    }
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('fix5: embedded-command subcommands (git submodule foreach/bisect run, yarn workspace/workspaces foreach, pnpm recursive exec) and pnpm --filter/-F publish guard in Bash & PowerShell', () => {
+  const env = makeTempEnv('cortex-ws-fix5-');
+  try {
+    const opts = {
+      terminalId: 'tab-fix5',
+      globalDir: env.globalDir,
+      env: { HC_TERMINAL_ID: 'tab-fix5', TEMP: os.tmpdir(), TMP: os.tmpdir() },
+    };
+
+    const callShell = (tool, command, role = 'main') => {
+      const payload = {
+        session_id: 's-fix5',
+        cwd: env.projectDir,
+        tool_name: tool,
+        tool_input: { command },
+        ...(role === 'subagent' ? { agent_id: 'sub-fix5' } : {}),
+      };
+      const baseEnv = role === 'worker'
+        ? { ...opts.env, HERDR_CORTEX_ROLE: 'worker' }
+        : opts.env;
+      return handleClaudePreToolUse(payload, { ...opts, env: baseEnv });
+    };
+
+    const mustGuard = [
+      'git submodule foreach --recursive git reset --hard',
+      'git submodule foreach --recursive git clean -fdx',
+      'git submodule foreach git reset --hard',
+      'git submodule foreach rm -rf x',
+      'git bisect run rm -rf x',
+      'yarn workspaces foreach --all npm publish',
+      'yarn workspaces foreach -A --topological npm publish --tolerate-republish',
+      'yarn workspace @scope/a npm publish --access public',
+      'yarn workspace a npm publish',
+      'yarn workspaces foreach -A exec rm -rf dist',
+      'yarn workspace web exec rm -rf dist',
+      'pnpm recursive exec rm -rf dist',
+      'pnpm --filter a publish',
+      'pnpm -F a publish',
+      'pnpm -r --filter ./packages/** publish',
+    ];
+
+    for (const cmd of mustGuard) {
+      for (const tool of ['Bash', 'PowerShell']) {
+        const match = inspectConfirmableShellCommand(cmd, { env: opts.env, shell: tool });
+        assert.equal(match.matched, true, `[${tool}] expected match for: ${cmd}`);
+        assert.ok(match.rule, `[${tool}] expected rule for: ${cmd}`);
+        assert.equal(
+          callShell(tool, cmd, 'main').hookSpecificOutput?.permissionDecision,
+          'ask',
+          `[${tool}] main must ask: ${cmd}`,
+        );
+        assert.equal(
+          callShell(tool, cmd, 'subagent').hookSpecificOutput?.permissionDecision,
+          'deny',
+          `[${tool}] subagent must deny: ${cmd}`,
+        );
+        assert.equal(
+          callShell(tool, cmd, 'worker').hookSpecificOutput?.permissionDecision,
+          'deny',
+          `[${tool}] worker must deny: ${cmd}`,
+        );
+      }
+    }
+
+    const mustPass = [
+      'git submodule update --init --recursive',
+      'git submodule foreach git status',
+      'git submodule status',
+      'git bisect start',
+      'git bisect good',
+      'yarn workspace a build',
+      'yarn workspaces foreach -A run build',
+      'yarn workspaces list',
+      'pnpm recursive install',
+      'pnpm --filter a build',
+      'pnpm -F a test',
+      'pnpm --filter a publish --dry-run',
+      'git rm -r --cached node_modules',
+      'npm i -D rimraf cross-env',
+      'grep -rn rimraf package.json',
+    ];
+
+    for (const cmd of mustPass) {
+      for (const tool of ['Bash', 'PowerShell']) {
+        assert.equal(
+          inspectConfirmableShellCommand(cmd, { env: opts.env, shell: tool }).matched,
+          false,
+          `[${tool}] must NOT match: ${cmd}`,
+        );
+        assert.deepEqual(callShell(tool, cmd, 'main'), {}, `[${tool}] main must pass: ${cmd}`);
+        assert.deepEqual(callShell(tool, cmd, 'subagent'), {}, `[${tool}] subagent must pass: ${cmd}`);
+        assert.deepEqual(callShell(tool, cmd, 'worker'), {}, `[${tool}] worker must pass: ${cmd}`);
+      }
+    }
   } finally {
     env.cleanup();
   }

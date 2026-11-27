@@ -47,6 +47,9 @@ export function isCortexToolName(toolName) {
   return CORTEX_DIRECT_TOOLS.has(trimmed) || CORTEX_TOOL_PREFIX_RE.test(trimmed);
 }
 
+/** Built-in tools that read or search files; counted per prompt turn for read-volume notices. */
+export const FILE_READ_TOOL_NAMES = Object.freeze(['Read', 'Grep', 'Glob']);
+
 /** Built-in tools that write files; a subagent may not point them into a `.memory/` folder. */
 export const FILE_WRITE_TOOL_NAMES = Object.freeze(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 
@@ -55,19 +58,27 @@ export const SHELL_TOOL_NAMES = Object.freeze(['Bash', 'PowerShell']);
 
 /**
  * Matcher the installer registers for the Claude Code PreToolUse hook: this server's tools (under the name
- * the installer registers), plus the file and shell tools the subagent `.memory/` guard inspects.
+ * the installer registers), plus the file-write, shell, and file-read tools inspected by `.memory/` and
+ * work-size guards.
  */
 export const CLAUDE_PRE_TOOL_USE_MATCHER = [
   `mcp__${MCP_SERVER_NAME}__.*`,
   ...FILE_WRITE_TOOL_NAMES,
   ...SHELL_TOOL_NAMES,
+  ...FILE_READ_TOOL_NAMES,
 ].join('|');
 
 /**
- * Matcher the installer registers for the Claude Code PostToolUse hook: shell tools (to detect `git commit`)
- * and this server's `memory_save` tool (to clear cumulative edit counts and record L completion).
+ * Matcher the installer registers for the Claude Code PostToolUse hook: shell tools (to detect `git commit`
+ * and clear failed-edit retry counts on shell success) and this server's `memory_save` tool.
  */
 export const CLAUDE_POST_TOOL_USE_MATCHER = [
   ...SHELL_TOOL_NAMES,
   `mcp__${MCP_SERVER_NAME}__memory_save`,
 ].join('|');
+
+/**
+ * Matcher the installer registers for the Claude Code PostToolUseFailure hook: shell tools whose non-zero
+ * exit codes increment per-file failed-edit retry counts.
+ */
+export const CLAUDE_POST_TOOL_USE_FAILURE_MATCHER = SHELL_TOOL_NAMES.join('|');

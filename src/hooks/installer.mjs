@@ -24,6 +24,7 @@ import {
 } from '../core/config.mjs';
 import { describeEmbeddingStatus, formatEmbeddingStatus } from '../embeddings/resolve.mjs';
 import {
+  CLAUDE_POST_TOOL_USE_FAILURE_MATCHER,
   CLAUDE_POST_TOOL_USE_MATCHER,
   CLAUDE_PRE_TOOL_USE_MATCHER,
   LEGACY_MCP_SERVER_NAME,
@@ -59,6 +60,7 @@ const CLAUDE_HOOK_EVENTS = [
   'UserPromptSubmit',
   'PreToolUse',
   'PostToolUse',
+  'PostToolUseFailure',
   'SubagentStop',
 ];
 
@@ -76,11 +78,13 @@ export const CLAUDE_HOOK_SPECS = Object.freeze([
   { event: 'SessionEnd', arg: 'session-end', matcher: '', timeout: CLAUDE_SESSION_END_TIMEOUT_SECONDS },
   { event: 'PreCompact', arg: 'pre-compact', matcher: '', timeout: 10 },
   { event: 'UserPromptSubmit', arg: 'user-prompt', matcher: '', timeout: 10 },
-  // One entry for this server's tools and for the file and shell tools whose calls the subagent
+  // One entry for this server's tools and for the file, shell, and read tools whose calls the subagent
   // `.memory/` guard and HEAD work-size counter inspect.
   { event: 'PreToolUse', arg: 'pre-tool-use', matcher: CLAUDE_PRE_TOOL_USE_MATCHER, timeout: 10 },
-  // Clears cumulative per-file edit counts on `git commit` / `memory_save` and records `memory_save` for L jobs.
+  // Clears cumulative per-file edit counts on `git commit` / `memory_save`, resets failed-edit retries on shell success, and records `memory_save` for L jobs.
   { event: 'PostToolUse', arg: 'post-tool-use', matcher: CLAUDE_POST_TOOL_USE_MATCHER, timeout: 10 },
+  // Tracks failed shell commands after file edits so repeated failed edits on the same file are blocked.
+  { event: 'PostToolUseFailure', arg: 'post-tool-use-failure', matcher: CLAUDE_POST_TOOL_USE_FAILURE_MATCHER, timeout: 10 },
   // Reads reviewer verdicts (`ACCEPT` / `NEEDS_FIX`) from finished subagent outputs for L jobs.
   { event: 'SubagentStop', arg: 'subagent-stop', matcher: '', timeout: 10 },
 ]);
@@ -1277,7 +1281,10 @@ export function checkClaudeHooks({ homeDir, repoRoot = REPO_ROOT } = {}) {
     result.events[event] = summarizeHookEvent(found, {
       expectedScript,
       expectedArgs: specs.map((spec) => spec.arg),
-      expectedMatcher: event === 'PreToolUse' || event === 'PostToolUse' ? specs[0].matcher : undefined,
+      expectedMatcher:
+        event === 'PreToolUse' || event === 'PostToolUse' || event === 'PostToolUseFailure'
+          ? specs[0].matcher
+          : undefined,
     });
   }
   result.ok = Object.values(result.events).every((event) => event.state === 'ok');

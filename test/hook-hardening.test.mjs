@@ -739,7 +739,7 @@ test('/clear: the tab record still identifies the previous session exactly, and 
     const hooks = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).hooks;
     assert.deepEqual(
       Object.keys(hooks).sort(),
-      ['PostToolUse', 'PreCompact', 'PreToolUse', 'SessionEnd', 'SessionStart', 'SubagentStop', 'UserPromptSubmit'],
+      ['PostToolUse', 'PostToolUseFailure', 'PreCompact', 'PreToolUse', 'SessionEnd', 'SessionStart', 'SubagentStop', 'UserPromptSubmit'],
     );
     assert.equal(hooks.SessionEnd.length, 2);
     const ours = hooks.SessionEnd.filter((entry) => entry.hooks.some((h) => isOwnHook(h)));
@@ -758,7 +758,7 @@ test('/clear: the tab record still identifies the previous session exactly, and 
     for (const group of hooks.SessionStart) {
       assert.equal(group.hooks[0].timeout, 10, 'SessionStart');
     }
-    for (const event of ['PreCompact', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'SubagentStop']) {
+    for (const event of ['PreCompact', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'SubagentStop']) {
       assert.equal(hooks[event].length, 1, event);
       assert.equal(hooks[event][0].hooks[0].timeout, 10, event);
     }

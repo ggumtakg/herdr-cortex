@@ -26,9 +26,25 @@ export const DEFAULT_WORK_SIZE = Object.freeze({
   enabled: true,
   maxFilesPerWindow: 1,
   maxCharsPerFile: 1000,
+  reminderEveryTurns: 10,
+  readNoticeThreshold: 25,
+  maxFailedRetries: 2,
+  confirmCommands: true,
+  confirmCommandPatterns: Object.freeze([]),
+  contractFiles: Object.freeze([]),
 });
 
-export const WORK_SIZE_KEYS = Object.freeze(['enabled', 'maxFilesPerWindow', 'maxCharsPerFile']);
+export const WORK_SIZE_KEYS = Object.freeze([
+  'enabled',
+  'maxFilesPerWindow',
+  'maxCharsPerFile',
+  'reminderEveryTurns',
+  'readNoticeThreshold',
+  'maxFailedRetries',
+  'confirmCommands',
+  'confirmCommandPatterns',
+  'contractFiles',
+]);
 
 export const DEFAULT_CONFIG = Object.freeze({
   mode: 'all', // 'all' | 'opt-in'
@@ -307,7 +323,14 @@ function mergeEmbedding(base, override) {
 function mergeWorkSize(base, override) {
   const from = isPlainObject(base) ? base : DEFAULT_WORK_SIZE;
   const over = isPlainObject(override) ? override : {};
-  return { ...from, ...over };
+  const merged = { ...from, ...over };
+  if (Array.isArray(merged.confirmCommandPatterns)) {
+    merged.confirmCommandPatterns = [...merged.confirmCommandPatterns];
+  }
+  if (Array.isArray(merged.contractFiles)) {
+    merged.contractFiles = [...merged.contractFiles];
+  }
+  return merged;
 }
 
 function mergeConfig(base, override) {
@@ -337,6 +360,201 @@ function warnConfigOnce(key, message) {
 export function getConfigProblems(config) {
   const found = config && typeof config === 'object' ? configProblems.get(config) : null;
   return found ? found.map((item) => ({ ...item })) : [];
+}
+
+/**
+ * Record a runtime `confirmCommandPatterns` timeout problem against a loaded `config` object
+ * (accessible via `getConfigProblems(config)` and logged once on stderr).
+ */
+export function recordConfirmPatternProblem(config, { pattern, index, timeoutMs } = {}) {
+  const loc = Number.isInteger(index) && index >= 0
+    ? `workSize.confirmCommandPatterns[${index}]`
+    : 'workSize.confirmCommandPatterns';
+  const limitNote = Number.isFinite(timeoutMs) ? `${timeoutMs}ms` : 'time';
+  const detail =
+    `Regular expression in ${loc} (${JSON.stringify(String(pattern ?? ''))}) exceeded the `
+    + `${limitNote} execution limit (catastrophic backtracking) and was treated as matched.`;
+
+  if (config && typeof config === 'object') {
+    let list = configProblems.get(config);
+    if (!list) {
+      list = [];
+      configProblems.set(config, list);
+    }
+    const source = list.find((p) => p.source && p.source !== 'overrides')?.source || '';
+    const sourceNote = source ? ` (in "${source}")` : '';
+    const message = `${detail}${sourceNote}`;
+    if (!list.some((item) => item.message === message)) {
+      list.push({
+        code: 'invalid_work_size',
+        key: 'confirmCommandPatterns',
+        location: loc,
+        source,
+        message,
+      });
+    }
+    warnConfigOnce(`worksize-timeout\0${source}\0${loc}\0${pattern}`, message);
+    return;
+  }
+
+  warnConfigOnce(`worksize-timeout\0\0${loc}\0${pattern}`, detail);
+}
+
+function readQuantifierAt(pattern, index) {
+  const ch = pattern[index];
+  if (ch === '*' || ch === '+') {
+    const lazy = pattern[index + 1] === '?' ? 1 : 0;
+    return { length: 1 + lazy, repeating: true };
+  }
+  if (ch === '?') {
+    const lazy = pattern[index + 1] === '?' ? 1 : 0;
+    return { length: 1 + lazy, repeating: false };
+  }
+  if (ch === '{') {
+    const m = /^\{(\d+)(?:,(\d*))?\}\??/.exec(pattern.slice(index));
+    if (m) {
+      const min = Number(m[1]);
+      const hasComma = m[2] !== undefined;
+      const max = hasComma ? (m[2] === '' ? Infinity : Number(m[2])) : min;
+      return { length: m[0].length, repeating: max >= 2 };
+    }
+  }
+  return null;
+}
+
+/**
+ * Detect group star-height > 1 patterns prone to catastrophic backtracking (such as `^(a+)+$`,
+ * `(x+x+)+y`, `([a-zA-Z]+)*$`, `(.*a)+`) while avoiding false positives on anchored/delimited groups
+ * like `(?:--[a-z0-9-]+\s+)*--force`.
+ */
+export function hasCatastrophicBacktrackingQuantifier(pattern) {
+  if (typeof pattern !== 'string' || !pattern) return false;
+  const stack = [];
+  const newBranch = () => ({ atoms: 0, unquantifiedAtoms: 0, repeatingAtoms: 0, hasWildcardRepeat: false });
+
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      const top = stack[stack.length - 1];
+      const q = readQuantifierAt(pattern, i + 2);
+      if (top) {
+        const br = top.branches[top.branches.length - 1];
+        // Ignore zero-width boundary escapes (`\b`, `\B`) as non-consuming
+        const esc = pattern[i + 1] || '';
+        if (esc !== 'b' && esc !== 'B') {
+          br.atoms++;
+          if (q) {
+            if (q.repeating) br.repeatingAtoms++;
+          } else {
+            br.unquantifiedAtoms++;
+          }
+        }
+      }
+      i += 2 + (q ? q.length : 0);
+      continue;
+    }
+
+    if (ch === '[') {
+      let close = i + 1;
+      if (pattern[close] === '^') close++;
+      if (pattern[close] === ']') close++;
+      while (close < pattern.length) {
+        if (pattern[close] === '\\') {
+          close += 2;
+          continue;
+        }
+        if (pattern[close] === ']') break;
+        close++;
+      }
+      const endClass = close < pattern.length ? close + 1 : pattern.length;
+      const q = readQuantifierAt(pattern, endClass);
+      const top = stack[stack.length - 1];
+      if (top) {
+        const br = top.branches[top.branches.length - 1];
+        br.atoms++;
+        if (q) {
+          if (q.repeating) br.repeatingAtoms++;
+        } else {
+          br.unquantifiedAtoms++;
+        }
+      }
+      i = endClass + (q ? q.length : 0);
+      continue;
+    }
+
+    if (ch === '(') {
+      let advance = 1;
+      if (pattern[i + 1] === '?') {
+        if (pattern[i + 2] === ':' || pattern[i + 2] === '=' || pattern[i + 2] === '!') advance = 3;
+        else if (pattern[i + 2] === '<' && (pattern[i + 3] === '=' || pattern[i + 3] === '!')) advance = 4;
+        else if (pattern[i + 2] === '<') {
+          const gt = pattern.indexOf('>', i + 3);
+          if (gt !== -1) advance = gt - i + 1;
+        }
+      }
+      stack.push({ branches: [newBranch()], nestedUnsafe: false });
+      i += advance;
+      continue;
+    }
+
+    if (ch === '|' && stack.length > 0) {
+      stack[stack.length - 1].branches.push(newBranch());
+      i++;
+      continue;
+    }
+
+    if (ch === ')') {
+      const frame = stack.pop();
+      const q = readQuantifierAt(pattern, i + 1);
+      const outerRepeating = Boolean(q && q.repeating);
+      if (frame) {
+        const branchRepeatsAllAtoms = frame.branches.some(
+          (br) => br.repeatingAtoms > 0 && (br.unquantifiedAtoms === 0 || br.hasWildcardRepeat),
+        );
+        if (outerRepeating && (frame.nestedUnsafe || branchRepeatsAllAtoms)) {
+          return true;
+        }
+        if (stack.length > 0) {
+          const parent = stack[stack.length - 1];
+          const pbr = parent.branches[parent.branches.length - 1];
+          pbr.atoms++;
+          if (q) {
+            if (q.repeating) pbr.repeatingAtoms++;
+          } else if (frame.branches.every((br) => br.unquantifiedAtoms > 0)) {
+            pbr.unquantifiedAtoms++;
+          }
+          if (frame.nestedUnsafe || branchRepeatsAllAtoms) {
+            parent.nestedUnsafe = true;
+          }
+        }
+      }
+      i += 1 + (q ? q.length : 0);
+      continue;
+    }
+
+    if (ch === '^' || ch === '$') {
+      i++;
+      continue;
+    }
+
+    const q = readQuantifierAt(pattern, i + 1);
+    const top = stack[stack.length - 1];
+    if (top) {
+      const br = top.branches[top.branches.length - 1];
+      br.atoms++;
+      if (q) {
+        if (q.repeating) {
+          br.repeatingAtoms++;
+          if (ch === '.') br.hasWildcardRepeat = true;
+        }
+      } else {
+        br.unquantifiedAtoms++;
+      }
+    }
+    i += 1 + (q ? q.length : 0);
+  }
+  return false;
 }
 
 /**
@@ -507,7 +725,11 @@ function sanitizeWorkSize(workSize, { source, location, problems }) {
 
   if (!isPlainObject(workSize)) {
     recordProblem('', `${location} must be a JSON object; using defaults.`);
-    return { ...DEFAULT_WORK_SIZE };
+    return {
+      ...DEFAULT_WORK_SIZE,
+      confirmCommandPatterns: [],
+      contractFiles: [],
+    };
   }
 
   const clean = {};
@@ -552,6 +774,97 @@ function sanitizeWorkSize(workSize, { source, location, problems }) {
     }
   }
 
+  for (const nonNegKey of ['reminderEveryTurns', 'readNoticeThreshold', 'maxFailedRetries']) {
+    if (Object.prototype.hasOwnProperty.call(workSize, nonNegKey)) {
+      const val = workSize[nonNegKey];
+      if (typeof val === 'number' && Number.isInteger(val) && val >= 0) {
+        clean[nonNegKey] = val;
+      } else {
+        recordProblem(
+          nonNegKey,
+          `${location}.${nonNegKey} must be an integer >= 0; using default (${DEFAULT_WORK_SIZE[nonNegKey]}).`,
+        );
+        clean[nonNegKey] = DEFAULT_WORK_SIZE[nonNegKey];
+      }
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(workSize, 'confirmCommands')) {
+    if (typeof workSize.confirmCommands === 'boolean') {
+      clean.confirmCommands = workSize.confirmCommands;
+    } else {
+      recordProblem(
+        'confirmCommands',
+        `${location}.confirmCommands must be a boolean; using default (${DEFAULT_WORK_SIZE.confirmCommands}).`,
+      );
+      clean.confirmCommands = DEFAULT_WORK_SIZE.confirmCommands;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(workSize, 'confirmCommandPatterns')) {
+    const rawPatterns = workSize.confirmCommandPatterns;
+    if (!Array.isArray(rawPatterns)) {
+      recordProblem(
+        'confirmCommandPatterns',
+        `${location}.confirmCommandPatterns must be an array of regular expression strings; using default ([]).`,
+      );
+      clean.confirmCommandPatterns = [];
+    } else {
+      const validPatterns = [];
+      for (let i = 0; i < rawPatterns.length; i++) {
+        const entry = rawPatterns[i];
+        if (typeof entry !== 'string' || !entry.trim()) {
+          recordProblem(
+            'confirmCommandPatterns',
+            `${location}.confirmCommandPatterns[${i}] must be a non-empty string; ignoring pattern.`,
+          );
+          continue;
+        }
+        try {
+          new RegExp(entry);
+          validPatterns.push(entry);
+          if (hasCatastrophicBacktrackingQuantifier(entry)) {
+            recordProblem(
+              'confirmCommandPatterns',
+              `Regular expression in ${location}.confirmCommandPatterns[${i}] (${JSON.stringify(entry)}) contains nested quantifiers (catastrophic backtracking risk); pattern is bounded to 50ms and asks on timeout.`,
+            );
+          }
+        } catch (err) {
+          recordProblem(
+            'confirmCommandPatterns',
+            `Invalid regular expression in ${location}.confirmCommandPatterns[${i}] (${JSON.stringify(entry)}): ${err?.message || err}; ignoring pattern.`,
+          );
+        }
+      }
+      clean.confirmCommandPatterns = validPatterns;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(workSize, 'contractFiles')) {
+    const rawGlobs = workSize.contractFiles;
+    if (!Array.isArray(rawGlobs)) {
+      recordProblem(
+        'contractFiles',
+        `${location}.contractFiles must be an array of glob strings; using default ([]).`,
+      );
+      clean.contractFiles = [];
+    } else {
+      const validGlobs = [];
+      for (let i = 0; i < rawGlobs.length; i++) {
+        const entry = rawGlobs[i];
+        if (typeof entry !== 'string' || !entry.trim() || entry.includes('\0')) {
+          recordProblem(
+            'contractFiles',
+            `${location}.contractFiles[${i}] must be a non-empty glob string; ignoring entry.`,
+          );
+          continue;
+        }
+        validGlobs.push(entry.trim());
+      }
+      clean.contractFiles = validGlobs;
+    }
+  }
+
   return clean;
 }
 
@@ -571,12 +884,38 @@ function withCleanSections(raw, { source, problems }) {
   return next;
 }
 
+function sanitizeRegexListQuiet(rawList) {
+  if (!Array.isArray(rawList)) return [];
+  const valid = [];
+  for (const item of rawList) {
+    if (typeof item !== 'string' || !item.trim()) continue;
+    try {
+      new RegExp(item);
+      valid.push(item);
+    } catch {
+      // ignore invalid regex
+    }
+  }
+  return valid;
+}
+
+function sanitizeGlobListQuiet(rawList) {
+  if (!Array.isArray(rawList)) return [];
+  const valid = [];
+  for (const item of rawList) {
+    if (typeof item !== 'string' || !item.trim() || item.includes('\0')) continue;
+    valid.push(item.trim());
+  }
+  return valid;
+}
+
 /**
  * Normalize a `config.workSize` block (whether loaded via `loadConfig` or constructed in-memory),
- * returning `{ enabled, maxFilesPerWindow, maxCharsPerFile }` with valid defaults for any bad/missing field.
+ * returning all `workSize` settings with valid defaults for any bad/missing field.
  */
 export function resolveWorkSizeConfig(config = DEFAULT_CONFIG) {
   const raw = isPlainObject(config?.workSize) ? config.workSize : {};
+  const nonNegInt = (val, fallback) => (typeof val === 'number' && Number.isInteger(val) && val >= 0 ? val : fallback);
   return {
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : DEFAULT_WORK_SIZE.enabled,
     maxFilesPerWindow: typeof raw.maxFilesPerWindow === 'number' && Number.isInteger(raw.maxFilesPerWindow) && raw.maxFilesPerWindow >= 1
@@ -585,6 +924,12 @@ export function resolveWorkSizeConfig(config = DEFAULT_CONFIG) {
     maxCharsPerFile: typeof raw.maxCharsPerFile === 'number' && Number.isInteger(raw.maxCharsPerFile) && raw.maxCharsPerFile >= 1
       ? raw.maxCharsPerFile
       : DEFAULT_WORK_SIZE.maxCharsPerFile,
+    reminderEveryTurns: nonNegInt(raw.reminderEveryTurns, DEFAULT_WORK_SIZE.reminderEveryTurns),
+    readNoticeThreshold: nonNegInt(raw.readNoticeThreshold, DEFAULT_WORK_SIZE.readNoticeThreshold),
+    maxFailedRetries: nonNegInt(raw.maxFailedRetries, DEFAULT_WORK_SIZE.maxFailedRetries),
+    confirmCommands: typeof raw.confirmCommands === 'boolean' ? raw.confirmCommands : DEFAULT_WORK_SIZE.confirmCommands,
+    confirmCommandPatterns: sanitizeRegexListQuiet(raw.confirmCommandPatterns),
+    contractFiles: sanitizeGlobListQuiet(raw.contractFiles),
   };
 }
 

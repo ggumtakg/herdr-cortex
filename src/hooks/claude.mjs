@@ -17,6 +17,7 @@ import {
   loadConfig,
   projectPathKey,
   resolveProjectRoot,
+  resolveWorkSizeConfig,
 } from '../core/config.mjs';
 import {
   HEAD_CORE_MAX_CHARS,
@@ -38,8 +39,27 @@ import {
   recordUnapprovedFolderNotice,
 } from '../core/trust.mjs';
 import { checkApprovalsForSession, pruneApprovalCheckRecords } from './approvals-watch.mjs';
-import { isReadOnlyShellCommand } from './shell-read-only.mjs';
 import {
+  createShellInspectionBudget,
+  formatConfirmCommandAskReason,
+  formatConfirmCommandDenyReason,
+  inspectConfirmableShellCommand,
+} from './confirm-commands.mjs';
+import {
+  READ_ONLY_GIT_SUBCOMMANDS,
+  READ_ONLY_SHELL_VERBS,
+  isReadOnlyShellCommand,
+} from './shell-read-only.mjs';
+import {
+  executableBaseName,
+  extractNestedShellCommands,
+  isCandidateCommandWord,
+  normalizeShellKind,
+  stripExeSuffix,
+  tokenizeShellSegments,
+} from './shell-tokens.mjs';
+import {
+  FILE_READ_TOOL_NAMES,
   FILE_WRITE_TOOL_NAMES,
   SHELL_TOOL_NAMES,
   cortexToolBaseName,
@@ -74,6 +94,8 @@ import {
   commandRunsGitCommit,
   consumeWorkSizeCompletedNotice,
   evaluateWorkSizeEdit,
+  evaluateWorkSizePrompt,
+  evaluateWorkSizeRead,
   getWorkSizeDir,
   getWorkSizeSessionNotice,
   isPathInsideMemoryDir,
@@ -81,6 +103,8 @@ import {
   recordGitCommitForWorkSize,
   recordMemorySaveForWorkSize,
   recordReviewVerdict,
+  recordShellResultForWorkSize,
+  resetWorkSizeTurnCountersOnSessionStart,
   resolveWorkSizeProjectRoot,
   resolveWorkSizeScope,
 } from './work-size.mjs';
@@ -176,6 +200,7 @@ const PROJECT_WRITE_CORTEX_TOOLS = new Set([
   'memory_update',
 ]);
 
+const FILE_READ_TOOLS = new Set(FILE_READ_TOOL_NAMES);
 const FILE_WRITE_TOOLS = new Set(FILE_WRITE_TOOL_NAMES);
 const SHELL_TOOLS = new Set(SHELL_TOOL_NAMES);
 
@@ -350,64 +375,427 @@ const WORK_COMMAND_NAMES = new Set([
 ]);
 const WORK_CLI_SCRIPT_NAME = 'cortex-work.mjs';
 
-/**
- * Classify a shell command line that invokes `cortex-work` (`scripts/cortex-work.mjs`):
- * - 'runs-cli'  : runs `release`, `reset`, or an ambiguous/compound `cortex-work` command (`ask` for main, `deny` for subagent/worker);
- * - 'read-only' : a single plain `cortex-work status` call (with optional `--tab <id>` / `--json` / `--all`), or a read-only shell command (`cat`, `git diff`, ...);
- * - ''          : unrelated command.
- */
-export function classifyWorkCommand(command) {
-  if (typeof command !== 'string' || !command.trim()) return '';
-  const { words, complex } = splitShellWords(command);
+const NODE_OPTIONS_WITH_VALUE = new Set([
+  '-r',
+  '--require',
+  '--import',
+  '--loader',
+  '--experimental-loader',
+  '-C',
+  '--conditions',
+  '--input-type',
+  '--env-file',
+  '--env-file-if-exists',
+  '--watch-path',
+  '--redirect-warnings',
+  '--diagnostic-dir',
+  '--heapsnapshot-dir',
+  '--cpu-prof-dir',
+  '--heap-prof-dir',
+  '--title',
+  '--openssl-config',
+  '--icu-data-dir',
+]);
 
-  const invocations = [];
-  let npmSeen = false;
-  for (let i = 0; i < words.length; i++) {
-    const word = words[i];
-    if (word === null) {
-      npmSeen = false;
-      continue;
-    }
-    const base = shellWordBaseName(word);
-    if (WORK_COMMAND_NAMES.has(base) || base === WORK_CLI_SCRIPT_NAME) {
-      invocations.push(i);
-    } else if (NPM_COMMAND_NAMES.has(base)) {
-      npmSeen = true;
-    } else if (npmSeen && (base === 'run' || base === 'run-script') && words[i + 1] && words[i + 1].toLowerCase() === 'work') {
-      invocations.push(i + 1);
-    }
+const NPM_RUNNERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
+const NPM_OPTS_WITH_VALUE = new Set(['--prefix', '-C', '--workspace', '-w', '--userconfig', '--globalconfig']);
+const CORTEX_WORK_MENTION_RE = /(?:^|[^A-Za-z0-9_-])cortex-work(?=$|[^A-Za-z0-9_-])/i;
+
+const READ_ONLY_UNSAFE_PREFIXES = Object.freeze({
+  git: ['--output', '-O', '--open-files-in-pager', '--ext-diff'],
+  rg: ['--pre', '--hostname-bin'],
+  less: ['-o', '-O', '--log-file', '-k', '--lesskey', '+'],
+  more: ['+'],
+});
+
+function wordNamesWorkCli(text) {
+  const base = executableBaseName(text);
+  return WORK_COMMAND_NAMES.has(base) || base === WORK_CLI_SCRIPT_NAME;
+}
+
+function segmentHasSubstitutionsOrRedirection(words) {
+  for (const tok of words) {
+    if (Array.isArray(tok.substitutions) && tok.substitutions.length > 0) return true;
+    if (!tok.quoted && /[<>]/.test(tok.text)) return true;
   }
+  return false;
+}
 
-  if (invocations.length === 0) return '';
-  if (isReadOnlyShellCommand(command)) return 'read-only';
-  if (complex || invocations.length !== 1) return 'runs-cli';
+function isReadOnlyWorkSegment(words) {
+  if (words.length < 2 || segmentHasSubstitutionsOrRedirection(words)) return false;
+  const first = words[0].text;
+  if (!first || /[\\/]/.test(first)) return false;
+  const verb = first.toLowerCase().replace(/\.exe$/, '');
+  const args = words.slice(1).map((w) => w.text);
+  const unsafe = READ_ONLY_UNSAFE_PREFIXES[verb] || [];
+  if (args.some((arg) => unsafe.some((prefix) => arg.startsWith(prefix)))) return false;
+  if (verb === 'git') {
+    return args.length > 0 && SHELL_GUARD_READ_ONLY_GIT.has(args[0].toLowerCase())
+      && !args.some((a) => /=.*cortex-work/i.test(a));
+  }
+  return SHELL_GUARD_READ_ONLY_VERBS.has(verb);
+}
 
-  const rawArgs = words.slice(invocations[0] + 1);
+function classifyWorkCliArgs(rawArgs) {
   const subcommands = [];
-  let unsafeOption = false;
+  let sawHelp = false;
   for (let i = 0; i < rawArgs.length; i++) {
-    const arg = rawArgs[i];
+    const tok = rawArgs[i];
+    const arg = tok.text;
+    if ((Array.isArray(tok.substitutions) && tok.substitutions.length > 0) || /[$%<>]/.test(arg)) {
+      return 'runs-cli';
+    }
     const lower = arg.toLowerCase();
     if (arg === '--' || lower === '--json' || lower === '--all') continue;
+    if (lower === '--help' || lower === '-h') {
+      sawHelp = true;
+      continue;
+    }
     if (lower === '--tab') {
-      if (i + 1 >= rawArgs.length) {
-        unsafeOption = true;
-        break;
+      if (i + 1 >= rawArgs.length) return 'runs-cli';
+      const tabTok = rawArgs[++i];
+      if ((Array.isArray(tabTok.substitutions) && tabTok.substitutions.length > 0) || /[$%<>]/.test(tabTok.text)) {
+        return 'runs-cli';
       }
-      i++;
       continue;
     }
     if (lower.startsWith('--tab=')) continue;
-    if (arg.startsWith('-')) {
-      unsafeOption = true;
-      break;
-    }
+    if (arg.startsWith('-')) return 'runs-cli';
     subcommands.push(lower);
   }
 
-  return !unsafeOption && subcommands.length === 1 && subcommands[0] === 'status'
-    ? 'read-only'
-    : 'runs-cli';
+  if (sawHelp && (subcommands.length === 0 || (subcommands.length === 1 && subcommands[0] === 'status'))) {
+    return 'read-only';
+  }
+  return subcommands.length === 1 && subcommands[0] === 'status' ? 'read-only' : 'runs-cli';
+}
+
+function findNpmWorkArgs(words, runnerIdx) {
+  const runnerBare = stripExeSuffix(executableBaseName(words[runnerIdx].text));
+  let idx = runnerIdx + 1;
+  while (idx < words.length) {
+    const arg = words[idx].text;
+    if (NPM_OPTS_WITH_VALUE.has(arg)) {
+      idx += 2;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      idx++;
+      continue;
+    }
+    break;
+  }
+  if (idx >= words.length) return null;
+  const sub = words[idx].text.toLowerCase();
+  if ((sub === 'run' || sub === 'run-script') && words[idx + 1]?.text.toLowerCase() === 'work') {
+    return words.slice(idx + 2);
+  }
+  if ((runnerBare === 'yarn' || runnerBare === 'pnpm') && sub === 'work') {
+    return words.slice(idx + 1);
+  }
+  return null;
+}
+
+function isNonExecutingFileArgSegment(words, workWordIndices) {
+  if (words.length < 2 || segmentHasSubstitutionsOrRedirection(words)) return false;
+  if (workWordIndices.some((idx) => idx === 0)) return false;
+  if (!isCandidateCommandWord(words, 0)) return false;
+
+  const headBase = executableBaseName(words[0].text);
+  const headBare = stripExeSuffix(headBase);
+
+  // 1. Any `git` subcommand (`git add scripts/cortex-work.mjs`, `git rm --cached ...`, etc.)
+  if (headBase === 'git' || headBase === 'git.exe') {
+    for (let i = 1; i < words.length; i++) {
+      const t = words[i].text;
+      if (t === '-c' || t === '--exec' || t.startsWith('--exec=')) {
+        if (CORTEX_WORK_MENTION_RE.test(t) || CORTEX_WORK_MENTION_RE.test(words[i + 1]?.text || '')) return false;
+      }
+      if (/=.*cortex-work/i.test(t)) return false;
+    }
+    return workWordIndices.every((idx) => !words[idx].text.startsWith('-'));
+  }
+
+  // 2. Syntax check only: `node --check scripts/cortex-work.mjs` / `node -c scripts/cortex-work.mjs`
+  if (headBare === 'node') {
+    let sawCheck = false;
+    for (let i = 1; i < words.length; i++) {
+      const tok = words[i];
+      const arg = tok.text;
+      if (!tok.quoted && arg === '--') break;
+      if (arg === '--check' || arg === '-c') {
+        sawCheck = true;
+        continue;
+      }
+      if (
+        arg === '-e' || arg === '--eval' || arg === '-p' || arg === '--print'
+        || arg.startsWith('--eval=') || arg.startsWith('--print=')
+        || NODE_OPTIONS_WITH_VALUE.has(arg)
+        || arg.startsWith('--require=') || arg.startsWith('--import=') || arg.startsWith('--loader=')
+      ) {
+        return false;
+      }
+      if (arg.startsWith('-')) continue;
+      break;
+    }
+    return sawCheck && workWordIndices.every((idx) => !words[idx].text.startsWith('-'));
+  }
+
+  // 3. Editor open: `code scripts/cortex-work.mjs`
+  if (headBare === 'code' || headBare === 'code-insiders') {
+    return workWordIndices.every((idx) => !words[idx].text.startsWith('-'));
+  }
+
+  return false;
+}
+
+function classifyPlainWorkStatusSegment(words, workWordIndices) {
+  if (segmentHasSubstitutionsOrRedirection(words)) return '';
+  let headIdx = 0;
+  if (words[0] && !words[0].quoted && words[0].text === '&') headIdx = 1;
+  if (headIdx >= words.length || !isCandidateCommandWord(words, headIdx)) return '';
+
+  const headBase = executableBaseName(words[headIdx].text);
+  const headBare = stripExeSuffix(headBase);
+
+  // Direct `cortex-work status` / `cortex-work --help`
+  if (workWordIndices.length === 1 && workWordIndices[0] === headIdx && wordNamesWorkCli(words[headIdx].text)) {
+    return classifyWorkCliArgs(words.slice(headIdx + 1));
+  }
+
+  // `node [--no-warnings ...] scripts/cortex-work.mjs status` / `bun scripts/cortex-work.mjs status`
+  if (workWordIndices.length === 1 && (headBare === 'node' || headBare === 'bun')) {
+    let idx = headIdx + 1;
+    while (idx < words.length) {
+      const tok = words[idx];
+      const arg = tok.text;
+      if (!tok.quoted && arg === '--') {
+        idx++;
+        break;
+      }
+      if (
+        arg === '-e' || arg === '--eval' || arg === '-p' || arg === '--print'
+        || arg.startsWith('--eval=') || arg.startsWith('--print=')
+        || NODE_OPTIONS_WITH_VALUE.has(arg)
+        || arg.startsWith('--require=') || arg.startsWith('--import=') || arg.startsWith('--loader=')
+      ) {
+        return 'runs-cli';
+      }
+      if (arg.startsWith('-')) {
+        idx++;
+        continue;
+      }
+      break;
+    }
+    if (idx === workWordIndices[0] && executableBaseName(words[idx].text) === WORK_CLI_SCRIPT_NAME) {
+      return classifyWorkCliArgs(words.slice(idx + 1));
+    }
+  }
+
+  return '';
+}
+
+function inspectSegmentWorkInvocation(words) {
+  if (words.length === 0) return '';
+
+  // Inline JS evaluation (`node -e "import('./scripts/cortex-work.mjs')"`) or `Start-Process` arg list
+  for (let i = 0; i < words.length; i++) {
+    if (!isCandidateCommandWord(words, i)) continue;
+    const bare = stripExeSuffix(executableBaseName(words[i].text));
+    if (bare === 'node' || bare === 'bun') {
+      for (let j = i + 1; j < words.length; j++) {
+        const a = words[j].text;
+        if (!words[j].quoted && a === '--') break;
+        if ((a === '-e' || a === '--eval' || a === '-p' || a === '--print' || NODE_OPTIONS_WITH_VALUE.has(a))
+          && CORTEX_WORK_MENTION_RE.test(words[j + 1]?.text || '')) {
+          return 'runs-cli';
+        }
+        if ((a.startsWith('--eval=') || a.startsWith('--print=') || a.startsWith('--require=') || a.startsWith('--import=') || a.startsWith('--loader='))
+          && CORTEX_WORK_MENTION_RE.test(a)) {
+          return 'runs-cli';
+        }
+      }
+    }
+    if (bare === 'start-process' || bare === 'saps') {
+      const restText = words.slice(i + 1).map((w) => w.text).join(' ');
+      if (CORTEX_WORK_MENTION_RE.test(restText)) return 'runs-cli';
+    }
+  }
+
+  // `npm run work` / `pnpm work` / `yarn work` / `bun run work` anywhere in the segment
+  let npmWorkResult = '';
+  for (let i = 0; i < words.length; i++) {
+    if (!isCandidateCommandWord(words, i)) continue;
+    const bare = stripExeSuffix(executableBaseName(words[i].text));
+    if (!NPM_RUNNERS.has(bare)) continue;
+    const workArgs = findNpmWorkArgs(words, i);
+    if (!workArgs) continue;
+    const headOnly = i === 0 || (i === 1 && !words[0].quoted && words[0].text === '&');
+    if (!headOnly || segmentHasSubstitutionsOrRedirection(words)) return 'runs-cli';
+    const res = classifyWorkCliArgs(workArgs);
+    if (res === 'runs-cli') return 'runs-cli';
+    npmWorkResult = res;
+  }
+
+  // Find every word in the segment that names `cortex-work` / `cortex-work.mjs`
+  const hasReleaseOrReset = words.some((w) => !w.quoted && /^(?:release|reset)$/i.test(w.text));
+  const headBare0 = words[0] ? stripExeSuffix(executableBaseName(words[0].text)) : '';
+  const workWordIndices = [];
+  for (let i = 0; i < words.length; i++) {
+    if (!wordNamesWorkCli(words[i].text)) continue;
+    // Wholly-quoted literal argument (`echo "cortex-work"`, `git commit -m "cortex-work"`) when not at
+    // command position, not passed as script to `node`/`bun`, and without `release`/`reset` in segment
+    if (
+      words[i].whollyQuoted
+      && !isCandidateCommandWord(words, i)
+      && !hasReleaseOrReset
+      && headBare0 !== 'node'
+      && headBare0 !== 'bun'
+    ) {
+      continue;
+    }
+    // Partial-quote obfuscation (`cortex-wo''rk`) is outside unquoted-word matching (known limitation)
+    if (words[i].quoted && !words[i].whollyQuoted) {
+      continue;
+    }
+    workWordIndices.push(i);
+  }
+
+  if (workWordIndices.length === 0) {
+    return npmWorkResult;
+  }
+
+  // Exception: read-only command inspecting the file (`cat`, `Get-Content`, `git diff`, `grep`, ...)
+  if (isReadOnlyWorkSegment(words)) {
+    return 'read-only';
+  }
+
+  // `release` / `reset` in the same segment always triggers regardless of leading words
+  if (hasReleaseOrReset) {
+    return 'runs-cli';
+  }
+
+  // Exception: file-path argument to a known non-executing command (`git` subcommands, `node --check`, `code`)
+  if (isNonExecutingFileArgSegment(words, workWordIndices)) {
+    return npmWorkResult;
+  }
+
+  // Exception: plain `status` / `--help` invocation
+  const plainStatus = classifyPlainWorkStatusSegment(words, workWordIndices);
+  if (plainStatus === 'read-only') {
+    return 'read-only';
+  }
+
+  // Default (HEAD baseline): any other non-read-only mention of `cortex-work` triggers `runs-cli`
+  return 'runs-cli';
+}
+
+function consumeHookShellStep(budget, count = 1) {
+  if (!budget) return false;
+  if (budget.exceeded) return true;
+  budget.steps += count;
+  if (budget.steps > budget.maxSteps) {
+    budget.exceeded = true;
+    return true;
+  }
+  return false;
+}
+
+function classifyWorkCommandRecursive(command, { shell = '', depth = 0, budget = null } = {}) {
+  if (typeof command !== 'string' || !command.trim()) return '';
+  if (depth > 4 || consumeHookShellStep(budget)) {
+    return CORTEX_WORK_MENTION_RE.test(command) ? 'runs-cli' : '';
+  }
+
+  let sawReadOnly = false;
+  const segments = tokenizeShellSegments(command, { shell, budget });
+  if (budget?.exceeded) {
+    return CORTEX_WORK_MENTION_RE.test(command) ? 'runs-cli' : '';
+  }
+
+  for (const words of segments) {
+    let candidateCount = 0;
+    for (let i = 0; i < words.length; i++) {
+      if (isCandidateCommandWord(words, i)) candidateCount++;
+    }
+    if (candidateCount > 0 && consumeHookShellStep(budget, candidateCount)) {
+      return CORTEX_WORK_MENTION_RE.test(command) ? 'runs-cli' : '';
+    }
+
+    const direct = inspectSegmentWorkInvocation(words);
+    if (direct === 'runs-cli') return 'runs-cli';
+    if (direct === 'read-only') sawReadOnly = true;
+
+    for (const nested of extractNestedShellCommands(words, shell)) {
+      const nestedRes = classifyWorkCommandRecursive(nested.command, {
+        shell: nested.shell,
+        depth: depth + 1,
+        budget,
+      });
+      if (nestedRes === 'runs-cli') return 'runs-cli';
+      if (nestedRes === 'read-only') sawReadOnly = true;
+      if (budget?.exceeded) {
+        return CORTEX_WORK_MENTION_RE.test(command) ? 'runs-cli' : '';
+      }
+    }
+  }
+  return sawReadOnly ? 'read-only' : '';
+}
+
+const SHELL_GUARD_READ_ONLY_VERBS = new Set(READ_ONLY_SHELL_VERBS);
+const SHELL_GUARD_READ_ONLY_GIT = new Set(READ_ONLY_GIT_SUBCOMMANDS);
+
+function isShellGuardReadOnly(command, shell = '') {
+  if (!isReadOnlyShellCommand(command)) return false;
+  const shellKind = normalizeShellKind(shell);
+  // `splitPlainCommands` does not interpret Bash unquoted `\'` / `\"` or ANSI-C `$'...'` escapes;
+  // verify every tokenized segment still starts with a read-only verb when those forms appear.
+  if ((shellKind === 'bash' || !shellKind) && /\\['"]|\$'/.test(command)) {
+    const segments = tokenizeShellSegments(command, { shell: 'bash' });
+    if (segments.length === 0) return false;
+    for (const words of segments) {
+      if (words.some((w) => Array.isArray(w.substitutions) && w.substitutions.length > 0)) return false;
+      const first = words[0]?.text || '';
+      if (!first || /[\\/]/.test(first)) return false;
+      const verb = first.toLowerCase().replace(/\.exe$/, '');
+      if (verb === 'git') {
+        const sub = words[1]?.text.toLowerCase() || '';
+        if (!SHELL_GUARD_READ_ONLY_GIT.has(sub)) return false;
+      } else if (!SHELL_GUARD_READ_ONLY_VERBS.has(verb)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Classify a shell command line that invokes `cortex-work` (`scripts/cortex-work.mjs`):
+ * - 'runs-cli'  : non-read-only mention or execution of `cortex-work` not covered by the explicit safe
+ *                 exceptions below (`ask` for main, `deny` for subagent/worker);
+ * - 'read-only' : plain `cortex-work status` / `--help`, or read-only inspection (`cat`, `Get-Content`, `git diff`, ...);
+ * - ''          : does not invoke `cortex-work` (quoted text, or file-path argument to `git` / `node --check` / `code`).
+ */
+export function classifyWorkCommand(command, { shell = '', budget = null } = {}) {
+  if (typeof command !== 'string' || !command.trim()) return '';
+  if (!/cortex-work|\b(?:npm|pnpm|yarn|bun)\b/i.test(command) && !/['"\\`^]/.test(command)) return '';
+
+  const effectiveBudget = budget || createShellInspectionBudget();
+  const shellKind = normalizeShellKind(shell);
+  let invocation = classifyWorkCommandRecursive(command, { shell: shellKind, depth: 0, budget: effectiveBudget });
+  if (
+    invocation !== 'runs-cli'
+    && !effectiveBudget.exceeded
+    && !shellKind
+    && /[`\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u2013\u2014\u2015]/.test(command)
+  ) {
+    const pwshInvocation = classifyWorkCommandRecursive(command, { shell: 'powershell', depth: 0, budget: effectiveBudget });
+    if (pwshInvocation === 'runs-cli') return 'runs-cli';
+    if (!invocation && pwshInvocation) invocation = pwshInvocation;
+  }
+  if (invocation) return invocation;
+  if (CORTEX_WORK_MENTION_RE.test(command) && isShellGuardReadOnly(command, shellKind)) return 'read-only';
+  return '';
 }
 
 export function formatWorkCommandAskReason(command) {
@@ -417,16 +805,11 @@ export function formatWorkCommandAskReason(command) {
 
 const SHELL_WORK_SIZE_DIR_RE = /(?:^|[^A-Za-z0-9_-])state\.*[\\/]+work-size\.*(?=$|[^A-Za-z0-9_-])/i;
 
-/**
- * Heuristic: does a shell command line reference the work-size state folder (either by `state/work-size` /
- * `state\work-size` notation or by `<globalDir>/state/work-size` real/written path)?
- */
-export function commandReferencesWorkSizeState(command, globalDir) {
-  if (typeof command !== 'string' || !command.trim()) return false;
-  if (SHELL_WORK_SIZE_DIR_RE.test(command)) return true;
+function rawTextReferencesWorkSizeState(text, dirForms) {
+  if (typeof text !== 'string' || !text.trim()) return false;
+  if (SHELL_WORK_SIZE_DIR_RE.test(text)) return true;
 
-  const haystack = process.platform === 'win32' ? command.toLowerCase() : command;
-  const dirForms = comparablePaths(getWorkSizeDir(globalDir));
+  const haystack = process.platform === 'win32' ? text.toLowerCase() : text;
   for (const rawForm of dirForms) {
     const variants = [rawForm, rawForm.replace(/\\/g, '/'), rawForm.replace(/\//g, '\\')];
     for (const candidate of variants) {
@@ -439,6 +822,55 @@ export function commandReferencesWorkSizeState(command, globalDir) {
         if (!isNameChar(after)) return true;
         from = at + 1;
       }
+    }
+  }
+  return false;
+}
+
+function segmentsReferenceWorkSizeState(command, dirForms, shellKind, depth = 0, budget = null) {
+  if (depth > 4 || typeof command !== 'string' || !command.trim()) return false;
+  if (consumeHookShellStep(budget)) return false;
+  for (const words of tokenizeShellSegments(command, { shell: shellKind, budget })) {
+    for (const tok of words) {
+      if (rawTextReferencesWorkSizeState(tok.text, dirForms)) return true;
+      if (Array.isArray(tok.substitutions)) {
+        for (const sub of tok.substitutions) {
+          if (
+            rawTextReferencesWorkSizeState(sub, dirForms)
+            || segmentsReferenceWorkSizeState(sub, dirForms, shellKind || 'bash', depth + 1, budget)
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    if (budget?.exceeded) return false;
+  }
+  return false;
+}
+
+/**
+ * Heuristic: does a shell command line reference the work-size state folder (either by `state/work-size` /
+ * `state\work-size` notation or by `<globalDir>/state/work-size` real/written path)?
+ */
+export function commandReferencesWorkSizeState(command, globalDir, { shell = '', budget = null } = {}) {
+  if (typeof command !== 'string' || !command.trim()) return false;
+  const dirForms = comparablePaths(getWorkSizeDir(globalDir));
+  if (rawTextReferencesWorkSizeState(command, dirForms)) return true;
+
+  // When quotes, backslashes, or backticks are present, also inspect unescaped token text and substitutions
+  // so inline escapes or line continuations inside the path cannot hide `state/work-size`.
+  if (/['"\\`]/.test(command)) {
+    const effectiveBudget = budget || createShellInspectionBudget();
+    const shellKind = normalizeShellKind(shell);
+    if (segmentsReferenceWorkSizeState(command, dirForms, shellKind || 'bash', 0, effectiveBudget)) return true;
+    if (
+      !effectiveBudget.exceeded
+      && !shellKind
+      && command.includes('`')
+      && segmentsReferenceWorkSizeState(command, dirForms, 'powershell', 0, effectiveBudget)
+    ) {
+      return true;
     }
   }
   return false;
@@ -869,7 +1301,8 @@ export function handleClaudeSessionStart(
     + (approvalsContext ? approvalsContext.length + 2 : 0);
 
   let headCoreToInject = '';
-  if (part === 'all' && !worker) {
+  let headCoreReinjectedOnStart = false;
+  if (!worker) {
     const headCore = readHeadCore(promptsDir, config, repoRoot);
     if (headCore) {
       const marker = extractHeadCoreMarker(headCore);
@@ -882,7 +1315,10 @@ export function handleClaudeSessionStart(
           turnOptions && typeof turnOptions === 'object' ? turnOptions : undefined,
         );
       if (!skipDuplicateHeadCore) {
-        headCoreToInject = headCore;
+        headCoreReinjectedOnStart = true;
+        if (part === 'all') {
+          headCoreToInject = headCore;
+        }
       }
     }
   }
@@ -937,24 +1373,41 @@ export function handleClaudeSessionStart(
 
   if (!worker) {
     try {
+      const sessionId = extractSessionId(payload);
+      const loadConfigForRoot = (root) => (
+        projectPathKey(root) === projectPathKey(resolveProjectRoot(projectDir))
+          ? config
+          : loadConfig({ projectDir: root, globalDir: effectiveGlobalDir })
+      );
+      if (headCoreReinjectedOnStart) {
+        const nowMs = Number(typeof now === 'function' ? now() : now) || Date.now();
+        resetWorkSizeTurnCountersOnSessionStart({
+          cwd: projectDir,
+          env,
+          projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+          globalDir: effectiveGlobalDir,
+          terminalId,
+          sessionId,
+          config,
+          loadConfigForRoot,
+          isEnabledForRoot: isProjectEnabled,
+          now: new Date(nowMs),
+        });
+      }
       const workSizeNotice = getWorkSizeSessionNotice({
         cwd: projectDir,
         env,
         projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
         globalDir: effectiveGlobalDir,
         terminalId,
-        sessionId: extractSessionId(payload),
+        sessionId,
         config,
-        loadConfigForRoot: (root) => (
-          projectPathKey(root) === projectPathKey(resolveProjectRoot(projectDir))
-            ? config
-            : loadConfig({ projectDir: root, globalDir: effectiveGlobalDir })
-        ),
+        loadConfigForRoot,
         isEnabledForRoot: isProjectEnabled,
       });
       pushNote(workSizeNotice);
     } catch {
-      // Never block SessionStart on work-size state read errors.
+      // Never block SessionStart on work-size state read/write errors.
     }
   }
 
@@ -1206,7 +1659,7 @@ export function handleClaudeUserPrompt(
   if (!worker) {
     try {
       const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
-      const completedNotice = consumeWorkSizeCompletedNotice({
+      const promptEval = evaluateWorkSizePrompt({
         cwd: projectDir,
         env,
         projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
@@ -1222,7 +1675,9 @@ export function handleClaudeUserPrompt(
         isEnabledForRoot: isProjectEnabled,
         now: nowDate,
       });
-      if (completedNotice) pushContextPart(completedNotice);
+      if (promptEval.completedNotice) pushContextPart(promptEval.completedNotice);
+      if (promptEval.unsavedNotice) pushContextPart(promptEval.unsavedNotice);
+      if (promptEval.periodicNotice) pushContextPart(promptEval.periodicNotice);
     } catch {
       // ignore work-size state errors in hook
     }
@@ -1428,19 +1883,90 @@ export function handleClaudePreToolUse(
 
     const trimmedTool = typeof toolName === 'string' ? toolName.trim() : '';
     if (SHELL_TOOLS.has(trimmedTool)) {
-      if (commandReferencesWorkSizeState(rawInput.command, effectiveGlobalDir) && !isReadOnlyShellCommand(rawInput.command)) {
+      const shellBudget = createShellInspectionBudget();
+      if (
+        commandReferencesWorkSizeState(rawInput.command, effectiveGlobalDir, {
+          shell: trimmedTool,
+          budget: shellBudget,
+        })
+        && !isShellGuardReadOnly(rawInput.command, trimmedTool)
+      ) {
         if (callerIsSubagent || worker) {
           return preToolUseDecision('deny', WORK_STATE_SHELL_DENY_REASON);
         }
         return preToolUseDecision('ask', formatWorkSizeStateShellAskReason(rawInput.command));
       }
 
-      const workCmdKind = classifyWorkCommand(rawInput.command);
+      const workCmdKind = classifyWorkCommand(rawInput.command, {
+        shell: trimmedTool,
+        budget: shellBudget,
+      });
       if (workCmdKind === 'runs-cli') {
         if (callerIsSubagent || worker) {
           return preToolUseDecision('deny', WORK_COMMAND_DENY_REASON);
         }
         return preToolUseDecision('ask', formatWorkCommandAskReason(rawInput.command));
+      }
+
+      try {
+        const scope = resolveWorkSizeScope({ terminalId, sessionId: extractSessionId(payload) });
+        const rootDir = resolveWorkSizeProjectRoot({
+          cwd,
+          env,
+          projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+          globalDir: effectiveGlobalDir,
+          scope,
+        });
+        const cfg = loadConfig({ projectDir: rootDir, globalDir: effectiveGlobalDir });
+        if (isProjectEnabled(rootDir, cfg)) {
+          const wsCfg = resolveWorkSizeConfig(cfg);
+          if (wsCfg.confirmCommands) {
+            const confirmMatch = inspectConfirmableShellCommand(rawInput.command, {
+              confirmCommands: wsCfg.confirmCommands,
+              confirmCommandPatterns: wsCfg.confirmCommandPatterns,
+              env,
+              shell: trimmedTool,
+              config: cfg,
+              budget: shellBudget,
+            });
+            if (confirmMatch.matched) {
+              if (callerIsSubagent || worker) {
+                return preToolUseDecision('deny', formatConfirmCommandDenyReason(confirmMatch));
+              }
+              return preToolUseDecision('ask', formatConfirmCommandAskReason(confirmMatch, rawInput.command));
+            }
+          }
+        }
+      } catch {
+        // State/config errors never block shell calls.
+      }
+      return {};
+    }
+
+    if (!callerIsSubagent && !worker && FILE_READ_TOOLS.has(trimmedTool)) {
+      try {
+        const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+        const readEval = evaluateWorkSizeRead({
+          cwd,
+          env,
+          projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+          globalDir: effectiveGlobalDir,
+          terminalId,
+          sessionId: extractSessionId(payload),
+          loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+          isEnabledForRoot: isProjectEnabled,
+          now: nowDate,
+        });
+        if (readEval.additionalContext) {
+          return {
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              additionalContext: readEval.additionalContext,
+            },
+          };
+        }
+      } catch {
+        // State read/write errors never block tool calls.
       }
       return {};
     }
@@ -1465,6 +1991,14 @@ export function handleClaudePreToolUse(
           });
           if (evaluated.action === 'deny') {
             return preToolUseDecision('deny', evaluated.denyReason);
+          }
+          if (evaluated.action === 'allow' && evaluated.additionalContext) {
+            return {
+              hookSpecificOutput: {
+                hookEventName: 'PreToolUse',
+                additionalContext: evaluated.additionalContext,
+              },
+            };
           }
         }
       } catch {
@@ -1567,14 +2101,18 @@ export function handleClaudePostToolUse(
   const toolResponse = payload.tool_response ?? payload.toolResponse;
 
   if (SHELL_TOOLS.has(toolName)) {
-    if (isPostToolResponseFailure(toolResponse, { isShell: true })) return {};
-    if (!commandRunsGitCommit(rawInput.command)) return {};
+    const isInterrupt = Boolean(toolResponse?.interrupted || payload.is_interrupt || payload.isInterrupt);
+    if (isInterrupt) return {};
+    const failed = isPostToolResponseFailure(toolResponse, { isShell: true });
     try {
       const cwd = extractCwd(payload, process.cwd());
       const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
       const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
-      recordGitCommitForWorkSize({
+      recordShellResultForWorkSize({
+        ok: !failed,
+        isInterrupt: false,
         command: rawInput.command,
+        shell: toolName,
         cwd,
         env,
         projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
@@ -1621,6 +2159,58 @@ export function handleClaudePostToolUse(
     } catch {
       // ignore state errors in hook
     }
+  }
+
+  return {};
+}
+
+/**
+ * Claude Code PostToolUseFailure handler: tracks failed shell runs (`Bash` / `PowerShell`) after project
+ * file edits so repeated failed edits on the same file are blocked and escalated to `L` (2-4).
+ * Ignores user-interrupted commands (`is_interrupt: true`), subagents, and worker sessions.
+ */
+export function handleClaudePostToolUseFailure(
+  payload = {},
+  {
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
+    globalDir,
+    now = Date.now,
+  } = {},
+) {
+  if (isSubagentPayload(payload) || isWorkerSession({ env })) return {};
+
+  const toolName = String(payload.tool_name || payload.toolName || '').trim();
+  if (!SHELL_TOOLS.has(toolName)) return {};
+
+  const isInterrupt = Boolean(payload.is_interrupt ?? payload.isInterrupt);
+  if (isInterrupt) return {};
+
+  const rawInput = payload.tool_input && typeof payload.tool_input === 'object' && !Array.isArray(payload.tool_input)
+    ? payload.tool_input
+    : {};
+
+  try {
+    const cwd = extractCwd(payload, process.cwd());
+    const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+    const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+    recordShellResultForWorkSize({
+      ok: false,
+      isInterrupt: false,
+      command: rawInput.command,
+      shell: toolName,
+      cwd,
+      env,
+      projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+      globalDir: effectiveGlobalDir,
+      terminalId,
+      sessionId: extractSessionId(payload),
+      loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+      isEnabledForRoot: isProjectEnabled,
+      now: nowDate,
+    });
+  } catch {
+    // ignore state errors in hook
   }
 
   return {};
@@ -1688,6 +2278,8 @@ export function runClaudeHook(eventName, payload = {}, options = {}) {
       return handleClaudePreToolUse(payload, options);
     case 'post-tool-use':
       return handleClaudePostToolUse(payload, options);
+    case 'post-tool-use-failure':
+      return handleClaudePostToolUseFailure(payload, options);
     case 'subagent-stop':
       return handleClaudeSubagentStop(payload, options);
     default:

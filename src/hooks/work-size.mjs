@@ -18,12 +18,27 @@ import {
   resolveCortexGlobalDir,
   validateTerminalId,
 } from '../revive/tracker.mjs';
+import {
+  formatContractFileDenyReason,
+  formatFileDependencyNotice,
+  lookupFileDependencyDocs,
+  matchContractFilePattern,
+} from './file-dependencies.mjs';
+import { isReadOnlyShellCommand } from './shell-read-only.mjs';
+import {
+  executableBaseName,
+  extractNestedShellCommands,
+  isCandidateCommandWord,
+  normalizeShellKind,
+  tokenizeShellSegments,
+} from './shell-tokens.mjs';
 
 /**
  * Host-independent work-size (S / L) state management, stable project-root resolution,
- * per-folder edit counting, threshold blocking, lock-protected updates, cumulative window
- * clearing (`git commit` / `memory_save`), reviewer verdict extraction, L completion tracking
- * (`ACCEPT` + `memory_save`), stale cleanup, and context notices.
+ * per-folder edit counting, threshold blocking, repeated failed-edit blocking, contract-file
+ * and memory-graph dependency notices, read-volume notices, unsaved/periodic reminders,
+ * lock-protected updates, cumulative window clearing (`git commit` / `memory_save`),
+ * reviewer verdict extraction, L completion tracking (`ACCEPT` + `memory_save`), and stale cleanup.
  *
  * Host hooks (Claude Code `claude.mjs`, and later Antigravity `antigravity.mjs`) adapt their
  * tool input shapes and host root hints (`projectDirEnvVar` or `workspacePaths`) and call into
@@ -35,6 +50,7 @@ export const WORK_SIZE_COMMAND = 'cortex-work';
 export const WORK_SIZE_STATE_VERSION = 2;
 export const WORK_SIZE_DENY_MAX_CHARS = 500;
 export const WORK_SIZE_SESSION_NOTICE_MAX_CHARS = 300;
+export const WORK_SIZE_NOTICE_MAX_CHARS = 300;
 export const WORK_SIZE_SESSION_STALE_MS = 30 * 24 * 60 * 60 * 1000;
 export const WORK_SIZE_LOCK_STALE_MS = 5000;
 export const WORK_SIZE_LOCK_RETRY_MS = 15;
@@ -584,6 +600,42 @@ function parseStoredFiles(rawFiles) {
   return clean;
 }
 
+function parseStoredFailedRetries(rawRetries) {
+  if (rawRetries === undefined || rawRetries === null) return {};
+  if (!isPlainObject(rawRetries)) return null;
+  const clean = {};
+  for (const [key, val] of Object.entries(rawRetries)) {
+    if (typeof key !== 'string' || !key.trim()) return null;
+    if (typeof val !== 'number' || !Number.isFinite(val) || val < 0) return null;
+    const count = Math.floor(val);
+    if (count > 0) clean[key.trim()] = count;
+  }
+  return clean;
+}
+
+function parseStoredStringList(rawList) {
+  if (rawList === undefined || rawList === null) return [];
+  if (!Array.isArray(rawList)) return null;
+  const seen = new Set();
+  const out = [];
+  for (const item of rawList) {
+    if (typeof item !== 'string') return null;
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    const norm = normalizeTrackedFileKey(trimmed);
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function parseOptionalNonNegInt(rawVal) {
+  if (rawVal === undefined || rawVal === null) return 0;
+  if (typeof rawVal !== 'number' || !Number.isFinite(rawVal) || rawVal < 0) return null;
+  return Math.floor(rawVal);
+}
+
 function parseFolderEntry(raw) {
   if (!isPlainObject(raw)) return null;
   if (raw.size !== 'S' && raw.size !== 'L') return null;
@@ -592,6 +644,19 @@ function parseFolderEntry(raw) {
 
   const files = parseStoredFiles(raw.files);
   if (!files) return null;
+
+  const failedRetries = parseStoredFailedRetries(raw.failedRetries);
+  if (!failedRetries) return null;
+
+  const editedSinceShell = parseStoredStringList(raw.editedSinceShell);
+  if (!editedSinceShell) return null;
+
+  const unsavedFiles = parseStoredStringList(raw.unsavedFiles);
+  if (!unsavedFiles) return null;
+
+  const promptTurns = parseOptionalNonNegInt(raw.promptTurns);
+  const turnReads = parseOptionalNonNegInt(raw.turnReads);
+  if (promptTurns === null || turnReads === null) return null;
 
   const isL = raw.size === 'L';
   return {
@@ -603,6 +668,14 @@ function parseFolderEntry(raw) {
       : null,
     escalationReason: isL && isPlainObject(raw.escalationReason) ? raw.escalationReason : null,
     files,
+    failedRetries,
+    editedSinceShell,
+    unsavedFiles,
+    unsavedCommitted: Boolean(raw.unsavedCommitted),
+    unsavedReminded: Boolean(raw.unsavedReminded),
+    promptTurns,
+    turnReads,
+    turnReadNotified: Boolean(raw.turnReadNotified),
     reviewAccepted: isL ? Boolean(raw.reviewAccepted) : false,
     reviewAcceptedAt: isL && typeof raw.reviewAcceptedAt === 'string' && raw.reviewAcceptedAt.trim()
       ? raw.reviewAcceptedAt.trim()
@@ -620,6 +693,12 @@ function isCleanEmptyFolderEntry(entry) {
   return Boolean(entry)
     && entry.size === 'S'
     && Object.keys(entry.files || {}).length === 0
+    && Object.keys(entry.failedRetries || {}).length === 0
+    && (entry.editedSinceShell?.length || 0) === 0
+    && (entry.unsavedFiles?.length || 0) === 0
+    && !entry.unsavedCommitted
+    && (entry.promptTurns || 0) === 0
+    && (entry.turnReads || 0) === 0
     && !entry.completedNoticePending;
 }
 
@@ -749,7 +828,12 @@ export function pruneStaleWorkSizeSessions(
  * Persist `scopeState` after pruning clean empty `S` folder entries (no files in window and no
  * pending notice) and pruning stale `session-*.json` files older than 30 days.
  */
-export function writeWorkSizeScopeState(globalDir, scope, scopeState, { now = new Date() } = {}) {
+export function writeWorkSizeScopeState(
+  globalDir,
+  scope,
+  scopeState,
+  { now = new Date(), skipPruneSessions = false } = {},
+) {
   const filePath = getWorkSizeStatePath(globalDir, scope);
   const nowDate = toDate(now);
   const nowMs = nowDate.getTime();
@@ -778,9 +862,11 @@ export function writeWorkSizeScopeState(globalDir, scope, scopeState, { now = ne
     });
   }
 
-  pruneStaleWorkSizeSessions(globalDir, nowMs, {
-    keepFileName: hasEntries ? scope.fileName : '',
-  });
+  if (!skipPruneSessions) {
+    pruneStaleWorkSizeSessions(globalDir, nowMs, {
+      keepFileName: hasEntries ? scope.fileName : '',
+    });
+  }
   return filePath;
 }
 
@@ -816,6 +902,14 @@ function createFreshFolderState(projectRoot, cwdKey) {
     escalatedAt: null,
     escalationReason: null,
     files: {},
+    failedRetries: {},
+    editedSinceShell: [],
+    unsavedFiles: [],
+    unsavedCommitted: false,
+    unsavedReminded: false,
+    promptTurns: 0,
+    turnReads: 0,
+    turnReadNotified: false,
     reviewAccepted: false,
     reviewAcceptedAt: null,
     memorySaved: false,
@@ -823,6 +917,15 @@ function createFreshFolderState(projectRoot, cwdKey) {
     completedNoticePending: false,
     updatedAt: '',
   };
+}
+
+function appendTrackedFileOnce(list, relPath) {
+  const norm = normalizeTrackedFileKey(relPath);
+  const existing = Array.isArray(list) ? list : [];
+  if (existing.some((item) => normalizeTrackedFileKey(item) === norm)) {
+    return existing;
+  }
+  return [...existing, relPath];
 }
 
 function clipText(value, maxChars) {
@@ -913,9 +1016,70 @@ export function formatWorkSizeSessionNotice(state) {
     : `${text.slice(0, WORK_SIZE_SESSION_NOTICE_MAX_CHARS - 3)}...`;
 }
 
+/**
+ * One-line unsaved-work reminder for `UserPromptSubmit` (2-1, <= 300 chars).
+ */
+export function formatUnsavedReminder({ editedFileCount = 0, committed = false } = {}) {
+  const count = Math.max(0, Math.floor(Number(editedFileCount) || 0));
+  if (count === 0 && !committed) return '';
+  const text =
+    `[herdr-cortex] 미저장 활동(편집 파일 ${formatNumber(count)}개, 커밋 ${committed ? '있음' : '없음'}): `
+    + '결정·작업 결과가 생겼다면 이번 응답 전에 `memory_save`로 남기세요.';
+  return clipText(text, WORK_SIZE_NOTICE_MAX_CHARS);
+}
+
+/**
+ * Two-line periodic reminder for `UserPromptSubmit` every `reminderEveryTurns` prompts (2-2, <= 300 chars).
+ */
+export function formatPeriodicReminder(state) {
+  const isL = state?.size === 'L';
+  let statusText = 'S';
+  if (isL) {
+    const remaining = [];
+    if (!state.reviewAccepted) remaining.push('검수 ACCEPT');
+    if (!state.memorySaved) remaining.push('memory_save');
+    statusText = `L(남은 조건: ${remaining.length > 0 ? remaining.join(', ') : '없음'})`;
+  }
+  const line1 = clipText(
+    `[herdr-cortex] 작업 규모(2파일+·위치 미상·의존 변경·파일당 1,000자 초과면 L, L은 위임) — 지금 상태: ${statusText}.`,
+    190,
+  );
+  const line2 = '기억 저장: 결정 합의·커밋·선호 확인 뒤, 그 턴의 최종 응답 전에 `memory_save`를 부른다.';
+  const combined = `${line1}\n${line2}`;
+  return combined.length <= WORK_SIZE_NOTICE_MAX_CHARS
+    ? combined
+    : `${combined.slice(0, WORK_SIZE_NOTICE_MAX_CHARS - 3)}...`;
+}
+
+/**
+ * One-time per-turn PreToolUse notice when `Read`/`Grep`/`Glob` calls exceed `readNoticeThreshold` (2-3, <= 300 chars).
+ */
+export function formatReadVolumeNotice({ readCount, threshold } = {}) {
+  const text =
+    `[herdr-cortex] 이번 입력에서 읽기·검색 도구를 ${formatNumber(readCount)}회 호출했습니다(기준 ${formatNumber(threshold)}회 초과). `
+    + '무엇을 찾는지 정해지지 않은 탐색이면 `researcher` 워커에게 맡기는 것을 고려하고, 원래 목적을 다시 확인하세요.';
+  return clipText(text, WORK_SIZE_NOTICE_MAX_CHARS);
+}
+
+/**
+ * PreToolUse deny reason when editing a file that already reached `maxFailedRetries` failed shell runs (2-4, <= 300 chars).
+ */
+export function formatFailedRetryDenyReason({ file, failedCount, escalated = true } = {}) {
+  const shortFile = clipText(file || '대상 파일', 45);
+  const actionClause = escalated ? '편집을 막고 L로 올렸습니다' : '편집을 막았습니다(현재 L)';
+  const text =
+    `[herdr-cortex] "${shortFile}" 수정 후 명령 실패가 ${formatNumber(failedCount)}회 되풀이되어 ${actionClause}. `
+    + '세부를 덧대지 말고 원래 문제로 올라가 원인을 다시 보세요. '
+    + '원인을 말할 수 없으면 조사를 `researcher`에게 맡기고(`start-job` 2번), 원인이 정해지면 구현을 위임하세요. '
+    + `잘못 걸렸으면 사용자에게 알리세요(\`${WORK_SIZE_COMMAND}\`).`;
+  return clipText(text, WORK_SIZE_NOTICE_MAX_CHARS);
+}
+
+export { formatContractFileDenyReason, formatFileDependencyNotice };
+
 function findMatchingFileKey(files, relPath) {
   const targetKey = normalizeTrackedFileKey(relPath);
-  for (const existingKey of Object.keys(files)) {
+  for (const existingKey of Object.keys(files || {})) {
     if (normalizeTrackedFileKey(existingKey) === targetKey) return existingKey;
   }
   return null;
@@ -926,15 +1090,17 @@ function evaluateConfigForRoot(rootDir, { preRoot, preConfig, loadConfigForRoot,
     ? preConfig
     : (typeof loadConfigForRoot === 'function' ? loadConfigForRoot(rootDir) : fallbackConfig);
   if (typeof isEnabledForRoot === 'function' && !isEnabledForRoot(rootDir, cfg)) {
-    return { enabled: false, workSize: null };
+    return { enabled: false, workSize: null, cfg };
   }
   const workSize = resolveWorkSizeConfig(cfg);
-  return { enabled: workSize.enabled, workSize };
+  return { enabled: workSize.enabled, workSize, cfg };
 }
 
 /**
- * Evaluate one file-edit tool call against the tab/session work-size window and update state on disk
- * under an exclusive lock. Returns `{ action: 'pass' | 'allow' | 'deny', denyReason?, violation?, state? }`.
+ * Evaluate one file-edit tool call against the tab/session work-size window (including repeated
+ * failed-edit blocking, contract-file blocking in S, file/char limits, and one-time memory-graph
+ * dependency notice per cumulative window) and update state on disk under an exclusive lock.
+ * Returns `{ action: 'pass' | 'allow' | 'deny', denyReason?, additionalContext?, dependencyDocs?, violation?, state? }`.
  */
 export function evaluateWorkSizeEdit({
   filePath,
@@ -949,6 +1115,7 @@ export function evaluateWorkSizeEdit({
   config = DEFAULT_CONFIG,
   loadConfigForRoot,
   isEnabledForRoot,
+  dependencyLookupOptions,
   lockOptions,
   now = new Date(),
 } = {}) {
@@ -987,6 +1154,35 @@ export function evaluateWorkSizeEdit({
 
   const preTracked = resolveTrackedProjectFile(filePath, cwd, { projectRoot: preRoot });
   if (!preTracked) return { action: 'pass', reason: 'outside_or_memory' };
+
+  const escalateIfS = (state, existingProjects, cwdKey, violation, stamp, nowDate) => {
+    if (state.size !== 'S') return state;
+    const escalated = {
+      ...state,
+      size: 'L',
+      escalatedAt: stamp,
+      escalationReason: violation,
+      reviewAccepted: false,
+      reviewAcceptedAt: null,
+      memorySaved: false,
+      memorySavedAt: null,
+      completedNoticePending: false,
+      updatedAt: stamp,
+    };
+    writeWorkSizeScopeState(
+      globalDir,
+      scope,
+      {
+        version: WORK_SIZE_STATE_VERSION,
+        scopeKind: scope.kind,
+        scopeId: scope.id,
+        updatedAt: stamp,
+        projects: { ...existingProjects, [cwdKey]: escalated },
+      },
+      { now: nowDate },
+    );
+    return escalated;
+  };
 
   const lockedResult = withWorkSizeScopeLock(
     globalDir,
@@ -1027,6 +1223,55 @@ export function evaluateWorkSizeEdit({
         : 0;
       const matchedKey = findMatchingFileKey(state.files, tracked.relPath);
       const fileKey = matchedKey || tracked.relPath;
+      const nowDate = toDate(now);
+      const stamp = formatIsoTimestamp(nowDate);
+
+      // 1. Repeated edit-after-shell-failure guard (2-4)
+      const matchedFailKey = findMatchingFileKey(state.failedRetries, tracked.relPath);
+      const failedCount = matchedFailKey ? state.failedRetries[matchedFailKey] : 0;
+      if (workSize.maxFailedRetries > 0 && failedCount >= workSize.maxFailedRetries) {
+        const wasS = state.size === 'S';
+        const violation = {
+          rule: 'max_failed_retries',
+          file: fileKey,
+          failedCount,
+          maxFailedRetries: workSize.maxFailedRetries,
+          summary: `${clipText(fileKey, 64)} 수정 실패 ${formatNumber(failedCount)}회 되풀이`,
+        };
+        const nextFolder = escalateIfS(state, existingProjects, cwdKey, violation, stamp, nowDate);
+        return {
+          action: 'deny',
+          denyReason: formatFailedRetryDenyReason({ file: fileKey, failedCount, escalated: wasS }),
+          violation,
+          state: { version: WORK_SIZE_STATE_VERSION, scopeKind: scope.kind, scopeId: scope.id, ...nextFolder },
+        };
+      }
+
+      // 2. Contract file glob guard while in S (2-6a; already-L applies ordinary limits below)
+      if (state.size === 'S' && workSize.contractFiles.length > 0) {
+        const matchedPattern = matchContractFilePattern(tracked.relPath, workSize.contractFiles);
+        if (matchedPattern) {
+          const violation = {
+            rule: 'contract_file',
+            file: fileKey,
+            pattern: matchedPattern,
+            summary: `계약 파일(${clipText(fileKey, 48)}, 패턴: ${clipText(matchedPattern, 40)})`,
+          };
+          const nextFolder = escalateIfS(state, existingProjects, cwdKey, violation, stamp, nowDate);
+          return {
+            action: 'deny',
+            denyReason: formatContractFileDenyReason({
+              file: fileKey,
+              pattern: matchedPattern,
+              commandName: WORK_SIZE_COMMAND,
+            }),
+            violation,
+            state: { version: WORK_SIZE_STATE_VERSION, scopeKind: scope.kind, scopeId: scope.id, ...nextFolder },
+          };
+        }
+      }
+
+      // 3. Cumulative file count & per-file character limit (6a)
       const previousChars = matchedKey ? state.files[matchedKey] : 0;
       const currentFileCount = Object.keys(state.files).length;
       const projectedFileCount = matchedKey ? currentFileCount : currentFileCount + 1;
@@ -1034,8 +1279,6 @@ export function evaluateWorkSizeEdit({
 
       const exceedsFiles = projectedFileCount > workSize.maxFilesPerWindow;
       const exceedsChars = projectedChars > workSize.maxCharsPerFile;
-      const nowDate = toDate(now);
-      const stamp = formatIsoTimestamp(nowDate);
 
       if (!exceedsFiles && !exceedsChars) {
         const nextFolder = {
@@ -1044,6 +1287,11 @@ export function evaluateWorkSizeEdit({
             ...state.files,
             [fileKey]: projectedChars,
           },
+          editedSinceShell:
+            workSize.maxFailedRetries > 0
+              ? appendTrackedFileOnce(state.editedSinceShell, fileKey)
+              : [],
+          unsavedFiles: appendTrackedFileOnce(state.unsavedFiles, fileKey),
           updatedAt: stamp,
         };
         writeWorkSizeScopeState(
@@ -1060,6 +1308,10 @@ export function evaluateWorkSizeEdit({
         );
         return {
           action: 'allow',
+          isFirstEditInWindow: matchedKey === null,
+          trackedRoot: tracked.projectRoot,
+          trackedRelPath: tracked.relPath,
+          evalConfig: evalCfg.cfg,
           state: { version: WORK_SIZE_STATE_VERSION, scopeKind: scope.kind, scopeId: scope.id, ...nextFolder },
         };
       }
@@ -1076,38 +1328,188 @@ export function evaluateWorkSizeEdit({
         exceedsChars,
       });
 
-      let nextFolder = state;
-      if (state.size === 'S') {
-        nextFolder = {
-          ...state,
-          size: 'L',
-          escalatedAt: stamp,
-          escalationReason: violation,
-          reviewAccepted: false,
-          reviewAcceptedAt: null,
-          memorySaved: false,
-          memorySavedAt: null,
-          completedNoticePending: false,
-          updatedAt: stamp,
-        };
-        writeWorkSizeScopeState(
-          globalDir,
-          scope,
-          {
-            version: WORK_SIZE_STATE_VERSION,
-            scopeKind: scope.kind,
-            scopeId: scope.id,
-            updatedAt: stamp,
-            projects: { ...existingProjects, [cwdKey]: nextFolder },
-          },
-          { now: nowDate },
-        );
-      }
-
+      const nextFolder = escalateIfS(state, existingProjects, cwdKey, violation, stamp, nowDate);
       return {
         action: 'deny',
         denyReason: formatWorkSizeDenyReason(violation),
         violation,
+        state: { version: WORK_SIZE_STATE_VERSION, scopeKind: scope.kind, scopeId: scope.id, ...nextFolder },
+      };
+    },
+    lockOptions,
+  );
+
+  if (!lockedResult.locked) {
+    return { action: 'pass', reason: 'lock_unavailable' };
+  }
+
+  const outcome = lockedResult.value;
+  if (outcome.action !== 'allow') {
+    return outcome;
+  }
+
+  const {
+    isFirstEditInWindow,
+    trackedRoot,
+    trackedRelPath,
+    evalConfig,
+    ...publicOutcome
+  } = outcome;
+
+  // 4. Memory-graph dependency notice once per file per cumulative window (2-6b; runs outside scope lock)
+  if (isFirstEditInWindow) {
+    const depDocs = lookupFileDependencyDocs(trackedRoot, trackedRelPath, {
+      globalDir,
+      config: evalConfig,
+      ...(isPlainObject(dependencyLookupOptions) ? dependencyLookupOptions : {}),
+    });
+    if (depDocs.length > 0) {
+      const additionalContext = formatFileDependencyNotice(depDocs);
+      if (additionalContext) {
+        return {
+          ...publicOutcome,
+          additionalContext,
+          dependencyDocs: depDocs,
+        };
+      }
+    }
+  }
+
+  return publicOutcome;
+}
+
+/**
+ * Lightweight PreToolUse counter for `Read`, `Grep`, and `Glob` calls within the current user prompt
+ * turn (2-3). When `readNoticeThreshold` is `0` (or work-size is disabled/excluded), returns immediately
+ * without reading, locking, or writing any state file.
+ */
+export function evaluateWorkSizeRead({
+  cwd = process.cwd(),
+  env,
+  projectDirEnvVar = '',
+  workspacePaths,
+  globalDir,
+  terminalId,
+  sessionId,
+  config = DEFAULT_CONFIG,
+  loadConfigForRoot,
+  isEnabledForRoot,
+  lockOptions,
+  now = new Date(),
+} = {}) {
+  if (typeof cwd !== 'string' || !cwd.trim() || cwd.includes('\0')) {
+    return { action: 'pass', reason: 'invalid_cwd' };
+  }
+
+  const scope = resolveWorkSizeScope({ terminalId, sessionId });
+  if (!scope) return { action: 'pass', reason: 'no_scope' };
+
+  // Fast exit before touching the state file when threshold is 0 or project/work-size is disabled.
+  const hostHintRoot = resolveWorkSizeProjectRoot({
+    cwd,
+    env,
+    projectDirEnvVar,
+    workspacePaths,
+    scopeState: null,
+  });
+  const initialCfg = typeof loadConfigForRoot === 'function' ? loadConfigForRoot(hostHintRoot) : config;
+  const initialEval = evaluateConfigForRoot(hostHintRoot, {
+    preRoot: hostHintRoot,
+    preConfig: initialCfg,
+    loadConfigForRoot,
+    isEnabledForRoot,
+    fallbackConfig: config,
+  });
+  const hasPerProjectOverrides = isPlainObject(initialCfg?.projects) && Object.keys(initialCfg.projects).length > 0;
+  const hasExplicitHostRoot = Boolean(
+    (projectDirEnvVar && getEnvValue(env, projectDirEnvVar).trim())
+    || (Array.isArray(workspacePaths) && workspacePaths.length > 0),
+  );
+  if (
+    (!initialEval.enabled || initialEval.workSize.readNoticeThreshold <= 0)
+    && (hasExplicitHostRoot || !hasPerProjectOverrides)
+  ) {
+    return { action: 'pass', reason: 'disabled' };
+  }
+
+  if (!hasExplicitHostRoot && hasPerProjectOverrides) {
+    const preScope = readWorkSizeScopeState(globalDir, scope);
+    const resolvedPreRoot = resolveWorkSizeProjectRoot({
+      cwd,
+      env,
+      projectDirEnvVar,
+      workspacePaths,
+      scopeState: preScope,
+    });
+    const preEval = evaluateConfigForRoot(resolvedPreRoot, {
+      preRoot: hostHintRoot,
+      preConfig: initialCfg,
+      loadConfigForRoot,
+      isEnabledForRoot,
+      fallbackConfig: config,
+    });
+    if (!preEval.enabled || preEval.workSize.readNoticeThreshold <= 0) {
+      return { action: 'pass', reason: 'disabled' };
+    }
+  }
+
+  const lockedResult = withWorkSizeScopeLock(
+    globalDir,
+    scope,
+    () => {
+      const existingScope = readWorkSizeScopeState(globalDir, scope);
+      const projectRoot = resolveWorkSizeProjectRoot({
+        cwd,
+        env,
+        projectDirEnvVar,
+        workspacePaths,
+        scopeState: existingScope,
+      });
+      const evalCfg = evaluateConfigForRoot(projectRoot, {
+        preRoot: hostHintRoot,
+        preConfig: initialCfg,
+        loadConfigForRoot,
+        isEnabledForRoot,
+        fallbackConfig: config,
+      });
+      if (!evalCfg.enabled || evalCfg.workSize.readNoticeThreshold <= 0) {
+        return { action: 'pass', reason: 'disabled' };
+      }
+
+      const threshold = evalCfg.workSize.readNoticeThreshold;
+      const cwdKey = projectPathKey(projectRoot);
+      const existingProjects = existingScope ? existingScope.projects : {};
+      const state = existingProjects[cwdKey] || createFreshFolderState(projectRoot, cwdKey);
+
+      const readCount = (state.turnReads || 0) + 1;
+      const shouldNotify = readCount > threshold && !state.turnReadNotified;
+      const nowDate = toDate(now);
+      const stamp = formatIsoTimestamp(nowDate);
+      const nextFolder = {
+        ...state,
+        turnReads: readCount,
+        turnReadNotified: state.turnReadNotified || shouldNotify,
+        updatedAt: stamp,
+      };
+
+      writeWorkSizeScopeState(
+        globalDir,
+        scope,
+        {
+          version: WORK_SIZE_STATE_VERSION,
+          scopeKind: scope.kind,
+          scopeId: scope.id,
+          updatedAt: stamp,
+          projects: { ...existingProjects, [cwdKey]: nextFolder },
+        },
+        { now: nowDate, skipPruneSessions: true },
+      );
+
+      return {
+        action: 'allow',
+        readCount,
+        notified: shouldNotify,
+        additionalContext: shouldNotify ? formatReadVolumeNotice({ readCount, threshold }) : '',
         state: { version: WORK_SIZE_STATE_VERSION, scopeKind: scope.kind, scopeId: scope.id, ...nextFolder },
       };
     },
@@ -1128,6 +1530,8 @@ function transitionToCompletedS(state, nowDate) {
     escalatedAt: null,
     escalationReason: null,
     files: {},
+    failedRetries: {},
+    editedSinceShell: [],
     reviewAccepted: false,
     reviewAcceptedAt: null,
     memorySaved: false,
@@ -1138,11 +1542,22 @@ function transitionToCompletedS(state, nowDate) {
 }
 
 /**
- * Clear cumulative per-file edit counts after a successful `git commit` inside the project root.
- * Keeps `size: 'L'` intact when the folder is in L.
+ * Process a shell tool execution result (`PostToolUse` when `ok === true`, `PostToolUseFailure` when
+ * `ok === false`):
+ * - Ignores user-interrupted runs (`isInterrupt === true`) and recognizably read-only shell commands
+ *   (`isReadOnlyShellCommand(command) === true`, so `grep` with exit 1 does not count as a failed edit
+ *   retry and `git diff` / `ls` with exit 0 does not reset prior failed-retry counts).
+ * - When `ok === false`: if `maxFailedRetries > 0` and at least one project file was edited since the
+ *   previous non-read-only shell result (`editedSinceShell`), increments each such file's `failedRetries`
+ *   by 1 and clears `editedSinceShell`. Shell failures with no preceding file edits are ignored.
+ * - When `ok === true`: resets `failedRetries` and `editedSinceShell`; if `command` also ran an
+ *   in-project `git commit`, clears cumulative `files` and marks `unsavedCommitted = true` (2-1).
  */
-export function recordGitCommitForWorkSize({
+export function recordShellResultForWorkSize({
+  ok = true,
+  isInterrupt = false,
   command,
+  shell = '',
   cwd = process.cwd(),
   env,
   projectDirEnvVar = '',
@@ -1156,15 +1571,61 @@ export function recordGitCommitForWorkSize({
   lockOptions,
   now = new Date(),
 } = {}) {
+  if (isInterrupt) return { changed: false };
+  if (typeof command === 'string' && isReadOnlyShellCommand(command)) {
+    return { changed: false };
+  }
+
   const scope = resolveWorkSizeScope({ terminalId, sessionId });
   if (!scope) return { changed: false };
-  if (command !== undefined && !commandRunsGitCommit(command)) return { changed: false };
 
-  let statePath;
+  const maybeGitCommit = Boolean(ok) && commandRunsGitCommit(command, { shell });
+  let stateExists = false;
   try {
-    statePath = getWorkSizeStatePath(globalDir, scope);
-    if (!fs.existsSync(statePath)) return { changed: false };
+    const statePath = getWorkSizeStatePath(globalDir, scope);
+    stateExists = Boolean(statePath) && fs.existsSync(statePath);
   } catch {
+    return { changed: false };
+  }
+
+  // Only an in-project `git commit` can record new state (`unsavedCommitted: true`) without prior state.
+  if (!stateExists && !maybeGitCommit) {
+    return { changed: false };
+  }
+
+  // Quick pre-check before acquiring the lock so ordinary shell calls in clean tabs do zero lock/write I/O.
+  const preScope = stateExists ? readWorkSizeScopeState(globalDir, scope) : null;
+  const preRoot = resolveWorkSizeProjectRoot({
+    cwd,
+    env,
+    projectDirEnvVar,
+    workspacePaths,
+    scopeState: preScope,
+  });
+  const preCfg = typeof loadConfigForRoot === 'function' ? loadConfigForRoot(preRoot) : config;
+  const preEval = evaluateConfigForRoot(preRoot, {
+    preRoot,
+    preConfig: preCfg,
+    loadConfigForRoot,
+    isEnabledForRoot,
+    fallbackConfig: config,
+  });
+  if (!preEval.enabled) return { changed: false };
+
+  if (!maybeGitCommit) {
+    const preEntry = preScope?.projects?.[projectPathKey(preRoot)];
+    if (!preEntry) return { changed: false };
+    if (!ok) {
+      if (preEval.workSize.maxFailedRetries <= 0 || preEntry.editedSinceShell.length === 0) {
+        return { changed: false };
+      }
+    } else if (
+      Object.keys(preEntry.failedRetries).length === 0
+      && preEntry.editedSinceShell.length === 0
+    ) {
+      return { changed: false };
+    }
+  } else if (!stateExists && !commandRunsGitCommit(command, { cwd, projectRoot: preRoot, shell })) {
     return { changed: false };
   }
 
@@ -1173,8 +1634,6 @@ export function recordGitCommitForWorkSize({
     scope,
     () => {
       const existingScope = readWorkSizeScopeState(globalDir, scope);
-      if (!existingScope) return { changed: false };
-
       const projectRoot = resolveWorkSizeProjectRoot({
         cwd,
         env,
@@ -1183,36 +1642,119 @@ export function recordGitCommitForWorkSize({
         scopeState: existingScope,
       });
       const evalCfg = evaluateConfigForRoot(projectRoot, {
+        preRoot,
+        preConfig: preCfg,
         loadConfigForRoot,
         isEnabledForRoot,
         fallbackConfig: config,
       });
       if (!evalCfg.enabled) return { changed: false };
 
-      const commitInProject = command !== undefined
-        ? commandRunsGitCommit(command, { cwd, projectRoot })
-        : isSameOrSubpath(cwd, projectRoot);
-      if (!commitInProject) return { changed: false };
-
       const cwdKey = projectPathKey(projectRoot);
-      const existing = existingScope.projects[cwdKey];
-      if (!existing) return { changed: false };
-      if (Object.keys(existing.files).length === 0) return { changed: false, state: existing };
-
+      const existingProjects = existingScope ? existingScope.projects : {};
+      const existing = existingProjects[cwdKey] || null;
       const nowDate = toDate(now);
       const stamp = formatIsoTimestamp(nowDate);
+
+      if (!ok) {
+        if (!existing || existing.editedSinceShell.length === 0) {
+          return { changed: false };
+        }
+        if (evalCfg.workSize.maxFailedRetries <= 0) {
+          const clearedEntry = {
+            ...existing,
+            editedSinceShell: [],
+            updatedAt: stamp,
+          };
+          writeWorkSizeScopeState(
+            globalDir,
+            scope,
+            {
+              version: WORK_SIZE_STATE_VERSION,
+              scopeKind: scope.kind,
+              scopeId: scope.id,
+              updatedAt: stamp,
+              projects: { ...existingProjects, [cwdKey]: clearedEntry },
+            },
+            { now: nowDate },
+          );
+          return { changed: true, state: clearedEntry };
+        }
+
+        const nextRetries = { ...existing.failedRetries };
+        for (const editedFile of existing.editedSinceShell) {
+          const matchKey = findMatchingFileKey(nextRetries, editedFile) || editedFile;
+          nextRetries[matchKey] = (nextRetries[matchKey] || 0) + 1;
+        }
+        const nextEntry = {
+          ...existing,
+          failedRetries: nextRetries,
+          editedSinceShell: [],
+          updatedAt: stamp,
+        };
+        writeWorkSizeScopeState(
+          globalDir,
+          scope,
+          {
+            version: WORK_SIZE_STATE_VERSION,
+            scopeKind: scope.kind,
+            scopeId: scope.id,
+            updatedAt: stamp,
+            projects: { ...existingProjects, [cwdKey]: nextEntry },
+          },
+          { now: nowDate },
+        );
+        return { changed: true, state: nextEntry };
+      }
+
+      const isInProjectCommit = maybeGitCommit && commandRunsGitCommit(command, { cwd, projectRoot, shell });
+      if (isInProjectCommit) {
+        const base = existing || createFreshFolderState(projectRoot, cwdKey);
+        const nextEntry = {
+          ...base,
+          files: {},
+          failedRetries: {},
+          editedSinceShell: [],
+          unsavedCommitted: true,
+          updatedAt: stamp,
+        };
+        writeWorkSizeScopeState(
+          globalDir,
+          scope,
+          {
+            version: WORK_SIZE_STATE_VERSION,
+            scopeKind: scope.kind,
+            scopeId: scope.id,
+            updatedAt: stamp,
+            projects: { ...existingProjects, [cwdKey]: nextEntry },
+          },
+          { now: nowDate },
+        );
+        return { changed: true, committed: true, state: nextEntry };
+      }
+
+      if (
+        !existing
+        || (Object.keys(existing.failedRetries).length === 0 && existing.editedSinceShell.length === 0)
+      ) {
+        return { changed: false, ...(existing ? { state: existing } : {}) };
+      }
+
       const nextEntry = {
         ...existing,
-        files: {},
+        failedRetries: {},
+        editedSinceShell: [],
         updatedAt: stamp,
       };
       writeWorkSizeScopeState(
         globalDir,
         scope,
         {
-          ...existingScope,
+          version: WORK_SIZE_STATE_VERSION,
+          scopeKind: scope.kind,
+          scopeId: scope.id,
           updatedAt: stamp,
-          projects: { ...existingScope.projects, [cwdKey]: nextEntry },
+          projects: { ...existingProjects, [cwdKey]: nextEntry },
         },
         { now: nowDate },
       );
@@ -1225,8 +1767,126 @@ export function recordGitCommitForWorkSize({
 }
 
 /**
- * Clear cumulative per-file edit counts after a successful `memory_save`, and when the folder is in `L`,
- * record `memorySaved = true` (completing `L` -> `S` if `reviewAccepted` is also recorded).
+ * Clear cumulative per-file edit counts and failed-edit retries after a successful `git commit` inside
+ * the project root, and mark `unsavedCommitted = true` until `memory_save` runs. Keeps `size: 'L'` intact.
+ */
+export function recordGitCommitForWorkSize({
+  command,
+  shell = '',
+  cwd = process.cwd(),
+  env,
+  projectDirEnvVar = '',
+  workspacePaths,
+  globalDir,
+  terminalId,
+  sessionId,
+  config = DEFAULT_CONFIG,
+  loadConfigForRoot,
+  isEnabledForRoot,
+  lockOptions,
+  now = new Date(),
+} = {}) {
+  if (command !== undefined) {
+    if (!commandRunsGitCommit(command, { shell })) return { changed: false };
+    return recordShellResultForWorkSize({
+      ok: true,
+      isInterrupt: false,
+      command,
+      shell,
+      cwd,
+      env,
+      projectDirEnvVar,
+      workspacePaths,
+      globalDir,
+      terminalId,
+      sessionId,
+      config,
+      loadConfigForRoot,
+      isEnabledForRoot,
+      lockOptions,
+      now,
+    });
+  }
+
+  const scope = resolveWorkSizeScope({ terminalId, sessionId });
+  if (!scope) return { changed: false };
+
+  const preScope = readWorkSizeScopeState(globalDir, scope);
+  const preRoot = resolveWorkSizeProjectRoot({
+    cwd,
+    env,
+    projectDirEnvVar,
+    workspacePaths,
+    scopeState: preScope,
+  });
+  const preCfg = typeof loadConfigForRoot === 'function' ? loadConfigForRoot(preRoot) : config;
+  const preEval = evaluateConfigForRoot(preRoot, {
+    preRoot,
+    preConfig: preCfg,
+    loadConfigForRoot,
+    isEnabledForRoot,
+    fallbackConfig: config,
+  });
+  if (!preEval.enabled || !isSameOrSubpath(cwd, preRoot)) return { changed: false };
+
+  const lockedResult = withWorkSizeScopeLock(
+    globalDir,
+    scope,
+    () => {
+      const existingScope = readWorkSizeScopeState(globalDir, scope);
+      const projectRoot = resolveWorkSizeProjectRoot({
+        cwd,
+        env,
+        projectDirEnvVar,
+        workspacePaths,
+        scopeState: existingScope,
+      });
+      const evalCfg = evaluateConfigForRoot(projectRoot, {
+        preRoot,
+        preConfig: preCfg,
+        loadConfigForRoot,
+        isEnabledForRoot,
+        fallbackConfig: config,
+      });
+      if (!evalCfg.enabled || !isSameOrSubpath(cwd, projectRoot)) return { changed: false };
+
+      const cwdKey = projectPathKey(projectRoot);
+      const existingProjects = existingScope ? existingScope.projects : {};
+      const base = existingProjects[cwdKey] || createFreshFolderState(projectRoot, cwdKey);
+      const nowDate = toDate(now);
+      const stamp = formatIsoTimestamp(nowDate);
+      const nextEntry = {
+        ...base,
+        files: {},
+        failedRetries: {},
+        editedSinceShell: [],
+        unsavedCommitted: true,
+        updatedAt: stamp,
+      };
+      writeWorkSizeScopeState(
+        globalDir,
+        scope,
+        {
+          version: WORK_SIZE_STATE_VERSION,
+          scopeKind: scope.kind,
+          scopeId: scope.id,
+          updatedAt: stamp,
+          projects: { ...existingProjects, [cwdKey]: nextEntry },
+        },
+        { now: nowDate },
+      );
+      return { changed: true, committed: true, state: nextEntry };
+    },
+    lockOptions,
+  );
+
+  return lockedResult.locked ? lockedResult.value : { changed: false };
+}
+
+/**
+ * Clear cumulative per-file edit counts, failed-edit retries, and unsaved-work markers after a
+ * successful `memory_save`, and when the folder is in `L`, record `memorySaved = true` (completing
+ * `L` -> `S` if `reviewAccepted` is also recorded).
  */
 export function recordMemorySaveForWorkSize({
   cwd = process.cwd(),
@@ -1279,12 +1939,24 @@ export function recordMemorySaveForWorkSize({
 
       const nowDate = toDate(now);
       const stamp = formatIsoTimestamp(nowDate);
-      const hadFiles = Object.keys(existing.files).length > 0;
+      const hadClearable =
+        Object.keys(existing.files).length > 0
+        || Object.keys(existing.failedRetries).length > 0
+        || existing.editedSinceShell.length > 0
+        || existing.unsavedFiles.length > 0
+        || existing.unsavedCommitted
+        || existing.unsavedReminded;
+
       if (existing.size !== 'L') {
-        if (!hadFiles) return { changed: false, completed: false, state: existing };
+        if (!hadClearable) return { changed: false, completed: false, state: existing };
         const nextEntry = {
           ...existing,
           files: {},
+          failedRetries: {},
+          editedSinceShell: [],
+          unsavedFiles: [],
+          unsavedCommitted: false,
+          unsavedReminded: false,
           updatedAt: stamp,
         };
         writeWorkSizeScopeState(
@@ -1303,6 +1975,11 @@ export function recordMemorySaveForWorkSize({
       let nextEntry = {
         ...existing,
         files: {},
+        failedRetries: {},
+        editedSinceShell: [],
+        unsavedFiles: [],
+        unsavedCommitted: false,
+        unsavedReminded: false,
         memorySaved: true,
         memorySavedAt: stamp,
         updatedAt: stamp,
@@ -1483,6 +2160,240 @@ export function getWorkSizeSessionNotice({
 }
 
 /**
+ * Reset per-folder `promptTurns` (and per-turn read counters) to `0` on `SessionStart` whenever
+ * `HEAD_CORE` is freshly injected (new session, `/clear`, `compact`, or `resume`/`fork` without
+ * duplicate `HEAD_CORE`). Never creates a state file if none exists.
+ */
+export function resetWorkSizeTurnCountersOnSessionStart({
+  cwd = process.cwd(),
+  env,
+  projectDirEnvVar = '',
+  workspacePaths,
+  globalDir,
+  terminalId,
+  sessionId,
+  config = DEFAULT_CONFIG,
+  loadConfigForRoot,
+  isEnabledForRoot,
+  lockOptions,
+  now = new Date(),
+} = {}) {
+  const scope = resolveWorkSizeScope({ terminalId, sessionId });
+  if (!scope) return { changed: false };
+
+  try {
+    const statePath = getWorkSizeStatePath(globalDir, scope);
+    if (!fs.existsSync(statePath)) return { changed: false };
+  } catch {
+    return { changed: false };
+  }
+
+  const quickScope = readWorkSizeScopeState(globalDir, scope);
+  if (!quickScope) return { changed: false };
+  const quickRoot = resolveWorkSizeProjectRoot({
+    cwd,
+    env,
+    projectDirEnvVar,
+    workspacePaths,
+    scopeState: quickScope,
+  });
+  const quickEntry = quickScope.projects[projectPathKey(quickRoot)];
+  if (!quickEntry || (quickEntry.promptTurns === 0 && quickEntry.turnReads === 0 && !quickEntry.turnReadNotified)) {
+    return { changed: false };
+  }
+
+  const lockedResult = withWorkSizeScopeLock(
+    globalDir,
+    scope,
+    () => {
+      const existingScope = readWorkSizeScopeState(globalDir, scope);
+      if (!existingScope) return { changed: false };
+      const projectRoot = resolveWorkSizeProjectRoot({
+        cwd,
+        env,
+        projectDirEnvVar,
+        workspacePaths,
+        scopeState: existingScope,
+      });
+      const evalCfg = evaluateConfigForRoot(projectRoot, {
+        loadConfigForRoot,
+        isEnabledForRoot,
+        fallbackConfig: config,
+      });
+      if (!evalCfg.enabled) return { changed: false };
+
+      const cwdKey = projectPathKey(projectRoot);
+      const existing = existingScope.projects[cwdKey];
+      if (!existing || (existing.promptTurns === 0 && existing.turnReads === 0 && !existing.turnReadNotified)) {
+        return { changed: false };
+      }
+
+      const nowDate = toDate(now);
+      const stamp = formatIsoTimestamp(nowDate);
+      const nextEntry = {
+        ...existing,
+        promptTurns: 0,
+        turnReads: 0,
+        turnReadNotified: false,
+        updatedAt: stamp,
+      };
+      writeWorkSizeScopeState(
+        globalDir,
+        scope,
+        {
+          ...existingScope,
+          updatedAt: stamp,
+          projects: { ...existingScope.projects, [cwdKey]: nextEntry },
+        },
+        { now: nowDate },
+      );
+      return { changed: true, state: nextEntry };
+    },
+    lockOptions,
+  );
+
+  return lockedResult.locked ? lockedResult.value : { changed: false };
+}
+
+/**
+ * Evaluate `UserPromptSubmit` for a main-conversation prompt:
+ * - Consumes `completedNoticePending` once;
+ * - Resets the per-turn read counter (`turnReads = 0`, `turnReadNotified = false`);
+ * - Increments `promptTurns` (when `reminderEveryTurns > 0`, or when folder state already exists so
+ *   `cortex-work status` reflects prompt count without writing files when reminders are off and clean);
+ * - Emits `unsavedNotice` (2-1) once per unsaved span, and repeats it alongside `periodicNotice` (2-2)
+ *   while unsaved work remains;
+ * - Emits two-line `periodicNotice` (2-2) every `reminderEveryTurns` prompts.
+ */
+export function evaluateWorkSizePrompt({
+  cwd = process.cwd(),
+  env,
+  projectDirEnvVar = '',
+  workspacePaths,
+  globalDir,
+  terminalId,
+  sessionId,
+  config = DEFAULT_CONFIG,
+  loadConfigForRoot,
+  isEnabledForRoot,
+  lockOptions,
+  now = new Date(),
+} = {}) {
+  const empty = { completedNotice: '', unsavedNotice: '', periodicNotice: '' };
+  if (typeof cwd !== 'string' || !cwd.trim() || cwd.includes('\0')) return empty;
+
+  const scope = resolveWorkSizeScope({ terminalId, sessionId });
+  if (!scope) return empty;
+
+  const preScope = readWorkSizeScopeState(globalDir, scope);
+  const preRoot = resolveWorkSizeProjectRoot({
+    cwd,
+    env,
+    projectDirEnvVar,
+    workspacePaths,
+    scopeState: preScope,
+  });
+  const preCfg = typeof loadConfigForRoot === 'function' ? loadConfigForRoot(preRoot) : config;
+  const preEval = evaluateConfigForRoot(preRoot, {
+    preRoot,
+    preConfig: preCfg,
+    loadConfigForRoot,
+    isEnabledForRoot,
+    fallbackConfig: config,
+  });
+  if (!preEval.enabled) return empty;
+
+  // When `reminderEveryTurns === 0` and no state exists for this folder yet, there is nothing to consume,
+  // reset, or remind — skip creating any state file or lock!
+  if (preEval.workSize.reminderEveryTurns <= 0 && !preScope?.projects?.[projectPathKey(preRoot)]) {
+    return empty;
+  }
+
+  const lockedResult = withWorkSizeScopeLock(
+    globalDir,
+    scope,
+    () => {
+      const existingScope = readWorkSizeScopeState(globalDir, scope);
+      const projectRoot = resolveWorkSizeProjectRoot({
+        cwd,
+        env,
+        projectDirEnvVar,
+        workspacePaths,
+        scopeState: existingScope,
+      });
+      const evalCfg = evaluateConfigForRoot(projectRoot, {
+        preRoot,
+        preConfig: preCfg,
+        loadConfigForRoot,
+        isEnabledForRoot,
+        fallbackConfig: config,
+      });
+      if (!evalCfg.enabled) return empty;
+
+      const reminderEvery = evalCfg.workSize.reminderEveryTurns;
+      const cwdKey = projectPathKey(projectRoot);
+      const existingProjects = existingScope ? existingScope.projects : {};
+      const existing = existingProjects[cwdKey] || null;
+      if (reminderEvery <= 0 && !existing) {
+        return empty;
+      }
+
+      const state = existing || createFreshFolderState(projectRoot, cwdKey);
+      const nowDate = toDate(now);
+      const stamp = formatIsoTimestamp(nowDate);
+
+      const completedNotice = state.completedNoticePending ? WORK_SIZE_COMPLETED_NOTICE : '';
+      const nextPromptTurns = reminderEvery > 0 ? (state.promptTurns || 0) + 1 : 0;
+      const isPeriodicTurn = reminderEvery > 0 && nextPromptTurns > 0 && nextPromptTurns % reminderEvery === 0;
+
+      const hasUnsaved = state.unsavedFiles.length > 0 || state.unsavedCommitted;
+      const shouldEmitUnsaved = hasUnsaved && (!state.unsavedReminded || isPeriodicTurn);
+      const unsavedNotice = shouldEmitUnsaved
+        ? formatUnsavedReminder({
+            editedFileCount: state.unsavedFiles.length,
+            committed: state.unsavedCommitted,
+          })
+        : '';
+
+      const stateAfterConsume = {
+        ...state,
+        completedNoticePending: false,
+        promptTurns: nextPromptTurns,
+        turnReads: 0,
+        turnReadNotified: false,
+        unsavedReminded: hasUnsaved ? (state.unsavedReminded || shouldEmitUnsaved) : false,
+        updatedAt: stamp,
+      };
+      const periodicNotice = isPeriodicTurn ? formatPeriodicReminder(stateAfterConsume) : '';
+
+      writeWorkSizeScopeState(
+        globalDir,
+        scope,
+        {
+          version: WORK_SIZE_STATE_VERSION,
+          scopeKind: scope.kind,
+          scopeId: scope.id,
+          updatedAt: stamp,
+          projects: { ...existingProjects, [cwdKey]: stateAfterConsume },
+        },
+        { now: nowDate },
+      );
+
+      return {
+        completedNotice,
+        unsavedNotice,
+        periodicNotice,
+        promptTurns: nextPromptTurns,
+        state: { version: WORK_SIZE_STATE_VERSION, scopeKind: scope.kind, scopeId: scope.id, ...stateAfterConsume },
+      };
+    },
+    lockOptions,
+  );
+
+  return lockedResult.locked ? lockedResult.value : empty;
+}
+
+/**
  * Consume and return the one-time L-completion notice (`WORK_SIZE_COMPLETED_NOTICE`) on the next
  * user prompt in the same project folder, or `''` if none is pending. Once consumed, the clean `S`
  * folder entry is removed during state write.
@@ -1596,6 +2507,7 @@ export function releaseWorkSizeForTab(
       size: 'S',
       changed: false,
       releasedFolders: [],
+      otherLFolders: [],
       state: null,
     };
   }
@@ -1620,6 +2532,7 @@ export function releaseWorkSizeForTab(
             size: 'S',
             changed: false,
             releasedFolders: [],
+            otherLFolders: [],
             state: null,
           };
         }
@@ -1646,6 +2559,7 @@ export function releaseWorkSizeForTab(
           size: 'S',
           changed: true,
           releasedFolders,
+          otherLFolders: [],
           state: null,
         };
       }
@@ -1653,6 +2567,12 @@ export function releaseWorkSizeForTab(
       const targetRoot = resolveWorkSizeProjectRoot({ cwd, scopeState: existingScope });
       const targetKey = projectPathKey(targetRoot);
       const existing = existingScope?.projects?.[targetKey] || null;
+      const otherLFolders = existingScope
+        ? Object.values(existingScope.projects)
+            .filter((entry) => entry.cwdKey !== targetKey && entry.size === 'L')
+            .map((entry) => entry.cwd)
+            .sort((a, b) => a.localeCompare(b))
+        : [];
       if (!existing) {
         return {
           terminalId: scope.id,
@@ -1663,6 +2583,7 @@ export function releaseWorkSizeForTab(
           size: 'S',
           changed: false,
           releasedFolders: [],
+          otherLFolders,
           state: null,
         };
       }
@@ -1689,6 +2610,7 @@ export function releaseWorkSizeForTab(
         size: 'S',
         changed: true,
         releasedFolders: [existing.cwd],
+        otherLFolders,
         state: null,
       };
     },
@@ -1702,9 +2624,9 @@ export function releaseWorkSizeForTab(
 }
 
 /**
- * User CLI operation: keep current size (`S` or `L`) and completion records, clearing only
- * cumulative per-file counts. Defaults to the current shell folder (or recorded containing folder);
- * `--all` resets every recorded folder in the tab.
+ * User CLI operation: keep current size (`S` or `L`) and completion records, clearing cumulative
+ * per-file counts and per-file failed-retry counts. Defaults to the current shell folder (or recorded
+ * containing folder); `--all` resets every recorded folder in the tab.
  */
 export function resetWorkSizeWindowForTab(
   terminalId,
@@ -1728,6 +2650,7 @@ export function resetWorkSizeWindowForTab(
       cwd: all ? null : targetRoot,
       size: 'S',
       clearedFiles: 0,
+      clearedFailures: 0,
       resetFolders: [],
       changed: false,
       state: null,
@@ -1745,23 +2668,33 @@ export function resetWorkSizeWindowForTab(
       if (all) {
         const entries = existingScope ? Object.values(existingScope.projects) : [];
         let clearedFiles = 0;
+        let clearedFailures = 0;
         const resetFolders = [];
         const nextProjects = {};
         let hasL = false;
 
         for (const entry of entries) {
           if (entry.size === 'L') hasL = true;
-          const count = Object.keys(entry.files).length;
-          if (count > 0) {
-            clearedFiles += count;
+          const fileCount = Object.keys(entry.files).length;
+          const failCount = Object.keys(entry.failedRetries).length;
+          const hasPendingShellEdits = entry.editedSinceShell.length > 0;
+          if (fileCount > 0 || failCount > 0 || hasPendingShellEdits) {
+            clearedFiles += fileCount;
+            clearedFailures += failCount;
             resetFolders.push(entry.cwd);
-            nextProjects[entry.cwdKey] = { ...entry, files: {}, updatedAt: stamp };
+            nextProjects[entry.cwdKey] = {
+              ...entry,
+              files: {},
+              failedRetries: {},
+              editedSinceShell: [],
+              updatedAt: stamp,
+            };
           } else {
             nextProjects[entry.cwdKey] = entry;
           }
         }
 
-        if (clearedFiles === 0) {
+        if (resetFolders.length === 0) {
           return {
             terminalId: scope.id,
             filePath,
@@ -1769,6 +2702,7 @@ export function resetWorkSizeWindowForTab(
             cwd: null,
             size: hasL ? 'L' : 'S',
             clearedFiles: 0,
+            clearedFailures: 0,
             resetFolders: [],
             changed: false,
             state: null,
@@ -1792,6 +2726,7 @@ export function resetWorkSizeWindowForTab(
           cwd: null,
           size: hasL ? 'L' : 'S',
           clearedFiles,
+          clearedFailures,
           resetFolders,
           changed: true,
           state: null,
@@ -1809,6 +2744,7 @@ export function resetWorkSizeWindowForTab(
           cwd: targetRoot,
           size: 'S',
           clearedFiles: 0,
+          clearedFailures: 0,
           resetFolders: [],
           changed: false,
           state: null,
@@ -1816,7 +2752,8 @@ export function resetWorkSizeWindowForTab(
       }
 
       const clearedFiles = Object.keys(existing.files).length;
-      if (clearedFiles === 0) {
+      const clearedFailures = Object.keys(existing.failedRetries).length;
+      if (clearedFiles === 0 && clearedFailures === 0 && existing.editedSinceShell.length === 0) {
         return {
           terminalId: scope.id,
           filePath,
@@ -1824,6 +2761,7 @@ export function resetWorkSizeWindowForTab(
           cwd: existing.cwd,
           size: existing.size,
           clearedFiles: 0,
+          clearedFailures: 0,
           resetFolders: [],
           changed: false,
           state: existing,
@@ -1833,6 +2771,8 @@ export function resetWorkSizeWindowForTab(
       const nextEntry = {
         ...existing,
         files: {},
+        failedRetries: {},
+        editedSinceShell: [],
         updatedAt: stamp,
       };
       writeWorkSizeScopeState(
@@ -1853,6 +2793,7 @@ export function resetWorkSizeWindowForTab(
         cwd: nextEntry.cwd,
         size: nextEntry.size,
         clearedFiles,
+        clearedFailures,
         resetFolders: [nextEntry.cwd],
         changed: true,
         state: isCleanEmptyFolderEntry(nextEntry) ? null : nextEntry,
@@ -1909,24 +2850,67 @@ const VERDICT_HEADING_ONLY_RE = new RegExp(
 
 const FENCE_RE = /^\s*(`{3,}|~{3,})/;
 
+// Rubric choice list separators (`ACCEPT | NEEDS_FIX`, `ACCEPT / NEEDS_FIX`, `ACCEPT or NEEDS_FIX`, `ACCEPT 또는 NEEDS_FIX`).
+// Comma `,` is NOT treated as a rubric separator so `Verdict: NEEDS_FIX, ACCEPT after fix` reads `NEEDS_FIX`.
+const RUBRIC_ALTERNATIVE_RE = /^\s*(?:\||\/|\bor\b|또는|혹은)\s*(?:\*\*|__|`)*\s*(?:ACCEPT|NEEDS_FIX)(?![A-Za-z0-9_])/iu;
+
+// Affirmative Korean declarative copula endings glued directly to the verdict (`판정: NEEDS_FIX입니다`, `ACCEPT임`, `ACCEPT다`).
+const AFFIRMATIVE_KOREAN_COPULA_RE = /^(?:입니다|임|이다|다|예요|이에요)(?=$|[\s.,!?;:()（）[\]—–\-/])/u;
+
+// Negation words directly following the verdict (`판정: ACCEPT 불가`, `ACCEPT 하지 않음`, `ACCEPT 할 수 없습니다`, `ACCEPT 어렵다`, `ACCEPT 아님`).
+const TRAILING_NEGATION_RE =
+  /^\s*(?:불가\S*|불충분\S*|하지\s*않\S*|할\s*수\s*없\S*|(?:하기\s*)?어렵\S*|어려움|아님|아닙니다|아니(?:다|며|라|고|므로)?(?=$|[\s.,!?;:()（）[\]—–\-/])|안\s*(?:됨|됩니다|된다|함|합니다|한다)(?=$|[\s.,!?;:()（）[\]—–\-/])|못\s*(?:함|합니다|한다|됨|됩니다)(?=$|[\s.,!?;:()（）[\]—–\-/])|(?:보류|거부|거절)(?:합니다|함|됨|다)?(?=$|[\s.,!?;:()（）[\]—–\-/])|\bis\s+not\b|\bcannot\b|\bcan\s+not\b|\bcan't\b|\bnot\b)/iu;
+
 function extractSingleVerdictToken(rawValue) {
   if (typeof rawValue !== 'string') return null;
   const trimmed = rawValue.trim();
   if (!trimmed) return null;
 
-  // Reject rubric/template lines that list both choices (e.g. "`ACCEPT` | `NEEDS_FIX`" or "`ACCEPT` 또는 `NEEDS_FIX`")
-  const hasAccept = /(?:^|[^A-Za-z0-9_])ACCEPT(?![A-Za-z0-9_])/.test(trimmed);
-  const hasNeedsFix = /(?:^|[^A-Za-z0-9_])NEEDS_FIX(?![A-Za-z0-9_])/.test(trimmed);
-  if (hasAccept && hasNeedsFix) return null;
+  // Strip leading list marker and markdown emphasis/code wrappers (`**`, `__`, `` ` ``).
+  // Leading negations (`not ACCEPT`) do not start with a verdict token and return `null`.
+  const withoutBullet = trimmed.replace(/^(?:[-*+]\s+)/, '');
+  const wrapperMatch = /^(?:\*\*|__|`)+/.exec(withoutBullet);
+  const unwrapped = withoutBullet.slice(wrapperMatch ? wrapperMatch[0].length : 0).trimStart();
 
-  // Strip leading list marker and markdown emphasis/code wrappers (`**`, `__`, `` ` ``)
-  const unwrapped = trimmed
-    .replace(/^(?:[-*+]\s+)/, '')
-    .replace(/^(?:\*\*|__|`)+/, '')
-    .trimStart();
-
+  // Reject ASCII word continuations (`ACCEPTED`, `ACCEPTABLE`, `ACCEPT_LATER`)
   const match = /^(ACCEPT|NEEDS_FIX)(?![A-Za-z0-9_])/.exec(unwrapped);
-  return match ? match[1] : null;
+  if (!match) return null;
+
+  const verdict = match[1];
+  let rest = unwrapped.slice(verdict.length);
+
+  if (wrapperMatch) {
+    const closingMatch = /^(?:\*\*|__|`)+/.exec(rest);
+    if (closingMatch) {
+      rest = rest.slice(closingMatch[0].length);
+    }
+  }
+
+  // When a Unicode letter/digit is glued immediately after the verdict (or its closing wrapper),
+  // accept affirmative Korean declarative copula endings (`입니다`, `임`, `이다`, `다`, `예요`, `이에요`)
+  // and reject glued negations (`ACCEPT하지 않음`) or non-final particles (`NEEDS_FIX이나 ...`).
+  if (/^[\p{L}\p{N}_]/u.test(rest)) {
+    const copulaMatch = AFFIRMATIVE_KOREAN_COPULA_RE.exec(rest);
+    if (!copulaMatch) return null;
+    rest = rest.slice(copulaMatch[0].length);
+  }
+
+  rest = rest.replace(/^(?:\*\*|__|`)+/, '');
+
+  if (TRAILING_NEGATION_RE.test(rest)) return null;
+  if (/^\s*[(（]\s*(?:불가\S*|불충분\S*|아님|아닙니다|아니다|안\s*됨|안됨|안\s*함|안함|못\s*함|못함|보류|거부|거절|하지\s*않\S*|할\s*수\s*없\S*|(?:하기\s*)?어렵\S*|어려움)\s*[)）]/u.test(rest)) return null;
+
+  // Strip optional short parenthetical tag that does not mention a verdict (`(Clean Evaluation)`, `（조건부）`)
+  // and closing markdown wrappers, then reject rubric choice lists (`ACCEPT | NEEDS_FIX`, `ACCEPT 또는 NEEDS_FIX`)
+  // while keeping commentary that mentions the other verdict (`NEEDS_FIX (ACCEPT 불가)`, `NEEDS_FIX, ACCEPT after fix`).
+  const tagMatch = /^\s*(?:\([^()\r\n]*\)|（[^（）\r\n]*）)/.exec(rest);
+  if (tagMatch && !/(?:^|[^A-Za-z0-9_])(?:ACCEPT|NEEDS_FIX)(?![A-Za-z0-9_])/.test(tagMatch[0])) {
+    rest = rest.slice(tagMatch[0].length);
+  }
+  rest = rest.replace(/^\s*(?:\*\*|__|`)+/, '');
+  if (RUBRIC_ALTERNATIVE_RE.test(rest)) return null;
+
+  return verdict;
 }
 
 /**
@@ -2034,239 +3018,23 @@ const GIT_COMMIT_NON_CLEARING_FLAGS = new Set([
   '--help',
 ]);
 
-function skipCommandSubstitution(command, startIndex) {
-  // Assumes `command.slice(startIndex, startIndex + 2) === '$('`
-  let depth = 1;
-  let quote = '';
-  let i = startIndex + 2;
-  while (i < command.length && depth > 0) {
-    const ch = command[i];
-    if (quote === '\'') {
-      if (ch === '\'') quote = '';
-      i++;
-      continue;
-    }
-    if (quote === '"') {
-      if (ch === '\\' && i + 1 < command.length) {
-        i += 2;
-        continue;
-      }
-      if (ch === '$' && command[i + 1] === '(') {
-        depth++;
-        i += 2;
-        continue;
-      }
-      if (ch === '"') quote = '';
-      i++;
-      continue;
-    }
-    if (ch === '\'' || ch === '"') {
-      quote = ch;
-      i++;
-      continue;
-    }
-    if (ch === '(') depth++;
-    else if (ch === ')') depth--;
-    i++;
-  }
-  return i;
-}
-
-/**
- * Split a shell command into top-level command segments (`[{ text, quoted }, ...]`), keeping quoted
- * arguments (including `"$(cat <<'EOF' ... EOF)"` commit messages) intact as single tokens and skipping
- * comments and unquoted heredoc bodies.
- */
-function tokenizeShellSegments(command) {
-  const segments = [];
-  let words = [];
-  let text = '';
-  let hasToken = false;
-  let wasQuoted = false;
-  let quote = '';
-  const pendingHeredocs = [];
-
-  const flushWord = () => {
-    if (hasToken) words.push({ text, quoted: wasQuoted });
-    text = '';
-    hasToken = false;
-    wasQuoted = false;
-  };
-  const flushSegment = () => {
-    flushWord();
-    if (words.length > 0) segments.push(words);
-    words = [];
-  };
-
-  let i = 0;
-  while (i < command.length) {
-    const ch = command[i];
-
-    if (quote === '\'') {
-      if (ch === '\'') quote = '';
-      else text += ch;
-      i++;
-      continue;
-    }
-
-    if (quote === '"') {
-      if (ch === '\\' && i + 1 < command.length && (command[i + 1] === '"' || command[i + 1] === '\\' || command[i + 1] === '$')) {
-        text += command[i + 1];
-        i += 2;
-        continue;
-      }
-      if (ch === '$' && command[i + 1] === '(') {
-        const end = skipCommandSubstitution(command, i);
-        text += command.slice(i, end);
-        i = end;
-        continue;
-      }
-      if (ch === '"') {
-        quote = '';
-      } else {
-        text += ch;
-      }
-      i++;
-      continue;
-    }
-
-    // Unquoted heredoc operator `<<` or `<<-` (not `<<<` here-string)
-    if (ch === '<' && command[i + 1] === '<' && command[i + 2] !== '<') {
-      flushWord();
-      i += 2;
-      let stripTabs = false;
-      if (command[i] === '-') {
-        stripTabs = true;
-        i++;
-      }
-      while (i < command.length && (command[i] === ' ' || command[i] === '\t')) i++;
-      let delim = '';
-      let delimQuote = '';
-      while (i < command.length) {
-        const dc = command[i];
-        if (delimQuote) {
-          if (dc === delimQuote) delimQuote = '';
-          else delim += dc;
-          i++;
-          continue;
-        }
-        if (dc === '\'' || dc === '"') {
-          delimQuote = dc;
-          i++;
-          continue;
-        }
-        if (/[\s;|&<>()\r\n]/.test(dc)) break;
-        if (dc === '\\' && i + 1 < command.length) {
-          delim += command[i + 1];
-          i += 2;
-          continue;
-        }
-        delim += dc;
-        i++;
-      }
-      if (delim) pendingHeredocs.push({ delim, stripTabs });
-      continue;
-    }
-
-    if (ch === '\'' || ch === '"') {
-      quote = ch;
-      hasToken = true;
-      wasQuoted = true;
-      i++;
-      continue;
-    }
-
-    if (ch === ' ' || ch === '\t') {
-      flushWord();
-      i++;
-      continue;
-    }
-
-    if (ch === '#' && !hasToken) {
-      while (i < command.length && command[i] !== '\n') i++;
-      continue;
-    }
-
-    if (ch === '\n' || ch === '\r') {
-      flushSegment();
-      if (ch === '\r' && command[i + 1] === '\n') i += 2;
-      else i++;
-      // Skip heredoc bodies queued on the line that just ended
-      while (pendingHeredocs.length > 0 && i < command.length) {
-        const { delim, stripTabs } = pendingHeredocs.shift();
-        while (i < command.length) {
-          const lineEnd = command.indexOf('\n', i);
-          const rawLine = (lineEnd === -1 ? command.slice(i) : command.slice(i, lineEnd)).replace(/\r$/, '');
-          i = lineEnd === -1 ? command.length : lineEnd + 1;
-          const candidate = stripTabs ? rawLine.replace(/^\t+/, '') : rawLine;
-          if (candidate === delim) break;
-        }
-      }
-      continue;
-    }
-
-    if (ch === ';' || ch === '|' || ch === '&' || ch === '(' || ch === ')' || ch === '{' || ch === '}') {
-      flushSegment();
-      i++;
-      continue;
-    }
-
-    if (ch === '\\' && i + 1 < command.length && (command[i + 1] === '\n' || command[i + 1] === '\r')) {
-      // Line continuation
-      i += command[i + 1] === '\r' && command[i + 2] === '\n' ? 3 : 2;
-      continue;
-    }
-
-    text += ch;
-    hasToken = true;
-    i++;
-  }
-
-  flushSegment();
-  return segments;
-}
-
-function executableBaseName(word) {
-  const cut = Math.max(word.lastIndexOf('/'), word.lastIndexOf('\\'));
-  return word.slice(cut + 1).toLowerCase();
-}
-
-function inspectGitCommitSegment(words, baseCwd) {
+function inspectGitCommitArgs(args, baseCwd) {
   let idx = 0;
-  // Skip PowerShell call operator `&` or leading POSIX `KEY=VALUE` assignments
-  while (idx < words.length) {
-    const token = words[idx];
-    if (!token.quoted && token.text === '&') {
-      idx++;
-      continue;
-    }
-    if (!token.quoted && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text)) {
-      idx++;
-      continue;
-    }
-    break;
-  }
-  if (idx >= words.length) return { isCommit: false, targetDir: '' };
-
-  const bin = executableBaseName(words[idx].text);
-  if (bin !== 'git' && bin !== 'git.exe') return { isCommit: false, targetDir: '' };
-  idx++;
-
   let effectiveDir = baseCwd;
   let invalidDirOption = false;
 
   // Walk global git options before the subcommand
   let subcommand = '';
-  while (idx < words.length) {
-    const arg = words[idx].text;
+  while (idx < args.length) {
+    const arg = args[idx].text;
     if (arg === '--') return { isCommit: false, targetDir: '' };
     if (arg === '-h' || arg === '--help' || arg === '--version') return { isCommit: false, targetDir: '' };
     if (arg === '-C') {
-      if (idx + 1 >= words.length || !words[idx + 1].text.trim() || words[idx + 1].text.includes('\0')) {
+      if (idx + 1 >= args.length || !args[idx + 1].text.trim() || args[idx + 1].text.includes('\0')) {
         return { isCommit: false, targetDir: '' };
       }
       if (effectiveDir) {
-        effectiveDir = path.resolve(effectiveDir, words[idx + 1].text.trim());
+        effectiveDir = path.resolve(effectiveDir, args[idx + 1].text.trim());
       }
       idx += 2;
       continue;
@@ -2297,8 +3065,8 @@ function inspectGitCommitSegment(words, baseCwd) {
   if (invalidDirOption || subcommand !== 'commit') return { isCommit: false, targetDir: '' };
 
   // Inspect `git commit` options (ignoring option values like `-m "--dry-run"` or `-m "--allow-empty"`)
-  while (idx < words.length) {
-    const token = words[idx];
+  while (idx < args.length) {
+    const token = args[idx];
     const arg = token.text;
     if (!token.quoted && arg === '--') break;
     if (
@@ -2317,14 +3085,51 @@ function inspectGitCommitSegment(words, baseCwd) {
   return { isCommit: true, targetDir: effectiveDir };
 }
 
+const MAX_COMMIT_SUBSTITUTION_DEPTH = 4;
+
+function commandRunsGitCommitInShell(
+  command,
+  { baseCwd, rootDir, hasProjectBound, shellKind, depth = 0 },
+) {
+  if (depth > MAX_COMMIT_SUBSTITUTION_DEPTH || typeof command !== 'string' || !command.trim()) {
+    return false;
+  }
+  for (const words of tokenizeShellSegments(command, { shell: shellKind })) {
+    for (let i = 0; i < words.length; i++) {
+      if (!isCandidateCommandWord(words, i)) continue;
+      const bin = executableBaseName(words[i].text);
+      if (bin !== 'git' && bin !== 'git.exe') continue;
+      const info = inspectGitCommitArgs(words.slice(i + 1), baseCwd);
+      if (info.isCommit && (!hasProjectBound || isSameOrSubpath(info.targetDir, rootDir))) {
+        return true;
+      }
+    }
+    for (const nested of extractNestedShellCommands(words, shellKind)) {
+      if (
+        commandRunsGitCommitInShell(nested.command, {
+          baseCwd,
+          rootDir,
+          hasProjectBound,
+          shellKind: nested.shell,
+          depth: depth + 1,
+        })
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /**
- * True when `command` executes a real `git commit` (excluding `--dry-run`, `--allow-empty`, `--short`,
+ * True when `command` executes a real `git commit` (including inside `$(...)`, backtick command
+ * substitutions, and nested shells, while excluding `--dry-run`, `--allow-empty`, `--short`,
  * `--porcelain`, `--long`, `--help`, and quoted strings). When `projectRoot` is given, also verifies
  * that the commit's target folder (`git -C <dir>` if present, otherwise `cwd`) lies inside `projectRoot`.
  */
-export function commandRunsGitCommit(command, { cwd, projectRoot } = {}) {
+export function commandRunsGitCommit(command, { cwd, projectRoot, shell = '' } = {}) {
   if (typeof command !== 'string' || !command.trim()) return false;
-  if (!/\bcommit\b/i.test(command)) return false;
+  if (!/\bcommit\b/i.test(command) && !/['"\\`^]/.test(command)) return false;
 
   const hasProjectBound = typeof projectRoot === 'string' && projectRoot.trim().length > 0;
   const baseCwd = hasProjectBound
@@ -2332,11 +3137,27 @@ export function commandRunsGitCommit(command, { cwd, projectRoot } = {}) {
     : '';
   const rootDir = hasProjectBound ? resolveProjectRoot(path.resolve(projectRoot.trim())) : '';
 
-  const segments = tokenizeShellSegments(command);
-  return segments.some((words) => {
-    const info = inspectGitCommitSegment(words, baseCwd);
-    if (!info.isCommit) return false;
-    if (!hasProjectBound) return true;
-    return isSameOrSubpath(info.targetDir, rootDir);
-  });
+  const shellKind = normalizeShellKind(shell);
+  const primaryShell = !shellKind && /[A-Za-z]:\\/.test(command) ? 'powershell' : shellKind;
+  if (
+    commandRunsGitCommitInShell(command, {
+      baseCwd,
+      rootDir,
+      hasProjectBound,
+      shellKind: primaryShell,
+      depth: 0,
+    })
+  ) {
+    return true;
+  }
+  if (!shellKind && primaryShell !== 'powershell' && /[`\u2018\u2019\u201a\u201b\u201c\u201d\u201e]/.test(command)) {
+    return commandRunsGitCommitInShell(command, {
+      baseCwd,
+      rootDir,
+      hasProjectBound,
+      shellKind: 'powershell',
+      depth: 0,
+    });
+  }
+  return false;
 }

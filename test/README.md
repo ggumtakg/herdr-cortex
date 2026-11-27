@@ -1,4 +1,4 @@
-# `test/` — 자동화 테스트 스위트 (21개 파일 · 210개 테스트)
+# `test/` — 자동화 테스트 스위트 (21개 파일 · 219개 테스트)
 
 > [← 루트 README](../README.md)
 
@@ -11,7 +11,7 @@
 `package.json`의 `engines`는 Node.js `>=22.13.0`을 요구합니다. 벡터 관련 테스트가 `sqlite-vec` 패키지를 쓰므로 먼저 저장소 루트에서 `npm install`을 실행합니다.
 
 ```powershell
-# 전체 스위트 (21개 파일, 210개 테스트)
+# 전체 스위트 (21개 파일, 219개 테스트)
 npm test
 
 # npm test 가 실제로 실행하는 명령 (package.json 의 scripts.test)
@@ -28,7 +28,7 @@ node --no-warnings --import ./test/support/isolate-home.mjs --test test/store-an
 `package.json`에는 테스트 말고 세 개의 스크립트가 더 있습니다.
 
 ```powershell
-npm test               # 자동 테스트 전체 (21개 파일, 210개)
+npm test               # 자동 테스트 전체 (21개 파일, 219개)
 npm run embed          # 임베딩을 기다리는 문서를 한꺼번에 처리
 npm run mcp            # MCP 서버를 직접 실행
 npm run trust -- list  # cortex-trust와 같은 명령 (프로필 없이)
@@ -106,8 +106,8 @@ npm run trust -- list  # cortex-trust와 같은 명령 (프로필 없이)
 | **`trust-confirm.test.mjs`** | 11 | 1 | **확인 절차(3)**: 대화상자의 Yes만 확인으로 인정하고 대화상자가 없으면 터미널에서 `yes` 전체를 입력해야 하며 둘 다 없으면 아무에게도 묻지 않음, 대화상자 스크립트(제목 `herdr-cortex`, 기본 버튼 No, 맨 위 표시, 경로는 스크립트 문자열이 아니라 stdin 데이터로 전달), 실제 Windows PowerShell을 거친 왕복(조건부).<br>**`cortex-trust approve`(2)**: 실제 폴더 경로만 묻고 확인된 yes에만 승인하며 질문을 건너뛰는 스위치가 없음, 자식 프로세스에서 status·list·revoke는 동작하고 approve·acknowledge는 대화상자도 터미널도 없으면 종료 코드 2로 거부.<br>**대화상자 없이 바뀐 승인(4)**: 확인 목록은 사람이 본 폴더만 기록하고 직접 편집은 acknowledge나 되돌리기 전까지 계속 보고, Claude 훅이 다음 프롬프트에서 세션과 변경마다 한 번 사용자(`systemMessage`)와 모델 양쪽에 알림, PreToolUse가 확인 목록 파일도 승인 파일처럼 보호, Antigravity 훅과 `cortex-status`도 같은 내용을 보고.<br>**사용자용 알림(1)**: SessionStart가 미승인·미색인·대화 미복원을 `systemMessage` 줄로도 내보내고 일상 출력은 내보내지 않음.<br>**`/clear`(1)**: SessionStart가 아직 없는 clear 기록을 100ms 간격으로 최대 2초 기다림. |
 | **`worker-role.test.mjs`** | 4 | 0 | **`HERDR_CORTEX_ROLE=worker`**: 공백·대소문자 무시 판정, Claude·Antigravity 훅에서 부모 탭 세션·받은편지함·`/clear` 기록·1회 미승인 안내 보존 및 `HEAD_CORE`·최근 대화 제외, MCP 서버의 쓰기 도구 `SUBAGENT_WRITE_DENIED` 차단과 읽기 도구 허용. |
 | **`cortex-worker.test.mjs`** | 7 | 2 | **`scripts/cortex-worker.mjs` 및 PowerShell `cortex-worker`**: `.ps1`·`.cmd`·`.exe` 실행 파일 해석과 인자 보존, 환경 격리(`HERDR_CORTEX_ROLE=worker`, `HC_TERMINAL_ID` 제거), 임시 권한 파일 정리, `--out` UTF-8 저장, 시간 초과 시 프로세스 트리 종료, 무출력 감지, 인자 검증. |
-| **`work-size.test.mjs`** | 9 | 1 | **작업 규모(S/L) 훅과 `cortex-work`**: 편집 한도 경계(1파일, 1,000자 vs 1,001자, 도구별 글자 합산, 막힌 편집 제외, 프로젝트 밖·`.memory/` 제외), 하위 폴더 `cwd`에서도 `L` 유지·상위 파일 합산(`CLAUDE_PROJECT_DIR` 유무 모두)과 다른 프로젝트 편집 시 기존 폴더 `L` 보존·v1 상태 파일 호환·깨진 파일 복구·I/O 실패 통과, 30일 지난 `session-*.json` 및 빈 `S` 폴더 항목 정리(안내 대기 항목은 내보낸 뒤 정리), 워커·서브에이전트·제외 프로젝트·`workSize.enabled: false`·설정 검증, `git commit` 참·거짓 판정(`--allow-empty`·프로젝트 밖 `-C`·프로젝트 밖 `cwd` 제외)과 누적 초기화, 검수 판정(`ACCEPT`/`NEEDS_FIX`, `최종 판정`·`Final verdict`·목록 항목 꼴 포함) 파싱·오인 방지·L 종료·세션 시작/종료 안내·`cortex-worker --role reviewer`, `cortex-work` 폴더별 및 `--all` 동작과 상태 폴더·`cortex-work` 셸 호출 보호(`ask`/`deny`/읽기 전용 통과), 동시 훅 프로세스 실행 무유실·오래된 잠금 교체·잠금 불가 시 통과, 설치기 등록·교체·제거. |
-| **합계** | **210** | **14** | |
+| **`work-size.test.mjs`** | 18 | 1 | **작업 규모(S/L)·리마인더·명령 확인·의존 안내 훅과 `cortex-work`**: 편집 한도 경계(1파일, 1,000자 vs 1,001자, 도구별 글자 합산, 막힌 편집 제외, 프로젝트 밖·`.memory/` 제외), 하위 폴더 `cwd`에서도 `L` 유지·상위 파일 합산(`CLAUDE_PROJECT_DIR` 유무 모두)과 다른 프로젝트 편집 시 기존 폴더 `L` 보존·v1 상태 파일 호환·깨진 파일 복구·I/O 실패 통과, 30일 지난 `session-*.json` 및 빈 `S` 폴더 항목 정리, 워커·서브에이전트·제외 프로젝트·`workSize.enabled: false`·설정 검증, 셸 종류별(`Bash`/`PowerShell`/`cmd`) 따옴표·`$'…'`·백슬래시·백틱·PowerShell 둥근 따옴표와 엔대시/엠대시·닫는 줄이 확인된 히어독·`<<<` 여기-문자열·치환·중첩 셸(`eval`/`iex`/`cmd /c"…"`)·닫히지 않은 인용 비삼킴 처리, 조각 내 어느 자리의 방아쇠 낱말이든 검사하되 비파괴 `git`·비실행 패키지 관리자·`grep`/`Select-String` 뒤 인자 자리 낱말 제외와 `npx`/`dlx`/`exec` 유지 및 5겹 이상 중첩·작업량 상한 초과 시 차단(`powershell -EncodedCommand` 포함), `git commit`(조각 내 비선두·치환·중첩 셸 포함) 참·거짓 판정과 누적 초기화, 검수 판정(`ACCEPT`/`NEEDS_FIX`, 서술 어미·부정 표현·낱말 경계·주석 병기·루브릭 제외 포함) 파싱·L 종료·`cortex-worker --role reviewer`, 미저장 리마인더(1회+주기 동반)·주기 리마인더·세션 시작 카운터 초기화, 읽기 26번째 안내와 `0`일 때 무입출력, `PostToolUseFailure` 수정 실패 반복 차단(읽기 전용 명령 실패·성공 제외 포함)과 초기화(성공·커밋·저장·`reset`·사용자 중단 제외), 되돌리기 어려운 셸 명령 확인(주 대화 `ask`, 워커·서브에이전트 `deny`, `git rebase` 진행 중 플래그·`+refspec`·`npm`/`pnpm`/`yarn publish`·`xargs`/`find`/`rimraf`·`cmd /c`·`cmd //c` `rmdir /s`·셸별 임시 폴더 변수 `${env:TEMP}` 예외, 사용자 정규식 `node:vm` 시간 상한, 우선순위), 계약 파일 glob 차단과 기억 그래프 의존 안내(승인 폴더 읽기 전용 조회·잠금 시 빠른 생략·Windows 대소문자 무시·200ms 상한), `cortex-work` 폴더별·`--all` 안내·직접 실행 무경고와 상태 폴더·`cortex-work` 셸 호출 보호(보수적 기본값 + 비실행 파일 인자·`status`/`--help` 예외), 동시 훅 프로세스 무유실, 설치기 `PostToolUseFailure`·읽기 매처 등록·교체·제거. |
+| **합계** | **219** | **14** | |
 
 `{ skip: ... }` 옵션 없이 테스트 본문 안에서 `process.platform === 'win32'`일 때만 실행하는 단언도 여러 파일에 있습니다(대소문자만 다른 경로 표기, `.memory.` 같은 Windows 전용 경로 표기, `cmd.exe`·PowerShell로 훅 명령 실행, 잠긴 DB 파일 삭제). 이런 테스트는 다른 운영체제에서 건너뛰지 않고 그 단언만 빼고 실행됩니다.
 

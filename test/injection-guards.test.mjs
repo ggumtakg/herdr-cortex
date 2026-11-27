@@ -812,7 +812,13 @@ test('PreToolUse: a subagent may not edit .memory/ with file tools or mention it
       for (const command of touching) {
         assert.equal(commandReferencesMemoryDir(command), true, command);
         expectDenied(run(tool, { command }), `${tool}: ${command}`);
-        assert.deepEqual(run(tool, { command }, {}), {}, `${tool} main conversation: ${command}`);
+        const mainOut = run(tool, { command }, {});
+        if (command.startsWith('rm -rf ')) {
+          // Recursive delete triggers the irreversible-command confirmation (ask) in main conversation, never subagent .memory/ deny
+          assert.equal(mainOut.hookSpecificOutput?.permissionDecision, 'ask', `${tool} main conversation asks on rm -rf: ${command}`);
+        } else {
+          assert.deepEqual(mainOut, {}, `${tool} main conversation: ${command}`);
+        }
       }
       for (const command of harmless) {
         assert.equal(commandReferencesMemoryDir(command), false, command);
@@ -910,15 +916,18 @@ test('installer: the PreToolUse hook is registered once, for this server\'s tool
     // The matcher, read as Claude Code reads it (a regular expression on the tool name), covers every tool the
     // hook acts on. The server is registered as herdr-cortex only, so the old `cortex` prefix is not matched
     // any more (the hook code itself still recognizes both prefixes, see the test above).
-    assert.equal(CLAUDE_PRE_TOOL_USE_MATCHER, 'mcp__herdr-cortex__.*|Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell');
+    assert.equal(
+      CLAUDE_PRE_TOOL_USE_MATCHER,
+      'mcp__herdr-cortex__.*|Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|Read|Grep|Glob',
+    );
     const matcher = new RegExp(`^(?:${CLAUDE_PRE_TOOL_USE_MATCHER})$`);
     for (const name of [
       'mcp__herdr-cortex__memory_save', 'mcp__herdr-cortex__relay_inbox',
-      'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell',
+      'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell', 'Read', 'Grep', 'Glob',
     ]) {
       assert.equal(matcher.test(name), true, name);
     }
-    for (const name of ['Read', 'Grep', 'Glob', 'mcp__other__memory_save', 'mcp__cortex__memory_save']) {
+    for (const name of ['TodoWrite', 'WebFetch', 'mcp__other__memory_save', 'mcp__cortex__memory_save']) {
       assert.equal(matcher.test(name), false, name);
     }
 
