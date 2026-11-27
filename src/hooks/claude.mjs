@@ -17,6 +17,7 @@ import {
   resolveProjectRoot,
 } from '../core/config.mjs';
 import { HOOK_MAX_CHARS, fitOverviewToBudget, resolveHookBudget, sanitizeInline } from '../core/budget.mjs';
+import { isWorkerSession } from '../core/role.mjs';
 import {
   APPROVAL_STATE_FILE_NAMES,
   formatProjectNotApprovedNotice,
@@ -500,12 +501,13 @@ function findClearedSession({ globalDir, projectDir, terminalId, newSessionId, c
 export function handleClaudeSessionEnd(
   payload = {},
   {
-    terminalId = process.env.HC_TERMINAL_ID,
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
     globalDir,
     now = Date.now,
   } = {},
 ) {
-  if (isSubagentPayload(payload)) return {};
+  if (isSubagentPayload(payload) || isWorkerSession({ env })) return {};
   if (String(payload.reason || '').trim().toLowerCase() !== 'clear') return {};
 
   const sessionId = extractSessionId(payload);
@@ -608,7 +610,8 @@ export function handleClaudeSessionStart(
   payload = {},
   {
     part = 'all',
-    terminalId = process.env.HC_TERMINAL_ID,
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
     globalDir,
     legacyHome,
     promptsDir = path.join(REPO_ROOT, 'prompts'),
@@ -625,14 +628,15 @@ export function handleClaudeSessionStart(
     return {};
   }
 
+  const worker = isWorkerSession({ env });
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   const maxChars = resolveHookBudget(config);
   const source = String(payload.source || '').trim().toLowerCase();
 
-  // Record revive session once (skip on legacy split part="core" to avoid parallel race)
-  const sessionRec = part !== 'core'
+  // Record revive session once (skip on worker sessions and legacy split part="core")
+  const sessionRec = !worker && part !== 'core'
     ? recordSession({
         terminalId,
         agent: 'claude',
@@ -677,23 +681,25 @@ export function handleClaudeSessionStart(
     used += sep + text.trim().length;
   };
 
-  // 1. HEAD_CORE.md (in 'all' or 'core'); on resume/fork, skip only when SessionStart already injected it
+  // 1. HEAD_CORE.md (in 'all' or 'core'); skipped in worker sessions, and on resume/fork when already injected
   if (part === 'all' || part === 'core') {
-    const headCore = readHeadCore(promptsDir, config);
-    if (headCore) {
-      const marker = extractHeadCoreMarker(headCore);
-      const transcriptPath = payload.transcript_path || payload.transcriptPath;
-      const skipDuplicateHeadCore = (source === 'resume' || source === 'fork')
-        && Boolean(marker)
-        && hasClaudeSessionStartMarker(
-          transcriptPath,
-          marker,
-          turnOptions && typeof turnOptions === 'object' ? turnOptions : undefined,
-        );
-      if (!skipDuplicateHeadCore) {
-        const noticeReserve = (notApprovedNotice ? notApprovedNotice.length + 2 : 0)
-          + (approvalsContext ? approvalsContext.length + 2 : 0);
-        pushSection(trimLinesToBudget(headCore, maxChars - noticeReserve));
+    if (!worker) {
+      const headCore = readHeadCore(promptsDir, config);
+      if (headCore) {
+        const marker = extractHeadCoreMarker(headCore);
+        const transcriptPath = payload.transcript_path || payload.transcriptPath;
+        const skipDuplicateHeadCore = (source === 'resume' || source === 'fork')
+          && Boolean(marker)
+          && hasClaudeSessionStartMarker(
+            transcriptPath,
+            marker,
+            turnOptions && typeof turnOptions === 'object' ? turnOptions : undefined,
+          );
+        if (!skipDuplicateHeadCore) {
+          const noticeReserve = (notApprovedNotice ? notApprovedNotice.length + 2 : 0)
+            + (approvalsContext ? approvalsContext.length + 2 : 0);
+          pushSection(trimLinesToBudget(headCore, maxChars - noticeReserve));
+        }
       }
     }
     if (part === 'core') {
@@ -720,7 +726,7 @@ export function handleClaudeSessionStart(
     if (text && used + sepCost(0) + text.length <= maxChars) pushSection(text);
   };
 
-  const wantsRecentTurns = (source === 'compact' || source === 'clear') && Boolean(payload.transcript_path || payload.transcriptPath);
+  const wantsRecentTurns = !worker && (source === 'compact' || source === 'clear') && Boolean(payload.transcript_path || payload.transcriptPath);
 
   // The index is synced under a time budget: documents that do not fit are left to the MCP server and
   // named in a short notice, everything else is injected as usual.
@@ -739,7 +745,7 @@ export function handleClaudeSessionStart(
   // 2. Budget-first relay inbox delivery. The inbox belongs to the terminal and lives in the global store,
   // so it is delivered whether or not the current project is approved (an excluded project returned above).
   // Only messages injected in full are acknowledged; one that is too long for any hook block is announced once.
-  if (isValidTerminalId(terminalId)) {
+  if (!worker && isValidTerminalId(terminalId)) {
     const remaining = maxChars - used - sepCost(0);
     if (remaining >= 120) {
       try {
@@ -921,7 +927,8 @@ export function handleClaudePreCompact(payload = {}, { globalDir } = {}) {
 export function handleClaudeUserPrompt(
   payload = {},
   {
-    terminalId = process.env.HC_TERMINAL_ID,
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
     globalDir,
   } = {},
 ) {
@@ -929,6 +936,7 @@ export function handleClaudeUserPrompt(
     return {};
   }
 
+  const worker = isWorkerSession({ env });
   const projectDir = extractCwd(payload, process.cwd());
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
@@ -943,7 +951,7 @@ export function handleClaudeUserPrompt(
   });
   const contextParts = approvalsNotice ? [approvalsNotice.contextText] : [];
 
-  if (isValidTerminalId(terminalId)) {
+  if (!worker && isValidTerminalId(terminalId)) {
     const inboxBudget = approvalsNotice ? maxChars - approvalsNotice.contextText.length - 2 : maxChars;
     if (inboxBudget >= 120 || !approvalsNotice) {
       // One consumer at a time: when another process is delivering this terminal's messages right now,

@@ -82,7 +82,7 @@ npm run mcp        # node --no-warnings src/mcp/server.mjs
 | `--global <폴더>` | 전역 저장소 폴더 | 환경변수 `HERDR_CORTEX_HOME` → `<HERDR_CORTEX_TEST_HOME>/.herdr-cortex`(`HERDR_REVIVE_TEST_HOME`도 같은 뜻) → `<사용자 홈>/.herdr-cortex` 순서 |
 | `--prompts <폴더>` | `cortex_prompt`가 읽는 프롬프트 폴더 | 저장소의 `prompts/` |
 
-값이 따라오지 않는 옵션과 모르는 옵션은 무시합니다. 서버 프로세스가 읽는 환경변수는 위 표의 것 외에 두 가지가 더 있습니다. `HC_TERMINAL_ID`는 릴레이 도구가 "지금 이 탭"을 아는 데 쓰고, `PATH`는 Herdr 명령줄 도구 `hc`를 찾는 데 씁니다(둘 다 [`src/relay/`](../relay/README.md)). 임베딩 프로바이더가 읽는 환경변수는 [`src/embeddings/`](../embeddings/README.md)에 있습니다.
+값이 따라오지 않는 옵션과 모르는 옵션은 무시합니다. 서버 프로세스가 읽는 환경변수는 위 표의 것 외에 세 가지가 더 있습니다. `HERDR_CORTEX_ROLE`이 `worker`(앞뒤 공백·대소문자 무시)이면 위임 워커 세션으로 보고 쓰기 도구를 거부합니다(`src/core/role.mjs`의 `isWorkerSession`). `HC_TERMINAL_ID`는 릴레이 도구가 "지금 이 탭"을 아는 데 쓰고, `PATH`는 Herdr 명령줄 도구 `hc`를 찾는 데 씁니다(둘 다 [`src/relay/`](../relay/README.md)). 임베딩 프로바이더가 읽는 환경변수는 [`src/embeddings/`](../embeddings/README.md)에 있습니다.
 
 서버 파일이 Node가 시작한 스크립트인지는 실제 경로끼리 비교해 판정하므로, 정션이나 심볼릭 링크를 거친 경로로 실행해도 서버가 시작됩니다.
 
@@ -131,7 +131,7 @@ npm run mcp        # node --no-warnings src/mcp/server.mjs
 레지스트리(`createToolRegistry`)는 도구를 호출할 때 다음 순서로 검사합니다.
 
 1. 등록되지 않은 이름이면 `UNKNOWN_TOOL`.
-2. 쓰기 도구(`memory_save`, `memory_update`, `relay_send`)를 서브에이전트가 호출했으면 `SUBAGENT_WRITE_DENIED`([서브에이전트 판정](#서브에이전트-판정-issubagentcaller) 참고).
+2. 쓰기 도구(`memory_save`, `memory_update`, `relay_send`)를 서브에이전트가 호출했거나 서버 프로세스가 워커 세션(`HERDR_CORTEX_ROLE=worker`)이면 `SUBAGENT_WRITE_DENIED`([서브에이전트 판정](#서브에이전트-판정-issubagentcaller) 참고). `relay_inbox(action="ack")`도 핸들러에서 같은 조건으로 거부합니다.
 3. 입력 스키마에 없는 인자가 하나라도 있으면 `UNKNOWN_ARGUMENT`.
 4. 도구 핸들러 실행. 핸들러가 던진 예외는 오류 결과로 바꿉니다.
 
@@ -339,7 +339,7 @@ Project folder "<폴더>" is not approved for herdr-cortex, so its .memory/ is n
 | 코드 | 언제 |
 | :--- | :--- |
 | `UNKNOWN_TOOL` | 등록되지 않은 도구 이름 |
-| `SUBAGENT_WRITE_DENIED` | 서브에이전트로 판정된 호출이 `memory_save`, `memory_update`, `relay_send`, `relay_inbox(action="ack")`를 부름 |
+| `SUBAGENT_WRITE_DENIED` | 서브에이전트로 판정된 호출이나 워커 세션(`HERDR_CORTEX_ROLE=worker`)의 서버에서 `memory_save`, `memory_update`, `relay_send`, `relay_inbox(action="ack")`를 부름 |
 | `UNKNOWN_ARGUMENT` | 입력 스키마에 없는 인자(내부 인자 `_caller_agent_id` 제외). `unknown_arguments`와 `allowed_arguments`가 함께 옵니다 |
 | `PROJECT_EXCLUDED` | 제외된 프로젝트의 프로젝트 기억을 읽거나 쓰려 함(`memory_read`의 `scope: "project"`, `memory_save`·`memory_update`의 `global`이 아닌 `scope`) |
 | `PROJECT_NOT_APPROVED` | 같은 조건에서 폴더가 제외는 아니지만 승인되지 않음. 저장소가 미승인 폴더의 프로젝트 기억을 여는 것을 거부했을 때도 같은 코드입니다 |

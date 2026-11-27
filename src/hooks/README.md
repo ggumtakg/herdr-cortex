@@ -78,6 +78,7 @@ Antigravity가 감지된 경우에만 `~/.gemini/config/hooks.json`의 `herdr-co
   ```
 * **실패해도 호스트를 막지 않음**: 두 진입점은 오류를 모두 삼키고 종료 코드 0으로 끝납니다. 훅이 실패하거나 제한 시간에 걸리면 주입도 검사도 없이 그대로 진행됩니다.
 * **서브에이전트 호출은 건너뜀**: 입력에 `agent_id`, `is_subagent`, 부모 대화·세션 ID가 있거나 `conversationId`와 `rootConversationId`가 다르면 서브에이전트로 보고(`src/revive/tracker.mjs`의 `isSubagentPayload`), 주입과 세션 기록을 하지 않습니다. `PreToolUse`만은 서브에이전트 호출을 검사 대상으로 삼습니다.
+* **워커 세션(`HERDR_CORTEX_ROLE=worker`)**: 환경변수 `HERDR_CORTEX_ROLE`의 값이 앞뒤 공백을 떼고 대소문자를 무시했을 때 `worker`이면 위임 워커 세션입니다(`src/core/role.mjs`의 `isWorkerSession`). 워커 세션에서는 탭별 세션 기록(`recordSession`), `/clear` 종료 기록(`SessionEnd`), `HEAD_CORE.md` 주입, 최근 대화 턴 복원, 릴레이 받은편지함 전달·알림 표시를 하지 않으므로 워커를 띄운 탭의 세션 기록과 받은편지함이 보존됩니다. 기억 개요(`Cortex Memory Overview`), 미승인 폴더 안내, 색인되지 않은 문서 안내, 승인 목록 변경 경고는 그대로 동작합니다.
 * **제외된 프로젝트**: 설정으로 꺼진 프로젝트(`enabled: false`, `excludedProjects`, `mode: "opt-in"`에서 미등록)에서는 `PreToolUse`를 뺀 모든 처리기가 아무것도 내보내지 않습니다. 받은편지함도 전달하지 않고 `/clear` 기록도 쓰지 않습니다. 탭별 세션 기록(재부팅 복구용)만은 계속 갱신합니다.
 * **승인되지 않은 프로젝트**: 그 폴더의 `.memory/`는 읽지도 만들지도 않으며, 그 안의 `config.json`도 읽지 않습니다. 세션 시작 지침, 전역 기억, 받은편지함은 그대로 동작합니다. 폴더에 `.memory/`가 있으면 그 사실을 안내합니다(아래 문구).
 

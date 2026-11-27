@@ -261,6 +261,7 @@ export function createMcpServer({
   projectEnabled = null,
   includeRelayTools = true,
   extraTools = [],
+  env = process.env,
   input = process.stdin,
   output = process.stdout,
 } = {}) {
@@ -280,6 +281,7 @@ export function createMcpServer({
         hcClient,
         store,
         projectEnabled: effectiveProjectEnabled,
+        env,
       })
     : [];
 
@@ -291,6 +293,7 @@ export function createMcpServer({
     embeddingBreaker,
     projectEnabled: effectiveProjectEnabled,
     extraTools: [...defaultRelayTools, ...extraTools],
+    env,
   });
 
   async function handleMessage(msg) {
@@ -492,6 +495,7 @@ export function createServerRuntime({
   indexCatchUpDelayMs = INDEX_CATCH_UP_DELAY_MS,
   indexCatchUpRequestDelayMs = INDEX_CATCH_UP_REQUEST_DELAY_MS,
   toolSyncLimits = DEFAULT_TOOL_SYNC_LIMITS,
+  env = process.env,
   input,
   output,
 } = {}) {
@@ -562,6 +566,7 @@ export function createServerRuntime({
     embeddingBreaker: breaker,
     hcClient,
     projectEnabled,
+    env,
     ...(input ? { input } : {}),
     ...(output ? { output } : {}),
   });

@@ -248,7 +248,7 @@ Context docs: [[decision-20261123-api]]
 
 - **제외된 프로젝트**: 서버의 현재 프로젝트가 herdr-cortex 설정으로 제외돼 있으면 세 도구 모두 `PROJECT_EXCLUDED`를 돌려줍니다(메시지: `Project "<폴더>" is excluded by herdr-cortex configuration; <도구> is disabled.`). 받는 쪽도 마찬가지로, 제외된 프로젝트에서 도는 훅은 메시지를 주입하지 않습니다.
 - **승인**: 릴레이 도구는 프로젝트 승인을 요구하지 않습니다. 받은편지함이 전역 저장소에 있어서 어떤 프로젝트 폴더에도 쓰지 않기 때문이며, 미승인 폴더에서도 메시지를 보내고 받을 수 있습니다. 승인이 관여하는 곳은 두 군데뿐입니다. 옛 위치의 메시지는 승인된 프로젝트에서만 옮기고, `relay_tabs`의 `projectSessions`는 미승인 프로젝트에서 빈 배열입니다.
-- **서브에이전트**: `relay_send`와 `relay_inbox(action="ack")`는 메인 대화만 쓸 수 있고, 서브에이전트로 판정된 호출은 `SUBAGENT_WRITE_DENIED`입니다. `relay_tabs`와 `relay_inbox(action="peek")`는 서브에이전트도 쓸 수 있습니다. 이 판정은 실수를 막는 장치이지 보안 경계가 아닙니다([`src/mcp/`](../mcp/README.md)의 "서브에이전트 판정").
+- **서브에이전트·워커 세션**: `relay_send`와 `relay_inbox(action="ack")`는 메인 대화만 쓸 수 있고, 서브에이전트로 판정된 호출이나 워커 세션(`HERDR_CORTEX_ROLE=worker`)의 서버에서는 `SUBAGENT_WRITE_DENIED`입니다. `relay_tabs`와 `relay_inbox(action="peek")`는 서브에이전트와 워커도 쓸 수 있습니다. 이 판정은 실수를 막는 장치이지 보안 경계가 아닙니다([`src/mcp/`](../mcp/README.md)의 "서브에이전트 판정").
 
 ### `relay_tabs` — 탭 목록
 
@@ -388,7 +388,7 @@ Another process is delivering this terminal's messages right now; nothing was ac
 | `PROJECT_EXCLUDED` | 셋 모두 | 서버의 현재 프로젝트가 제외됨 |
 | `TARGET_PROJECT_EXCLUDED` | `relay_send` | 받는 탭이 일하는 폴더가 제외된 프로젝트임. `to_terminal_id`, `target_project_dir`가 함께 옵니다 |
 | `REMOTE_TERMINAL_UNSUPPORTED` | `relay_send`, `relay_inbox` | 탭 ID가 다른 PC의 주소(`pc2/t3`)임. `terminal_id`, `machine`이 함께 옵니다 |
-| `SUBAGENT_WRITE_DENIED` | `relay_send`, `relay_inbox`의 `ack` | 서브에이전트로 판정된 호출 |
+| `SUBAGENT_WRITE_DENIED` | `relay_send`, `relay_inbox`의 `ack` | 서브에이전트로 판정된 호출 또는 워커 세션(`HERDR_CORTEX_ROLE=worker`) |
 | `EMPTY_MESSAGE` | `relay_send` | `message`가 비었거나 공백뿐임 |
 | `INVALID_WAKE` | `relay_send` | `wake`가 `auto`, `always`, `never`가 아님 |
 | `MISSING_TERMINAL_ID` | `relay_inbox` | `HC_TERMINAL_ID`도 `terminal_id`도 없음 |

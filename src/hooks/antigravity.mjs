@@ -14,6 +14,7 @@ import {
   loadConfig,
 } from '../core/config.mjs';
 import { fitOverviewToBudget, resolveHookBudget } from '../core/budget.mjs';
+import { isWorkerSession } from '../core/role.mjs';
 import { formatProjectNotApprovedNotice } from '../core/trust.mjs';
 import {
   extractCwd,
@@ -270,7 +271,8 @@ function pushOverviewSections({ pushSection, remaining, reserve = 0, ...overview
 export function handleAntigravitySessionStart(
   payload = {},
   {
-    terminalId = process.env.HC_TERMINAL_ID,
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
     globalDir,
     legacyHome,
     promptsDir = path.join(REPO_ROOT, 'prompts'),
@@ -295,19 +297,22 @@ export function handleAntigravitySessionStart(
     return {};
   }
 
+  const worker = isWorkerSession({ env });
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   const budget = resolveHookBudget(config);
 
-  recordSession({
-    terminalId,
-    agent: 'antigravity',
-    payload,
-    cwd: projectDir,
-    globalDir: effectiveGlobalDir,
-    legacyHome,
-  });
+  if (!worker) {
+    recordSession({
+      terminalId,
+      agent: 'antigravity',
+      payload,
+      cwd: projectDir,
+      globalDir: effectiveGlobalDir,
+      legacyHome,
+    });
+  }
 
   if (!isProjectEnabled(projectDir, config)) {
     return {};
@@ -332,9 +337,11 @@ export function handleAntigravitySessionStart(
   pruneApprovalCheckRecords(effectiveGlobalDir);
   pushSection(resolveApprovalsWarning(effectiveGlobalDir, convId));
 
-  const headCore = readHeadCore(promptsDir, config);
-  if (headCore) {
-    pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
+  if (!worker) {
+    const headCore = readHeadCore(promptsDir, config);
+    if (headCore) {
+      pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
+    }
   }
   pushSection(notApprovedNotice);
 
@@ -349,7 +356,7 @@ export function handleAntigravitySessionStart(
   });
 
   // Budget-first relay inbox delivery (see ANTIGRAVITY_INBOX_MAX_CHARS)
-  if (isValidTerminalId(terminalId)) {
+  if (!worker && isValidTerminalId(terminalId)) {
     const remaining = budget - used;
     if (remaining >= 120) {
       try {
@@ -395,7 +402,8 @@ export function handleAntigravitySessionStart(
 export function handleAntigravityPreInvocation(
   payload = {},
   {
-    terminalId = process.env.HC_TERMINAL_ID,
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
     globalDir,
     legacyHome,
     promptsDir = path.join(REPO_ROOT, 'prompts'),
@@ -426,12 +434,13 @@ export function handleAntigravityPreInvocation(
     || explicitRoot
     || (role === 'unknown' && lastInput.length > 0 && !SUBAGENT_MSG_RE.test(lastInput));
 
+  const worker = isWorkerSession({ env });
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   const budget = resolveHookBudget(config);
 
-  if (isConfirmedRoot) {
+  if (!worker && isConfirmedRoot) {
     recordSession({
       terminalId,
       agent: 'antigravity',
@@ -491,9 +500,11 @@ export function handleAntigravityPreInvocation(
   // 2. First root PreInvocation startup injection (deferred from SessionStart)
   let injectedStartupThisTurn = false;
   if (!cpState.started) {
-    const headCore = readHeadCore(promptsDir, config);
-    if (headCore) {
-      pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
+    if (!worker) {
+      const headCore = readHeadCore(promptsDir, config);
+      if (headCore) {
+        pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
+      }
     }
     pushSection(notApprovedNotice);
     pushOverviewSections({ pushSection, remaining: () => budget - used, ...overviewArgs });
@@ -544,38 +555,43 @@ export function handleAntigravityPreInvocation(
       stateDirty = true;
 
       if (state.latestCheckpoint?.key && state.latestCheckpoint.key !== cpState.checkpoint) {
-        const humanTurns = state.candidateTurns.filter((t) => t.user).length;
-        const turns = humanTurns >= readerOptions.maxTurns
-          ? state
-          : extractAntigravityState(actualTranscript, readerOptions);
+        const turns = worker
+          ? null
+          : (state.candidateTurns.filter((t) => t.user).length >= readerOptions.maxTurns
+              ? state
+              : extractAntigravityState(actualTranscript, readerOptions));
 
         if (!injectedStartupThisTurn) {
-          const headCore = readHeadCore(promptsDir, config);
-          if (headCore) {
-            pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
+          if (!worker) {
+            const headCore = readHeadCore(promptsDir, config);
+            if (headCore) {
+              pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
+            }
           }
           pushSection(notApprovedNotice);
 
           pushOverviewSections({
             pushSection,
             remaining: () => budget - used,
-            reserve: turns.text ? Math.min(turns.text.length, Math.floor((budget - used) * 0.5)) : 0,
+            reserve: turns?.text ? Math.min(turns.text.length, Math.floor((budget - used) * 0.5)) : 0,
             ...overviewArgs,
           });
         }
 
-        if (turns.text) {
-          const remaining = budget - used;
-          if (turns.text.length <= remaining) {
-            pushSection(turns.text);
-          } else if (remaining >= 160) {
-            const refit = formatRecentTurns(turns.candidateTurns, { maxChars: remaining });
-            if (refit.text) {
-              pushSection(refit.text);
+        if (!worker && turns) {
+          if (turns.text) {
+            const remaining = budget - used;
+            if (turns.text.length <= remaining) {
+              pushSection(turns.text);
+            } else if (remaining >= 160) {
+              const refit = formatRecentTurns(turns.candidateTurns, { maxChars: remaining });
+              if (refit.text) {
+                pushSection(refit.text);
+              }
             }
+          } else {
+            pushSection(restoreFailureNote(turns.restoreFailure));
           }
-        } else {
-          pushSection(restoreFailureNote(turns.restoreFailure));
         }
 
         cpState.checkpoint = state.latestCheckpoint.key;
@@ -589,7 +605,7 @@ export function handleAntigravityPreInvocation(
   }
 
   // 4. Budget-first relay inbox delivery
-  if (isValidTerminalId(terminalId)) {
+  if (!worker && isValidTerminalId(terminalId)) {
     const remaining = budget - used;
     if (remaining >= 120) {
       try {

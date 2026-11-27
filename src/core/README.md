@@ -28,6 +28,7 @@
 | **`search.mjs`** | 검색어 토큰화, 조건 거르기, 키워드 검색과 벡터 검색과 이웃 문서를 합치는 순위 계산 | `searchMemory`, `tokenizeQuery` |
 | **`graph.mjs`** | 문서와 파일 사이의 연결(간선) 조회, 여러 단계 탐색 | `exploreGraph`, `getNeighbors`, `normalizeGraphTarget` |
 | **`budget.mjs`** | 개요를 글자 수 한도에 맞추기, 훅 주입 한도, 주입 내용 첫 줄의 고정 문구, 한 줄 정리 | `FIT_STEPS`, `HOOK_MAX_CHARS`, `UNTRUSTED_MEMORY_PREAMBLE`, `fitOverviewToBudget`, `resolveHookBudget`, `sanitizeInline` |
+| **`role.mjs`** | 환경변수 `HERDR_CORTEX_ROLE`로 위임 워커 세션 여부 판정 | `ROLE_ENV_VAR`, `WORKER_ROLE`, `isWorkerSession` |
 
 `store.mjs`의 `ProjectNotApprovedError`와 `UnsafeUpdateError`는 각각 `trust.mjs`, `frontmatter.mjs`의 것을 다시 내보낸 같은 클래스입니다. `trust.mjs`의 `getTrustedProjectsPath`, `isProjectTrusted`도 `config.mjs`의 것을 다시 내보낸 것입니다.
 
@@ -74,6 +75,7 @@
 | 변수 | 뜻 |
 | :--- | :--- |
 | `HC_TERMINAL_ID` | Herdr가 탭마다 넣어 주는 탭 ID. 세션 기록, 받은편지함, 탭 복구의 기준입니다. |
+| `HERDR_CORTEX_ROLE` | 앞뒤 공백을 떼고 대소문자 무시로 `worker`이면 위임 워커 세션으로 판정합니다(`role.mjs`의 `isWorkerSession`). 훅의 `HEAD_CORE`·최근 대화 턴·받은편지함 주입과 탭 상태 기록을 건너뛰고, MCP 서버의 쓰기 도구를 거부합니다([`../hooks/README.md`](../hooks/README.md), [`../mcp/README.md`](../mcp/README.md)). |
 | `HERDR_CORTEX_HOME` | 전역 저장소 폴더를 다른 곳으로 지정합니다. |
 | `HERDR_CORTEX_PROJECT` | MCP 서버를 직접 실행할 때 프로젝트 폴더를 지정합니다([`../mcp/README.md`](../mcp/README.md#직접-실행-옵션과-환경변수)). |
 | `HERDR_CORTEX_TEST_HOME`, `HERDR_REVIVE_TEST_HOME` | 홈 폴더를 다른 폴더로 바꿉니다(테스트용). |

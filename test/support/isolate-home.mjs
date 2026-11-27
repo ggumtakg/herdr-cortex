@@ -34,3 +34,4 @@ process.env.HOME = guardHome;
 process.env.HERDR_CORTEX_TEST_HOME = guardHome;
 process.env.HERDR_CORTEX_HOME = path.join(guardHome, '.herdr-cortex');
 delete process.env.HERDR_REVIVE_TEST_HOME;
+delete process.env.HERDR_CORTEX_ROLE;

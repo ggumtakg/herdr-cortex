@@ -13,6 +13,7 @@ import {
 } from './inbox.mjs';
 import { isValidTerminalId, listSavedSessions, readSavedSession, validateTerminalId } from '../revive/tracker.mjs';
 import { isSubagentCaller } from '../mcp/tools.mjs';
+import { isWorkerSession } from '../core/role.mjs';
 
 // How long an explicit relay_inbox(action="ack") waits for a hook that is delivering the same terminal's
 // messages at that moment (hooks themselves never wait for the lock).
@@ -99,7 +100,8 @@ export function createRelayTools({
   hcClient = null,
   store = null,
   projectEnabled = null,
-  getCurrentTerminalId = () => (process.env.HC_TERMINAL_ID || '').trim(),
+  env = process.env,
+  getCurrentTerminalId = () => (env?.HC_TERMINAL_ID || '').trim(),
 } = {}) {
   const hc = hcClient || createHcClient();
   const resolvedProjectDir = path.resolve(projectDir);
@@ -425,14 +427,14 @@ export function createRelayTools({
     },
     async handler(args, meta = {}) {
       const action = args.action || 'peek';
-      if (action === 'ack' && isSubagentCaller(args, meta)) {
+      if (action === 'ack' && (isSubagentCaller(args, meta) || isWorkerSession({ env }))) {
         return {
           isError: true,
           errorCode: 'SUBAGENT_WRITE_DENIED',
           data: {
             error: 'SUBAGENT_WRITE_DENIED',
             tool: 'relay_inbox',
-            message: 'Subagents cannot acknowledge/delete relay inbox messages; use action="peek" only.',
+            message: 'Subagents and worker sessions cannot acknowledge/delete relay inbox messages; use action="peek" only.',
           },
         };
       }

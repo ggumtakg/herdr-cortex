@@ -12,6 +12,7 @@ import { PROJECT_NOT_APPROVED_CODE, formatProjectNotApprovedMessage } from '../c
 import { CortexStore } from '../core/store.mjs';
 import { searchMemory } from '../core/search.mjs';
 import { HOOK_MAX_CHARS, fitOverviewToBudget } from '../core/budget.mjs';
+import { isWorkerSession } from '../core/role.mjs';
 
 /**
  * Canon Protection check: detect whether the caller is a subagent.
@@ -121,7 +122,7 @@ function makeSubagentDeniedError(toolName) {
     data: {
       error: 'SUBAGENT_WRITE_DENIED',
       tool: toolName,
-      message: 'Canonical memory writes are restricted to the main HEAD conversation; subagents have read-only memory access.',
+      message: 'Canonical memory and relay writes are restricted to the main HEAD conversation; subagents and worker sessions have read-only access.',
     },
   };
 }
@@ -321,6 +322,7 @@ export function createToolRegistry(
     embeddingBreaker = null,
     projectEnabled = null,
     extraTools = [],
+    env = process.env,
   } = {},
 ) {
   const tools = new Map();
@@ -756,7 +758,7 @@ export function createToolRegistry(
         };
       }
 
-      if (tool.writeProtected && isSubagentCaller(args, meta)) {
+      if (tool.writeProtected && (isSubagentCaller(args, meta) || isWorkerSession({ env }))) {
         return makeSubagentDeniedError(name);
       }
 
