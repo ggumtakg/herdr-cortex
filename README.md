@@ -104,7 +104,7 @@ flowchart TB
     subgraph Prompts["작업 원칙 (prompts/)"]
         HC["HEAD_CORE.md (29줄, 세션 시작 때 주입)"]
         SK["스킬 5개: start-job / product-planning / delegate / independent-review / plan-run"]
-        WK["워커 역할 3개: coder / developer / reviewer + DEVELOPMENT_STANDARD"]
+        WK["워커 역할 4개: coder / developer / reviewer / researcher + DEVELOPMENT_STANDARD"]
     end
 
     subgraph Hosts["에이전트 (Herdr 탭)"]
@@ -173,7 +173,7 @@ flowchart TB
 | `src/hooks/` | [README](src/hooks/README.md) | [등록되는 훅](src/hooks/README.md#등록되는-훅), [세션 시작·압축·`/clear` 뒤의 주입과 직전 대화 복원](src/hooks/README.md#claude-code-처리기-claudemjs), [도구 호출 전 검사](src/hooks/README.md#pretooluse-도구-호출-직전의-검사), [Antigravity에서 다른 점](src/hooks/README.md#antigravity-처리기-antigravitymjs), [설치기의 내부](src/hooks/README.md#설치기-installermjs) |
 | `src/relay/` | [README](src/relay/README.md) | [탭 릴레이의 흐름](src/relay/README.md#전체-흐름), `hc` 호출, 받은편지함, 릴레이 도구 3개와 [깨우기 결정표](src/relay/README.md#깨우기-결정표) |
 | `src/revive/` | [README](src/revive/README.md) | 탭별 세션 기록의 형식과 기록 규칙 |
-| `prompts/` | [README](prompts/README.md) | [설계 원리](prompts/README.md#설계-원리), `HEAD_CORE.md`, 개발 기준, 스킬 5개, 워커 역할 3개, [`plan-run`의 기준선 규약](prompts/README.md#plan-run의-기준선-규약) |
+| `prompts/` | [README](prompts/README.md) | [설계 원리](prompts/README.md#설계-원리), `HEAD_CORE.md`, 개발 기준, 스킬 5개, 워커 역할 4개, [`plan-run`의 기준선 규약](prompts/README.md#plan-run의-기준선-규약) |
 | `scripts/` | [README](scripts/README.md) | [설치와 제거의 전 과정](scripts/README.md#설치와-제거), [셸 명령과 `cortex-status`의 출력](scripts/README.md#셸-명령), [탭 복구의 판정 규칙](scripts/README.md#탭-복구), 설치 보조 함수 |
 | `test/` | [README](test/README.md) | 자동 테스트 21개 파일(224개)의 [구성](test/README.md#테스트-스위트-구성), 실제 홈 격리, [실물과 대역](test/README.md#실물과-대역). `npm test`로 실행합니다. |
 
