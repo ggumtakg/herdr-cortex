@@ -3,12 +3,12 @@
     Unified herdr-cortex Installer for Windows 11 Herdr GUI (herdr-core / hc):
       - Registers the herdr-cortex Stdio MCP server for Claude Code (through `claude mcp add`) and, when
         Antigravity is present, for Antigravity CLI
-      - Registers official hooks (Claude Code SessionStart/SessionEnd/PreCompact/UserPromptSubmit/PreToolUse,
+      - Registers official hooks (Claude Code SessionStart/SessionEnd/PreCompact/UserPromptSubmit/PreToolUse/PostToolUse/SubagentStop,
         Antigravity SessionStart/PreInvocation) with the absolute path of node.exe
       - Installs cortex skills into ~/.claude/skills/cortex-* (when prompts/skills exists)
       - Initializes ~/.herdr-cortex/ (sessions, docs, config.json)
       - Adds a marker-delimited block to the PowerShell profile(s) that provides auto-resume and the commands
-        `cortex-status`, `cortex-trust`, `revive-agents`, `revive-status`
+        `cortex-status`, `cortex-trust`, `cortex-work`, `cortex-worker`, `revive-agents`, `revive-status`
     Every file is checked before anything is written, and every existing file that changes is first copied to
     <file>.herdr-cortex.<yyyyMMdd-HHmmss>.bak.
 .PARAMETER NoAutoResume
@@ -222,4 +222,4 @@ Write-Host "Next steps:"
 Write-Host "  1. Open a new terminal or run: . '$escapedAutoRevive'"
 Write-Host "  2. Restart Claude Code / Antigravity CLI tabs to load the herdr-cortex MCP server and official hooks."
 Write-Host "  3. In each project folder that should have memory, run: cortex-trust approve"
-Write-Host "  4. Commands available anywhere: cortex-status, cortex-trust, revive-agents, revive-status, revive-agents -DryRun"
+Write-Host "  4. Commands available anywhere: cortex-status, cortex-trust, cortex-work, cortex-worker, revive-agents, revive-status, revive-agents -DryRun"

@@ -680,7 +680,7 @@ test('shell commands: cortex-trust and cortex-status run with the Node path reco
     assert.equal(lines[0], '=== herdr-cortex status ===');
     assert.ok(lines.includes(`Node         : ${process.version} OK | ${process.execPath}`), status.text);
     assert.ok(lines.includes('  recorded   : same path (exists)'));
-    assert.ok(lines.includes('Claude hooks : SessionStart=ok SessionEnd=ok PreCompact=ok UserPromptSubmit=ok PreToolUse=ok'));
+    assert.ok(lines.includes('Claude hooks : SessionStart=ok SessionEnd=ok PreCompact=ok UserPromptSubmit=ok PreToolUse=ok PostToolUse=ok SubagentStop=ok'));
     assert.ok(lines.includes('Claude MCP   : "herdr-cortex" registered (node ok, server.mjs ok)'));
     assert.ok(lines.includes(`This folder  : ${project}`), status.text);
     assert.ok(lines.some((line) => /^ {2}approved {3}: yes \(since /.test(line)));

@@ -22,12 +22,21 @@ export function expandCortexRootPlaceholder(text, repoRoot = REPO_ROOT) {
   return text.split(CORTEX_ROOT_PLACEHOLDER).join(normalizedRoot);
 }
 
+export const DEFAULT_WORK_SIZE = Object.freeze({
+  enabled: true,
+  maxFilesPerWindow: 1,
+  maxCharsPerFile: 1000,
+});
+
+export const WORK_SIZE_KEYS = Object.freeze(['enabled', 'maxFilesPerWindow', 'maxCharsPerFile']);
+
 export const DEFAULT_CONFIG = Object.freeze({
   mode: 'all', // 'all' | 'opt-in'
   enabledProjects: [],
   excludedProjects: [],
   headCoreEnabled: true,
   hookBudget: 9000,
+  workSize: DEFAULT_WORK_SIZE,
   embedding: {
     // none | auto | gemini | openai | ollama | onnx. Nothing is embedded (and nothing leaves this machine)
     // until the user picks a provider; "auto" is an explicit choice, not the default.
@@ -295,11 +304,18 @@ function mergeEmbedding(base, override) {
   return out;
 }
 
+function mergeWorkSize(base, override) {
+  const from = isPlainObject(base) ? base : DEFAULT_WORK_SIZE;
+  const over = isPlainObject(override) ? override : {};
+  return { ...from, ...over };
+}
+
 function mergeConfig(base, override) {
   const over = isPlainObject(override) ? override : {};
   return {
     ...base,
     ...over,
+    workSize: mergeWorkSize(base.workSize, over.workSize),
     embedding: mergeEmbedding(base.embedding, over.embedding),
   };
 }
@@ -473,11 +489,103 @@ function dropLegacyEmbeddingKeys(embedding, { source, location, problems }) {
   return clean;
 }
 
-function withCleanEmbedding(raw, context) {
-  if (!isPlainObject(raw) || raw.embedding === undefined) return raw;
-  const { embedding, ...rest } = raw;
-  const clean = dropLegacyEmbeddingKeys(embedding, context);
-  return clean === undefined ? rest : { ...rest, embedding: clean };
+function sanitizeWorkSize(workSize, { source, location, problems }) {
+  if (workSize === undefined) return undefined;
+  const sourceNote = source && source !== 'overrides' ? ` (in "${source}")` : '';
+  const recordProblem = (subKey, detail) => {
+    const fullLocation = subKey ? `${location}.${subKey}` : location;
+    const message = `${detail}${sourceNote}`;
+    problems.push({
+      code: 'invalid_work_size',
+      ...(subKey ? { key: subKey } : {}),
+      location: fullLocation,
+      source,
+      message,
+    });
+    warnConfigOnce(`worksize\0${source}\0${fullLocation}\0${detail}`, message);
+  };
+
+  if (!isPlainObject(workSize)) {
+    recordProblem('', `${location} must be a JSON object; using defaults.`);
+    return { ...DEFAULT_WORK_SIZE };
+  }
+
+  const clean = {};
+  for (const key of Object.keys(workSize)) {
+    if (!WORK_SIZE_KEYS.includes(key)) {
+      recordProblem(key, `Unknown setting ${location}.${key} is ignored.`);
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(workSize, 'enabled')) {
+    if (typeof workSize.enabled === 'boolean') {
+      clean.enabled = workSize.enabled;
+    } else {
+      recordProblem('enabled', `${location}.enabled must be a boolean; using default (${DEFAULT_WORK_SIZE.enabled}).`);
+      clean.enabled = DEFAULT_WORK_SIZE.enabled;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(workSize, 'maxFilesPerWindow')) {
+    const val = workSize.maxFilesPerWindow;
+    if (typeof val === 'number' && Number.isInteger(val) && val >= 1) {
+      clean.maxFilesPerWindow = val;
+    } else {
+      recordProblem(
+        'maxFilesPerWindow',
+        `${location}.maxFilesPerWindow must be an integer >= 1; using default (${DEFAULT_WORK_SIZE.maxFilesPerWindow}).`,
+      );
+      clean.maxFilesPerWindow = DEFAULT_WORK_SIZE.maxFilesPerWindow;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(workSize, 'maxCharsPerFile')) {
+    const val = workSize.maxCharsPerFile;
+    if (typeof val === 'number' && Number.isInteger(val) && val >= 1) {
+      clean.maxCharsPerFile = val;
+    } else {
+      recordProblem(
+        'maxCharsPerFile',
+        `${location}.maxCharsPerFile must be an integer >= 1; using default (${DEFAULT_WORK_SIZE.maxCharsPerFile}).`,
+      );
+      clean.maxCharsPerFile = DEFAULT_WORK_SIZE.maxCharsPerFile;
+    }
+  }
+
+  return clean;
+}
+
+function withCleanSections(raw, { source, problems }) {
+  if (!isPlainObject(raw)) return raw;
+  let next = raw;
+  if (raw.embedding !== undefined) {
+    const { embedding, ...rest } = next;
+    const clean = dropLegacyEmbeddingKeys(embedding, { source, location: 'embedding', problems });
+    next = clean === undefined ? rest : { ...rest, embedding: clean };
+  }
+  if (raw.workSize !== undefined) {
+    const { workSize, ...rest } = next;
+    const clean = sanitizeWorkSize(workSize, { source, location: 'workSize', problems });
+    next = clean === undefined ? rest : { ...rest, workSize: clean };
+  }
+  return next;
+}
+
+/**
+ * Normalize a `config.workSize` block (whether loaded via `loadConfig` or constructed in-memory),
+ * returning `{ enabled, maxFilesPerWindow, maxCharsPerFile }` with valid defaults for any bad/missing field.
+ */
+export function resolveWorkSizeConfig(config = DEFAULT_CONFIG) {
+  const raw = isPlainObject(config?.workSize) ? config.workSize : {};
+  return {
+    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : DEFAULT_WORK_SIZE.enabled,
+    maxFilesPerWindow: typeof raw.maxFilesPerWindow === 'number' && Number.isInteger(raw.maxFilesPerWindow) && raw.maxFilesPerWindow >= 1
+      ? raw.maxFilesPerWindow
+      : DEFAULT_WORK_SIZE.maxFilesPerWindow,
+    maxCharsPerFile: typeof raw.maxCharsPerFile === 'number' && Number.isInteger(raw.maxCharsPerFile) && raw.maxCharsPerFile >= 1
+      ? raw.maxCharsPerFile
+      : DEFAULT_WORK_SIZE.maxCharsPerFile,
+  };
 }
 
 /**
@@ -599,7 +707,7 @@ export function loadConfig({ projectDir, globalDir, overrides } = {}) {
   const globalRaw = readJsonSafe(gPaths.configPath, { warnOnError: true });
   let cfg = mergeConfig(
     DEFAULT_CONFIG,
-    withCleanEmbedding(globalRaw, { source: gPaths.configPath, location: 'embedding', problems }),
+    withCleanSections(globalRaw, { source: gPaths.configPath, problems }),
   );
 
   if (projectDir) {
@@ -611,6 +719,12 @@ export function loadConfig({ projectDir, globalDir, overrides } = {}) {
         problems,
       });
       if (embedding) cfg = mergeConfig(cfg, { embedding });
+      const workSize = sanitizeWorkSize(entry.workSize, {
+        source: gPaths.configPath,
+        location: `projects[${JSON.stringify(key)}].workSize`,
+        problems,
+      });
+      if (workSize) cfg = mergeConfig(cfg, { workSize });
     }
 
     const pPaths = getTierPaths(getProjectMemoryDir(projectDir));
@@ -633,7 +747,7 @@ export function loadConfig({ projectDir, globalDir, overrides } = {}) {
   }
 
   if (overrides) {
-    cfg = mergeConfig(cfg, withCleanEmbedding(overrides, { source: 'overrides', location: 'embedding', problems }));
+    cfg = mergeConfig(cfg, withCleanSections(overrides, { source: 'overrides', problems }));
   }
 
   configProblems.set(cfg, problems);

@@ -17,13 +17,14 @@
 
 | 파일 | 역할 | Export |
 | :--- | :--- | :--- |
-| **`claude.mjs`** | Claude Code 훅 5종(`session-start`, `session-end`, `pre-compact`, `user-prompt`, `pre-tool-use`)의 처리기와 명령줄 진입점 | `CLAUDE_HOOK_MAX_CHARS`, `CLEAR_RECORD_DIR_NAME`, `CLEAR_RECORD_POLL_MS`, `CLEAR_RECORD_STALE_MS`, `CLEAR_RECORD_WAIT_MS`, `CLEAR_RECORD_WINDOW_MS`, `COMPACT_POINTER_INSTRUCTION`, `COMPACT_USER_INSTRUCTIONS_CLAUSE`, `EMPTY_MEMORY_NOTICE`, `HEAD_CORE_MAX_CHARS`, `SUBAGENT_CORTEX_WRITE_DENY_REASON`, `SUBAGENT_MEMORY_DIR_DENY_REASON`, `SUBAGENT_TRUST_CHANGE_DENY_REASON`, `TURNS_NOT_RESTORED_NO_TURNS_NOTE`, `TURNS_NOT_RESTORED_TOO_LARGE_NOTE`, `TURNS_NOT_RESTORED_UNIDENTIFIED_NOTE`, `USER_NOTICE_MAX_CHARS`, `buildCompactInstruction`, `classifyTrustCommand`, `commandReferencesMemoryDir`, `formatOtherProjectWriteReason`, `formatStateFileWriteAskReason`, `formatTrustCommandAskReason`, `getClearRecordsDir`, `handleClaudePreCompact`, `handleClaudePreToolUse`, `handleClaudeSessionEnd`, `handleClaudeSessionStart`, `handleClaudeUserPrompt`, `isCortexToolName`, `isPathInsideMemoryDir`, `renderClaudeHookStdout`, `restoreFailureNote`, `runClaudeHook` |
+| **`claude.mjs`** | Claude Code 훅 7종(`session-start`, `session-end`, `pre-compact`, `user-prompt`, `pre-tool-use`, `post-tool-use`, `subagent-stop`)의 처리기와 명령줄 진입점 | `CLAUDE_HOOK_MAX_CHARS`, `CLAUDE_PROJECT_DIR_ENV`, `CLEAR_RECORD_DIR_NAME`, `CLEAR_RECORD_POLL_MS`, `CLEAR_RECORD_STALE_MS`, `CLEAR_RECORD_WAIT_MS`, `CLEAR_RECORD_WINDOW_MS`, `COMPACT_POINTER_INSTRUCTION`, `COMPACT_USER_INSTRUCTIONS_CLAUSE`, `EMPTY_MEMORY_NOTICE`, `HEAD_CORE_MAX_CHARS`, `SUBAGENT_CORTEX_WRITE_DENY_REASON`, `SUBAGENT_MEMORY_DIR_DENY_REASON`, `SUBAGENT_TRUST_CHANGE_DENY_REASON`, `TURNS_NOT_RESTORED_NO_TURNS_NOTE`, `TURNS_NOT_RESTORED_TOO_LARGE_NOTE`, `TURNS_NOT_RESTORED_UNIDENTIFIED_NOTE`, `USER_NOTICE_MAX_CHARS`, `WORK_COMMAND_DENY_REASON`, `WORK_SIZE_COMPLETED_NOTICE`, `WORK_STATE_SHELL_DENY_REASON`, `buildCompactInstruction`, `classifyTrustCommand`, `classifyWorkCommand`, `commandReferencesMemoryDir`, `commandReferencesWorkSizeState`, `formatOtherProjectWriteReason`, `formatStateFileWriteAskReason`, `formatTrustCommandAskReason`, `formatWorkCommandAskReason`, `formatWorkSizeStateShellAskReason`, `getClearRecordsDir`, `handleClaudePostToolUse`, `handleClaudePreCompact`, `handleClaudePreToolUse`, `handleClaudeSessionEnd`, `handleClaudeSessionStart`, `handleClaudeSubagentStop`, `handleClaudeUserPrompt`, `isCortexToolName`, `isPathInsideMemoryDir`, `renderClaudeHookStdout`, `restoreFailureNote`, `runClaudeHook` |
+| **`work-size.mjs`** | 호스트에 묶이지 않는 작업 규모(S/L) 프로젝트 루트 판정, 폴더별 상태 관리(`<전역>/state/work-size/`), 잠금과 오래된 상태 정리, 파일·글자 수 누적과 한도 차단, `git commit`·`memory_save` 누적 초기화, 검수 판정(`ACCEPT`/`NEEDS_FIX`) 파싱과 L 종료 처리, 세션 시작·종료 안내 문구 | `WORK_SIZE_COMMAND`, `WORK_SIZE_COMPLETED_NOTICE`, `WORK_SIZE_DENY_MAX_CHARS`, `WORK_SIZE_DIR_NAME`, `WORK_SIZE_LOCK_MAX_RETRIES`, `WORK_SIZE_LOCK_RETRY_MS`, `WORK_SIZE_LOCK_STALE_MS`, `WORK_SIZE_SESSION_NOTICE_MAX_CHARS`, `WORK_SIZE_SESSION_STALE_MS`, `WORK_SIZE_STATE_VERSION`, `commandRunsGitCommit`, `consumeWorkSizeCompletedNotice`, `evaluateWorkSizeEdit`, `formatWorkSizeDenyReason`, `formatWorkSizeSessionNotice`, `getWorkSizeDir`, `getWorkSizeSessionNotice`, `getWorkSizeStatePath`, `isPathInsideMemoryDir`, `isSameOrSubpath`, `listTabWorkSizeStates`, `parseReviewVerdict`, `pruneStaleWorkSizeSessions`, `readWorkSizeScopeState`, `readWorkSizeState`, `recordGitCommitForWorkSize`, `recordMemorySaveForWorkSize`, `recordReviewVerdict`, `releaseWorkSizeForTab`, `resetWorkSizeWindowForTab`, `resolveTrackedProjectFile`, `resolveWorkSizeProjectRoot`, `resolveWorkSizeScope`, `tabWorkSizeScope`, `withWorkSizeScopeLock`, `writeWorkSizeScopeState`, `writeWorkSizeState` |
 | **`antigravity.mjs`** | Antigravity 훅 2종(`session-start`, `pre-invocation`)의 처리기와 명령줄 진입점, 대화 기록 앞부분으로 주 대화·서브에이전트를 가리는 역할 판별, 체크포인트 뒤 복원 | `EMPTY_MEMORY_NOTICE`, `HEAD_CORE_MAX_CHARS`, `detectAntigravityTranscriptRole`, `handleAntigravityPreInvocation`, `handleAntigravitySessionStart`, `runAntigravityHook` |
 | **`overview.mjs`** | 훅용 기억 개요 읽기와 기억 0건 안내 상수. 시간·크기 한도 안에서만 색인을 갱신하고, 한도를 넘는 문서는 미룬 뒤 그 사실을 알리는 문구를 만듦 | `EMPTY_MEMORY_NOTICE`, `HOOK_INDEX_BUDGET_MS`, `HOOK_INDEX_BYTES_PER_MS`, `HOOK_INDEX_MAX_FILE_BYTES`, `HOOK_INDEX_PER_FILE_MS`, `UNINDEXED_NOTICE_MAX_FILES`, `UNINDEXED_USER_NOTICE_MAX_FILES`, `formatUnindexedNotice`, `formatUnindexedUserNotice`, `loadHookOverview`, `resolveHookSyncOptions` |
 | **`recent-turns.mjs`** | 대화 기록 끝부분에서 사람이 직접 입력한 턴과 그 답을 뽑아 글자 수 안에 맞추는 공통 로직과 호스트별 어댑터, 대화 기록 앞부분의 `SessionStart` 주입 표식 확인 | `ANTIGRAVITY_TRANSCRIPT_ADAPTER`, `CLAUDE_TRANSCRIPT_ADAPTER`, `DEFAULT_MAX_TAIL_BYTES`, `DEFAULT_MAX_TURNS`, `DEFAULT_RECENT_TURNS_BUDGET`, `MAX_HEAD_SCAN_BYTES`, `MAX_TAIL_BYTES_CAP`, `MAX_TRANSCRIPT_RECORD_BYTES`, `RESTORE_FAILURE_NO_TURNS_WITHIN_CAP`, `RESTORE_FAILURE_RECORD_TOO_LARGE`, `extractAntigravityState`, `extractClaudeRecentTurns`, `extractRecentTurns`, `formatRecentTurns`, `hasClaudeSessionStartMarker`, `resolveAntigravityTranscriptPath`, `stripSystemReminders` |
 | **`approvals-watch.mjs`** | 승인 목록이 확인 대화상자를 거치지 않고 바뀌었는지를 세션마다 값싸게 확인 | `APPROVAL_CHECK_DIR_NAME`, `APPROVAL_CHECK_STALE_MS`, `checkApprovalsForSession`, `getApprovalChecksDir`, `pruneApprovalCheckRecords` |
 | **`shell-read-only.mjs`** | 셸 명령줄이 읽기만 하는 것으로 분명히 인식되는지 판정 | `READ_ONLY_GIT_SUBCOMMANDS`, `READ_ONLY_SHELL_VERBS`, `isReadOnlyShellCommand`, `splitPlainCommands` |
-| **`tool-names.mjs`** | MCP 서버 이름, 이 서버의 도구 이름 판정, PreToolUse 매처 문자열 | `CLAUDE_PRE_TOOL_USE_MATCHER`, `CORTEX_MCP_SERVER_NAMES`, `FILE_WRITE_TOOL_NAMES`, `LEGACY_MCP_SERVER_NAME`, `MCP_SERVER_NAME`, `SHELL_TOOL_NAMES`, `cortexToolBaseName`, `isCortexToolName` |
+| **`tool-names.mjs`** | MCP 서버 이름, 이 서버의 도구 이름 판정, PreToolUse·PostToolUse 매처 문자열 | `CLAUDE_POST_TOOL_USE_MATCHER`, `CLAUDE_PRE_TOOL_USE_MATCHER`, `CORTEX_MCP_SERVER_NAMES`, `FILE_WRITE_TOOL_NAMES`, `LEGACY_MCP_SERVER_NAME`, `MCP_SERVER_NAME`, `SHELL_TOOL_NAMES`, `cortexToolBaseName`, `isCortexToolName` |
 | **`installer.mjs`** | 훅·MCP 서버·스킬의 설치와 제거, 전역 `config.json`의 옛 임베딩 키 이관, 날짜 붙인 백업, 설치 상태 점검 함수, 명령줄 진입점 | `AGY_HOOK_KEY`, `ANTIGRAVITY_HOOK_SPECS`, `BACKUP_INFIX`, `CLAUDE_HOOK_MARKER`, `CLAUDE_HOOK_SPECS`, `CLAUDE_MCP_VERIFY_DELAY_MS`, `CLAUDE_SESSION_END_TIMEOUT_SECONDS`, `HOOK_ID_FLAG`, `INSTALL_RECORD_FILE`, `LEGACY_AGY_HOOK_KEY`, `LEGACY_BACKUP_SUFFIX`, `LEGACY_MCP_SERVER_KEY`, `MCP_SERVER_KEY`, `OLD_DEFAULT_CONFIGS`, `SKILL_MANAGED_MARKER`, `buildClaudeHookHandler`, `buildShellHookCommand`, `checkAntigravity`, `checkClaudeHooks`, `checkClaudeMcpRegistration`, `claudeMcpAddArgs`, `claudeMcpRemoveArgs`, `createDatedBackup`, `describeGlobalConfigProblems`, `describeInstalledEmbedding`, `describeMcpEntry`, `describeOwnHook`, `detectAntigravity`, `findBackups`, `findOnPath`, `formatBackupStamp`, `formatInstallSummary`, `getInstallRecordPath`, `installCortex`, `isLegacyReviveHook`, `isOwnHook`, `listBackups`, `migrateGlobalEmbeddingConfig`, `quotePathForShells`, `readInstallRecord`, `removeBackups`, `resolveClaudeCli`, `runClaudeCli`, `splitCommandLine`, `uninstallCortex` |
 
 ---
@@ -32,7 +33,7 @@
 
 ### Claude Code (`CLAUDE_HOOK_SPECS`)
 
-설치기는 `~/.claude/settings.json`의 `hooks`에 다섯 이벤트에 걸쳐 아래 여섯 항목을 추가합니다(`SessionStart`만 둘로 나누어 등록). 제한 시간의 단위는 초입니다.
+설치기는 `~/.claude/settings.json`의 `hooks`에 일곱 이벤트에 걸쳐 아래 여덟 항목을 추가합니다(`SessionStart`만 둘로 나누어 등록). 제한 시간의 단위는 초입니다.
 
 | 이벤트 | 매처 | 제한 시간 | 실행하는 하위 명령 |
 | :--- | :--- | :--- | :--- |
@@ -42,13 +43,16 @@
 | `PreCompact` | 빈 문자열 | 10초 | `claude.mjs pre-compact` |
 | `UserPromptSubmit` | 빈 문자열 | 10초 | `claude.mjs user-prompt` |
 | `PreToolUse` | `CLAUDE_PRE_TOOL_USE_MATCHER`(아래) | 10초 | `claude.mjs pre-tool-use` |
+| `PostToolUse` | `CLAUDE_POST_TOOL_USE_MATCHER`(아래) | 10초 | `claude.mjs post-tool-use` |
+| `SubagentStop` | 빈 문자열 | 10초 | `claude.mjs subagent-stop` |
 
-Claude Code는 훅 하나가 내는 `additionalContext`를 10,000자로 제한하고 같은 이벤트의 훅들을 병렬로 실행해 각각의 `additionalContext`를 모두 모델에 전달합니다. 그래서 `SessionStart`를 `core`(`HEAD_CORE`만)와 `context`(기억 개요·받은편지함·최근 대화·각종 안내)로 나누어, `HEAD_CORE`가 길어져도 `hookBudget`(최대 9,000자)을 깎아 먹지 않게 합니다. 이전 버전의 단일 `session-start` 등록이 있는 설정에 설치기를 다시 돌리면 그 등록은 지워지고 새 두 항목으로 교체됩니다.
+Claude Code는 훅 하나가 내는 `additionalContext`를 10,000자로 제한하고 같은 이벤트의 훅들을 병렬로 실행해 각각의 `additionalContext`를 모두 모델에 전달합니다. 그래서 `SessionStart`를 `core`(`HEAD_CORE`만)와 `context`(기억 개요·받은편지함·최근 대화·각종 안내)로 나누어, `HEAD_CORE`가 길어져도 `hookBudget`(최대 9,000자)을 깎아 먹지 않게 합니다. 이전 버전의 등록이 있는 설정에 설치기를 다시 돌리면 `--id herdr-cortex` 표시가 있는 기존 등록은 지워지고 새 여덟 항목으로 교체됩니다.
 
-`PreToolUse`의 매처는 이 서버의 도구와, 서브에이전트 검사 대상인 파일 쓰기 도구·셸 도구를 한 줄로 묶은 것입니다.
+`PreToolUse`와 `PostToolUse`의 매처는 다음과 같습니다.
 
 ```
-mcp__herdr-cortex__.*|Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell
+PreToolUse : mcp__herdr-cortex__.*|Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell
+PostToolUse: Bash|PowerShell|mcp__herdr-cortex__memory_save
 ```
 
 `SessionEnd`의 제한 시간을 따로 적는 까닭은 Claude Code가 이 이벤트에 기본으로 1.5초만 주기 때문입니다. 처리기는 작은 파일 하나만 쓰며, 5초는 Node를 띄우는 시간을 위한 여유입니다.
@@ -93,7 +97,7 @@ Antigravity가 감지된 경우에만 `~/.gemini/config/hooks.json`의 `herdr-co
 ### 명령줄과 출력이 닿는 곳
 
 ```
-node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|user-prompt|pre-tool-use> [part] --id herdr-cortex
+node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|user-prompt|pre-tool-use|post-tool-use|subagent-stop> [part] --id herdr-cortex
 ```
 
 표준 입력의 JSON을 읽습니다. `--id`와 `--marker`는 다음 값과 함께 건너뜁니다. `part`는 `session-start`에서만 쓰이는 선택 인자로 `core`(세션 시작 지침만), `context`(세션 시작 지침을 뺀 나머지), `all`(기본값, 둘을 한 번에)을 받습니다. 설치기는 `core`와 `context` 두 훅을 따로 등록하며, 아직 다시 설치하지 않은 이전 설정은 인자 없는 `all`로 동작합니다. 알 수 없는 이벤트 이름은 아무것도 출력하지 않습니다.
@@ -104,6 +108,7 @@ node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|u
 | :--- | :--- | :--- |
 | `session-start`, `user-prompt` | JSON 한 줄. 결과가 비면 출력 없음 | `hookSpecificOutput.additionalContext`는 모델만 읽고 사용자 화면에는 나오지 않습니다. 최상위 `systemMessage`는 Claude Code가 사용자에게 보여 줍니다 |
 | `pre-tool-use` | JSON 한 줄. 통과시킬 호출이면 출력 없음 | `permissionDecision`(`deny` 또는 `ask`)과 `permissionDecisionReason`, 필요하면 `updatedInput` |
+| `post-tool-use`, `subagent-stop` | 없음 | 작업 규모 상태 파일만 갱신하며 SQLite 색인 DB는 열지 않습니다 |
 | `pre-compact` | JSON이 아닌 일반 글 한 단락과 줄바꿈 | Claude Code가 압축 요약의 지시문으로 씁니다 |
 | `session-end` | 없음 | Claude Code가 이 이벤트의 출력을 쓰지 않습니다 |
 
@@ -122,6 +127,7 @@ node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|u
 | 1 (`all`·`core`) | 세션 시작 지침 `prompts/HEAD_CORE.md` | `core`에서는 단독으로 `HEAD_CORE_MAX_CHARS`(9,500자)까지, `all`에서는 필수 안내·1회 미승인 안내 자리를 남긴 `hookBudget` 안에서 줄 단위로 뒤쪽을 덜어 냄. `resume`·`fork` 중복 생략 조건과 `headCoreEnabled: false`·워커 제외 규칙은 위와 같음 |
 | 2 | 미승인 안내(`formatProjectNotApprovedNotice` / `formatUnapprovedFolderNotice`) | 작업 폴더가 승인되지 않았을 때. `.memory/`가 있으면 매 세션 내고, `.memory/`가 없으면 워커·홈 폴더·파일 시스템 루트가 아닌 세션에서 예산에 들어갈 때만 폴더당 첫 한 번 내고 `<전역>/state/unapproved-folder-notices.json`에 기록합니다 |
 | 3 | 승인 목록 변경 경고 | 아래 "승인 목록 변경 경고" 참고 |
+| 3-b | 끝나지 않은 L 작업 안내(`formatWorkSizeSessionNotice`) | 이 탭(탭 밖이면 세션)에 같은 작업 폴더의 끝나지 않은 L 작업이 있을 때(워커·서브에이전트·제외 프로젝트·`workSize.enabled: false`·`part: "core"` 제외). L이 된 시각·이유, 남은 조건(`검수 ACCEPT`·`memory_save`), `start-job` 안내를 300자 이하로 `hookBudget` 예산 안에서 넣음 |
 | 4 | 색인되지 않은 문서 안내(`formatUnindexedNotice`) | 색인 갱신이 문서를 미뤘을 때 |
 | 5 | 릴레이 받은편지함 | 탭 ID가 유효하고 남은 예산이 120자 이상일 때. 기억 개요가 있거나 최근 대화를 복원할 차례이면 `min(2000, max(300, 남은 예산의 35%))`자(남은 예산의 35%, 300자 이상 2,000자 이하), 아니면(기억 0건 안내가 나갈 때 그 길이와 2자를 남긴) 남은 예산 전부 |
 | 6 | 최근 대화를 복원하지 못했다는 한 줄 | 자리가 있을 때만(같은 문장이 `systemMessage`로도 나감) |
@@ -264,7 +270,10 @@ Claude Code는 이 훅의 일반 표준 출력을 압축 요약의 지시문으�
 | `Bash`·`PowerShell` 명령에 `.memory`가 경로 조각으로 들어 있음 | 통과 | `deny` (가) |
 | `Bash`·`PowerShell` 명령에 승인 파일 이름(`trusted-projects.json`, `trusted-projects.acknowledged.json`)이 있고 읽기 전용으로 인식되지 않음 | `ask` (다) | `deny` (나) |
 | `Write`·`Edit`·`MultiEdit`·`NotebookEdit`의 대상이 `<전역>/state/` 안 | `ask` (라) | `deny` (나) |
+| `Bash`·`PowerShell` 명령에 작업 규모 상태 폴더(`state/work-size`·`state\work-size` 또는 그 실제·표기 경로)가 들어 있고 읽기 전용(`isReadOnlyShellCommand`)으로 인식되지 않음 | `ask` (차). `cat`·`Get-Content`·`ls` 등 읽기 전용은 통과(`workSize.enabled`와 무관) | `deny` (카). 위임 워커 세션(`HERDR_CORTEX_ROLE=worker`)도 `deny` |
 | `Bash`·`PowerShell` 명령이 승인 명령(`cortex-trust`, `trust-cli.mjs`, `npm run trust`)을 실행 | 통과 | `deny` (나). 단순한 `status`·`list` 호출 한 번은 통과 |
+| `Bash`·`PowerShell` 명령이 작업 규모 해제·초기화 명령(`cortex-work release`·`reset`, `cortex-work.mjs`, `npm run work`)을 실행 | `ask` (사). 단순한 `status` 호출 한 번은 통과 | `deny` (아). 위임 워커 세션(`HERDR_CORTEX_ROLE=worker`)도 `deny` |
+| `Write`·`Edit`·`MultiEdit`·`NotebookEdit`의 대상이 작업 규모 프로젝트 루트 안(`.memory/` 제외)이고 편집 한도를 넘음 | `deny` (자) + 그 폴더 상태를 `L`로 상향(막힌 편집은 누적 제외). 워커 세션·제외 프로젝트·`workSize.enabled: false`는 세지 않음 | 통과(서브에이전트 편집은 세지 않음) |
 | `memory_save`, `memory_update`, `relay_send`, `relay_inbox(action="ack")` | 통과(다음 줄 제외) | `deny` (마) |
 | `memory_save`·`memory_update`의 `project_dir`가 현재 세션과 다른 프로젝트 | `ask` (바) | `deny` (마) |
 | 이 서버의 그 밖의 도구 | 입력에 `_caller_agent_id`가 있으면 지우고 통과 | 호스트가 준 `agent_id`를 `_caller_agent_id`로 넣고 통과 |
@@ -277,20 +286,25 @@ Claude Code는 이 훅의 일반 표준 출력을 압축 요약의 지시문으�
 * (라) `formatStateFileWriteAskReason`: 대상이 승인 파일이면 `[herdr-cortex] herdr-cortex project approvals are about to be changed: this call writes the approvals file "<경로>". Approvals decide which project folders' .memory/ is read and written. Allow it only if you want that change.`, 그 밖의 파일이면 `[herdr-cortex] This call writes a file in the herdr-cortex state folder: "<경로>". That folder holds the project approvals and other internal records. Allow it only if you want the agent to change it.`
 * (마) `SUBAGENT_CORTEX_WRITE_DENY_REASON`: `Canonical memory and relay write operations are restricted to the main HEAD conversation; subagents have read-only access.`
 * (바) `formatOtherProjectWriteReason`: `[herdr-cortex] This call writes memory into a different project folder: "<폴더>". Allow it only if you want that project's memory changed from this session.`
+* (사) `formatWorkCommandAskReason`: `[herdr-cortex] 작업 규모(S/L) 상태를 바꾸는 명령입니다: "<명령>". 사용자가 직접 풀려는 경우에만 허용하세요.`
+* (아) `WORK_COMMAND_DENY_REASON`: `[herdr-cortex] Subagents and delegated workers must not release or reset herdr-cortex work-size state (\`cortex-work\`). Only the user may release or reset work-size limits.`
+* (자) `formatWorkSizeDenyReason` (`[herdr-cortex]`로 시작, 한국어, 500자 이하): 어느 기준과 수치에 걸렸는지, 이 작업은 `L`이므로 HEAD는 직접 고치지 않고 워커에게 맡기며 `cortex_prompt(kind: "skill", name: "start-job")`를 따르라는 안내, 잘못 걸렸으면 사용자(`cortex-work`)에게 알리라는 안내, 상태 파일 수정·우회 금지를 담습니다(커밋으로 누적이 비워진다는 내용은 언급하지 않음).
+* (차) `formatWorkSizeStateShellAskReason`: `[herdr-cortex] 작업 규모(S/L) 상태 폴더를 건드리는 명령입니다: "<명령>". 사용자가 직접 상태를 정리하려는 경우에만 허용하세요.`
+* (카) `WORK_STATE_SHELL_DENY_REASON`: `[herdr-cortex] Subagents and delegated workers must not modify or delete files in the herdr-cortex work-size state folder.`
 
-(다)와 (라)에 들어가는 명령과 경로는 한 줄로 정리되고 300자를 넘으면 잘립니다.
+(다)·(라)·(사)·(차)에 들어가는 명령과 경로는 한 줄로 정리되고 300자를 넘으면 잘립니다.
 
 세부 규칙은 다음과 같습니다.
 
 * **`.memory/` 판정(파일 도구)**: 상대 경로는 작업 폴더 기준으로 풀고, 경로 조각 가운데 이름이 `.memory`인 것이 있으면 해당합니다(`isPathInsideMemoryDir`). 대소문자를 가리지 않고, Windows가 무시하는 끝의 점과 공백도 무시하며, 적힌 경로와 실제 경로를 모두 보므로 `.memory/`를 가리키는 정션이나 심볼릭 링크도 잡습니다. 어느 프로젝트의 `.memory/`인지는 가리지 않습니다.
 * **`.memory/` 판정(셸 도구)**: 명령 문자열에 `.memory`가 온전한 경로 조각으로 있는지 봅니다(`commandReferencesMemoryDir`). `my.memory.txt` 같은 이름은 해당하지 않습니다. 글자만 보는 판정이라 읽기와 쓰기를 구별하지 못하므로 서브에이전트의 `cat .memory/...`도 거부됩니다.
 * **승인 명령 분류(`classifyTrustCommand`)**: 결과는 네 가지입니다. `approvals-file`은 승인 파일 이름이 있고 읽기 전용으로 인식되지 않는 명령, `runs-cli`는 승인 명령(`cortex-trust`와 그 `.ps1`·`.cmd`·`.bat`·`.exe`, `trust-cli.mjs`, `npm run trust`·`npm run-script trust`)을 실행하는 명령, `read-only`는 읽기만 하는 명령(승인 명령의 단순한 `status`·`list` 호출 한 번, 또는 아래 읽기 전용 명령), 빈 문자열은 무관한 명령입니다. 주 대화가 승인 명령을 실행하는 것은 묻지 않습니다. 승인 명령 자체가 승인하기 전에 사람에게 확인 대화상자를 띄우기 때문입니다.
-* **읽기 전용 명령은 묻지 않음(`shell-read-only.mjs`)**: 승인 파일이나 승인 명령의 소스를 읽기만 하는 명령(`cat`, `type`, `grep`, `git diff` 등)은 승인 파일 이름이 들어 있어도 확인 없이 통과합니다. 인식 범위는 일부러 좁습니다. `|`, `;`, `&`, 줄바꿈으로 나뉜 명령 하나하나가 폴더 없이 이름만으로 부른 아래 프로그램으로 시작해야 하고(대소문자 무시, `.exe` 무시), 명령줄에 리다이렉션(`<`, `>`), 괄호·중괄호, 백틱, 큰따옴표 안의 `$(`, 주석(`#`), 닫히지 않은 따옴표가 없어야 합니다.
+* **읽기 전용 명령은 묻지 않음(`shell-read-only.mjs`)**: 승인 파일·승인 명령 소스나 작업 규모 상태 폴더를 읽기만 하는 명령(`cat`, `type`, `Get-Content`, `ls`, `grep`, `git diff` 등)은 그 경로가 들어 있어도 확인 없이 통과합니다. 인식 범위는 일부러 좁습니다. `|`, `;`, `&`, 줄바꿈으로 나뉜 명령 하나하나가 폴더 없이 이름만으로 부른 아래 프로그램으로 시작해야 하고(대소문자 무시, `.exe` 무시), 명령줄에 리다이렉션(`<`, `>`), 괄호·중괄호, 백틱, 큰따옴표 안의 `$(`, 주석(`#`), 닫히지 않은 따옴표가 없어야 합니다.
   * 프로그램(`READ_ONLY_SHELL_VERBS`): `cat`, `type`, `more`, `less`, `head`, `tail`, `get-content`, `gc`, `select-string`, `sls`, `grep`, `rg`, `findstr`, `ls`, `dir`, `get-childitem`, `gci`, `get-item`, `gi`, `stat`, `wc`
   * `git`은 첫 인자가 `diff`, `log`, `show`, `status`, `blame`, `grep`(`READ_ONLY_GIT_SUBCOMMANDS`)일 때만
   * 파일을 쓰거나 다른 프로그램을 띄우는 옵션이 있으면 제외: `git`의 `--output`·`-O`·`--open-files-in-pager`·`--ext-diff`, `rg`의 `--pre`·`--hostname-bin`, `less`의 `-o`·`-O`·`--log-file`·`-k`·`--lesskey`·`+`, `more`의 `+`
-  * 인식되지 않았다는 것은 "쓰는 명령"이라는 뜻이 아니라 "읽기 전용인지 모름"이라는 뜻이며, 그때는 위 표대로 묻거나 거부합니다. 이 면제는 승인 관련 검사에만 적용되고 서브에이전트의 `.memory/` 셸 검사에는 적용되지 않습니다.
-* **`<전역>/state/` 쓰기**: 승인 파일뿐 아니라 그 폴더 아래의 모든 파일이 대상입니다(받은편지함, 설치 기록 등). 셸 명령은 승인 파일 이름이 들어 있을 때만 걸립니다.
+  * 인식되지 않았다는 것은 "쓰는 명령"이라는 뜻이 아니라 "읽기 전용인지 모름"이라는 뜻이며, 그때는 위 표대로 묻거나 거부합니다. 이 면제는 승인 및 작업 규모 상태 폴더 검사에만 적용되고 서브에이전트의 `.memory/` 셸 검사에는 적용되지 않습니다.
+* **`<전역>/state/` 쓰기**: 파일 도구는 승인 파일뿐 아니라 그 폴더 아래의 모든 파일이 대상입니다(받은편지함, 작업 규모 상태, 설치 기록 등). 셸 명령은 승인 파일 이름이나 작업 규모 상태 폴더(`state/work-size`·`state\work-size` 또는 그 실제 경로)가 들어 있을 때 걸립니다.
 * **다른 프로젝트로 쓰기**: `project_dir`를 현재 프로젝트 루트 기준으로 풀어 실제 경로로 비교합니다. 같은 프로젝트를 가리키면 묻지 않습니다. `project_dir`로는 사용자가 승인한 프로젝트만 지정할 수 있으며(MCP 서버가 검사), 승인된 프로젝트끼리 읽는 것은 묻지 않습니다.
 * **`_caller_agent_id`**: 훅이 도구 입력에 덧붙이는 내부 인자입니다. 호스트가 알려 준 서브에이전트의 `agent_id`를 `updatedInput`으로 넣어, MCP 서버가 호출자가 서브에이전트임을 알 수 있게 합니다(서버는 이 값이 있으면 쓰기 도구를 `SUBAGENT_WRITE_DENIED`로 거부합니다). 모델이 스스로 적어 넣은 `_caller_agent_id`는 주 대화의 호출에서 제거합니다.
 
@@ -298,12 +312,29 @@ Claude Code는 이 훅의 일반 표준 출력을 압축 요약의 지시문으�
 
 * **호스트가 호출자 정보를 넘겨줄 때만 동작합니다.** MCP 서버는 호출이 서브에이전트의 것인지 스스로 알 수 없고, 이 훅이 호출에 붙여 주는 호출자 ID(`_caller_agent_id`)나 호스트가 보내는 메타데이터로 판단합니다. Claude Code 2.1.330은 이 정보를 실제로 넘겨주는 것을 확인했습니다(아래 [확인 상태](#확인-상태)).
 * **훅이 실패하면 통과합니다.** 훅이 오류를 내거나 제한 시간에 걸리면 호스트는 호출을 검사 없이 그대로 진행합니다.
-* **셸 명령 검사는 글자 판정입니다.** 명령에 `.memory`, 승인 파일 이름, 승인 명령 이름이라는 글자가 있는지만 봅니다. 실행 중에 이름을 조립하면 잡지 못하고, 반대로 무해한 언급이나 읽기만 하는 명령도 걸릴 수 있습니다. 또 셸 명령으로 `<전역>/state/` 폴더의 다른 파일(승인 목록 두 파일이 아닌 것)을 쓰는 것은 검사하지 않습니다. 파일 도구로 쓰는 것만 검사합니다.
+* **셸 명령 검사는 글자 판정입니다.** 명령에 `.memory`, 승인 파일 이름, 승인·작업 규모 명령 이름, `state/work-size` 경로가 있는지만 봅니다. 실행 중에 이름을 조립하면 잡지 못하고, 반대로 무해한 언급이나 인식 목록 밖의 읽기 명령도 걸릴 수 있습니다. 또 셸 명령으로 `<전역>/state/` 폴더의 그 밖의 파일(승인 목록 두 파일과 `state/work-size` 밖의 것)을 쓰는 것은 검사하지 않습니다.
 * **기억 도구와 `.memory/` 직접 쓰기만 다룹니다.** 서브에이전트가 다른 파일을 고치는 것은 이 장치의 대상이 아닙니다.
 * 등록되는 매처는 `mcp__herdr-cortex__`로 시작하는 도구와 파일 쓰기·셸 도구만 훅으로 보냅니다. 다른 도구로 `.memory/`를 건드리는 호출은 이 훅에 오지 않습니다.
 * 주 대화가 `.memory/`에 직접 쓰는 것은 막지 않습니다.
-* 이 훅은 매처에 맞는 도구 호출(이 서버의 도구, 파일 쓰기 도구, 셸 도구)마다 Node 프로세스를 하나 실행하므로 호출마다 약간의 시간(0.1초 안팎)이 더 듭니다.
+* **이 훅은 매처에 맞는 도구 호출마다 Node 프로세스를 하나 실행하므로** 호출마다 약간의 시간(수십 ms 안팎)이 더 듭니다.
 * 승인 파일과 승인 명령에 대한 검사는 에이전트가 스스로 승인하는 것을 어렵게 하는 장치의 일부입니다. 그 장치 전체가 하는 일과 막지 못하는 것(화면 조작, 승인 파일 직접 수정, 환경변수 조작)은 [`src/core/README.md`](../core/README.md#이-장치의-한계)에 있습니다.
+
+### 작업 규모(S/L) 측정·차단과 PostToolUse / SubagentStop (`work-size.mjs`)
+
+판정과 상태 관리는 호스트에 묶이지 않는 `src/hooks/work-size.mjs`가 맡고, `claude.mjs`는 Claude Code 훅 입출력과 환경변수 이름(`CLAUDE_PROJECT_DIR`)만 그 모듈의 꼴로 바꾸어 연결합니다. 색인 SQLite DB는 열지 않습니다.
+
+* **프로젝트 루트를 정하는 방식(`resolveWorkSizeProjectRoot`)**: Claude Code의 훅 입력 `cwd`는 에이전트가 셸에서 `cd`를 실행하면 함께 바뀌므로, 작업 규모 기능은 프로젝트 루트를 다음 순서로 정합니다. ① 호스트 어댑터가 지정한 환경변수(`CLAUDE_PROJECT_DIR` — Claude Code가 세션을 시작한 프로젝트 루트 절대 경로로 훅 프로세스에 넣어 주는 값, 향후 Antigravity 어댑터는 `workspacePaths`)가 있고 실제 폴더이면 그것 ② 그 탭/세션의 상태 파일에 이미 기록된 폴더 가운데 지금 `cwd`를 포함하는(같거나 상위인, 여럿이면 가장 깊은) 폴더가 있으면 그것 ③ 훅 입력의 `cwd`. 이 변경은 작업 규모 기능 안에서만 쓰이며 기억·승인 등 다른 기능이 프로젝트 폴더를 정하는 방식은 바꾸지 않습니다.
+* **폴더별 상태 파일·동시성·정리(`<전역>/state/work-size/`)**: Herdr 탭에서는 `HC_TERMINAL_ID` 기준 `tab-<탭 ID>.json`, 탭 밖에서는 세션 기준 `session-<세션 ID>.json`에 `version: 2` 형식으로 폴더별 상태(`projects` 맵: `cwdKey` → 현재 규모 `S`/`L`, `L`이 된 시각과 이유, 누적 구간 파일별 새 글자 수 `files`, `reviewAccepted`, `memorySaved`, 완료 1회 안내 표시 `completedNoticePending`, `cwd`)를 따로 담습니다(이전 단일 폴더 `version: 1` 파일도 읽을 때 새 형식으로 변환). 다른 프로젝트 폴더에서의 편집은 그 폴더 항목만 만들거나 바꾸고 다른 폴더의 `L` 상태는 덮어쓰지 않으므로, 원래 프로젝트 폴더로 돌아오면 `L` 상태가 그대로 이어집니다. 탭 기준이므로 `/clear`·압축·이어받기·재부팅 복구 뒤에도 남고, 깨진 파일은 없는 것으로 보고 새로 시작합니다. 상태를 읽고-고쳐-쓰는 구간은 `<상태 파일>.lock` 배타 생성 잠금(짧은 재시도, 죽은 프로세스나 `WORK_SIZE_LOCK_STALE_MS`를 넘긴 오래된 잠금 교체)으로 직렬화하며, 잠금을 끝내 얻지 못하거나 I/O 오류가 나면 기다리다 멈추지 않고 통과시킵니다. 상태 파일을 쓸 때 30일(`WORK_SIZE_SESSION_STALE_MS`) 넘게 바뀌지 않은 `session-*.json`과, `S`이면서 누적이 비고 아직 내보내지 않은 안내(`completedNoticePending`)도 없는 폴더 항목을 함께 지웁니다(내보낼 안내가 남은 항목은 다음 프롬프트에서 안내를 내보낸 뒤에 지우며, 남은 폴더 항목이 없으면 상태 파일도 지우고 정리 중 오류는 무시).
+* **세기와 막기(`PreToolUse`)**: 주 대화의 `Write`(`content`), `Edit`(`new_string`), `MultiEdit`(`edits`의 새 글 합), `NotebookEdit`(`new_source`) 가운데 위에서 정한 프로젝트 루트 안(`.memory/` 제외)의 파일을 셉니다(하위 폴더로 `cwd`가 바뀐 뒤 상위 프로젝트 루트의 파일을 고쳐도 같은 프로젝트 파일로 셈). 프로젝트 밖 파일, 워커 세션(`isWorkerSession`), 서브에이전트, 제외 프로젝트, `workSize.enabled: false`, 그리고 앞선 `PreToolUse` 검사가 이미 `deny`/`ask`를 낸 호출은 세지 않습니다. 고친 파일 수가 `workSize.maxFilesPerWindow`(기본 1)를 넘거나 한 파일 누적이 `workSize.maxCharsPerFile`(기본 1,000자)를 넘으면 `deny`로 막고(막힌 편집은 누적 제외), 그 폴더 상태가 `S`였으면 `L`로 올립니다.
+* **누적 비우기(`PostToolUse`)**: 주 대화에서 실제 `git commit` 명령(`--dry-run`·`--allow-empty`·`--short`·`--porcelain`·`--long`·`--help` 및 문자열 인자 제외, `git -C <폴더>`가 있으면 그 폴더가 프로젝트 루트 안일 때만, `-C`가 없으면 그때의 `cwd`가 프로젝트 루트 안일 때만) 또는 이 프로젝트의 `memory_save`가 성공하면 그 폴더의 `files` 누적을 비웁니다(`L` 상태 자체는 유지되므로 검수 지적에 대한 1파일·1,000자 이내 작은 수정은 가능).
+* **검수 기록과 L 종료(`SubagentStop`, `cortex-worker --role reviewer`, `PostToolUse`)**: `parseReviewVerdict`가 서브에이전트의 `last_assistant_message` 또는 `cortex-worker --role reviewer`의 표준 출력에서 `Verdict`, `Final verdict`, `판정`, `최종 판정` 제목·줄·목록 항목(`- **Verdict (판정)**: ...`)의 `ACCEPT`·`NEEDS_FIX`를 읽어, 그 폴더 상태가 `L`일 때 기록합니다(`NEEDS_FIX`는 기존 `ACCEPT` 기록을 지움). `ACCEPT`와 `memory_save` 두 조건이 모두 차면 `S`로 돌리고 다음 `UserPromptSubmit` 때 모델 문맥에 완료 안내 한 줄(`WORK_SIZE_COMPLETED_NOTICE`)을 한 번 넣습니다. 사용자는 `cortex-work status|release|reset [--all]`로 폴더별 상태를 직접 조회·해제할 수 있습니다.
+* **작업 규모 장치의 한계**:
+  * **셸을 통한 프로젝트 파일 쓰기 우회는 잡지 않습니다.** 작업 규모 상태 폴더(`state/work-size`)를 건드리는 셸 명령은 `PreToolUse`가 `ask`/`deny`로 가로채지만, 일반 프로젝트 파일을 `Bash`·`PowerShell`에서 `echo > file`, `sed -i`, 스크립트 실행 등으로 고치는 것은 세지 않습니다.
+  * **복합 셸 명령에서 커밋이 실제로 성공했는지는 알 수 없습니다.** `PostToolUse`는 셸 도구 전체가 성공 종료했을 때 명령 문자열을 보고 판정하므로, `git commit … || true`처럼 앞의 커밋이 실패해도 전체 명령 종료 코드가 0이면 누적이 비워질 수 있습니다.
+  * **프로젝트를 설정에서 제외하면 이 기능도 함께 꺼집니다.** 전역 설정의 `enabled: false`·`excludedProjects`·`mode: "opt-in"` 미등록뿐 아니라, 승인된 프로젝트의 `.memory/config.json`에 `enabled: false`가 적힌 경우에도 그 프로젝트에서는 세기·막기·안내·검수 기록이 모두 동작하지 않습니다.
+  * **`.memory/`를 뺀 프로젝트 루트 아래 모든 경로를 셉니다.** 별도 제외 목록을 두지 않으므로 프로젝트 안의 `node_modules`나 `.git` 아래 파일을 편집 도구로 고치면 프로젝트 안 파일로 함께 세집니다.
+  * **워커와 서브에이전트가 고친 파일은 세지 않습니다.** `L` 작업에서 워커에게 위임해 고치는 것이 의도된 경로이므로 주 대화(HEAD)의 편집 도구 호출만 셉니다.
+  * **검수 판정은 응답 글에서 읽습니다.** `Verdict` / `Final verdict` / `판정` / `최종 판정` 구획·목록 항목의 `ACCEPT`·`NEEDS_FIX` 표기를 문자열로 읽으므로(코드 블록·인용문·단순 본문 언급은 제외), 검수자가 정해진 출력 형식을 따르지 않으면 판정을 알아차리지 못하고 반대로 검수자가 아닌 서브에이전트의 글에 같은 판정 꼴의 줄이 있으면 검수 조건이 채워집니다.
 
 ---
 

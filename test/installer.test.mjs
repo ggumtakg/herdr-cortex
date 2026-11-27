@@ -95,7 +95,15 @@ const IS_WINDOWS = process.platform === 'win32';
 const SERVER_SCRIPT = path.join(REPO_ROOT, 'src', 'mcp', 'server.mjs');
 const CLAUDE_HOOK_SCRIPT = path.join(REPO_ROOT, 'src', 'hooks', 'claude.mjs');
 const AGY_HOOK_SCRIPT = path.join(REPO_ROOT, 'src', 'hooks', 'antigravity.mjs');
-const CLAUDE_EVENTS = ['SessionStart', 'SessionEnd', 'PreCompact', 'UserPromptSubmit', 'PreToolUse'];
+const CLAUDE_EVENTS = [
+  'SessionStart',
+  'SessionEnd',
+  'PreCompact',
+  'UserPromptSubmit',
+  'PreToolUse',
+  'PostToolUse',
+  'SubagentStop',
+];
 
 function makeTempEnv(prefix = 'herdr-cortex-installer-') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -171,6 +179,8 @@ test('installer: Claude Code hooks are written in exec form with the absolute No
       PreCompact: [['pre-compact']],
       UserPromptSubmit: [['user-prompt']],
       PreToolUse: [['pre-tool-use']],
+      PostToolUse: [['post-tool-use']],
+      SubagentStop: [['subagent-stop']],
     };
     for (const event of CLAUDE_EVENTS) {
       const expectedSpecs = expectedArgsByEvent[event];
@@ -1329,6 +1339,8 @@ test('status checks: hook registration is verified per event with the strict ide
       PreCompact: 'missing',
       UserPromptSubmit: 'node_on_path',
       PreToolUse: 'matcher',
+      PostToolUse: 'ok',
+      SubagentStop: 'ok',
     });
     assert.match(broken.events.SessionStart.problems[0].message, /the recorded Node path does not exist: .*gone/);
     assert.match(broken.events.UserPromptSubmit.problems[0].message, /starts "node" by name, which only works while node is on PATH/);

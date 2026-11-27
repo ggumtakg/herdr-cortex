@@ -17,7 +17,7 @@
 
 | 파일 | 역할 | Export |
 | :--- | :--- | :--- |
-| **`config.mjs`** | 전역 저장소와 홈 폴더 위치 결정, 계층 폴더 구조, 설정 읽기와 병합, 프로젝트 사용 여부 판정, 승인 목록 읽기, ID·경로 검증, 프롬프트 경로 자리표시자 치환, 원자적 파일 쓰기, 시각 형식 | `CORTEX_ROOT_PLACEHOLDER`, `DEFAULT_CONFIG`, `EMBEDDING_PROVIDER_NAMES`, `GLOBAL_DIR_NAME`, `LEGACY_EMBEDDING_KEYS`, `LEGACY_EMBEDDING_KEY_TARGETS`, `MEMORY_GITIGNORE_CONTENT`, `REPO_ROOT`, `assertInsideDir`, `atomicWriteJson`, `atomicWriteText`, `compareTimestamps`, `describeLegacyEmbeddingKeys`, `ensureMemoryGitignore`, `ensureTierDirs`, `expandCortexRootPlaceholder`, `findLegacyEmbeddingKeys`, `formatIsoTimestamp`, `formatLegacyEmbeddingContextNotice`, `formatLegacyEmbeddingUserNotices`, `generateDocId`, `getConfigProblems`, `getGlobalDir`, `getProjectMemoryDir`, `getTierPaths`, `getTrustedProjectsPath`, `hasProjectMemoryDir`, `isMainModule`, `isProjectEnabled`, `isProjectTrusted`, `isValidId`, `loadConfig`, `normalizeRelPath`, `parseTimestampMs`, `projectPathKey`, `readTrustedProjects`, `resolveGlobalDir`, `resolveHomeDir`, `resolveProjectRoot`, `sanitizeProjectConfig`, `sanitizeRelFilePath`, `trustedPathKey`, `validateDocId` |
+| **`config.mjs`** | 전역 저장소와 홈 폴더 위치 결정, 계층 폴더 구조, 설정 읽기와 병합, 프로젝트 사용 여부 판정, 승인 목록 읽기, ID·경로 검증, 프롬프트 경로 자리표시자 치환, 원자적 파일 쓰기, 시각 형식 | `CORTEX_ROOT_PLACEHOLDER`, `DEFAULT_CONFIG`, `DEFAULT_WORK_SIZE`, `EMBEDDING_PROVIDER_NAMES`, `GLOBAL_DIR_NAME`, `LEGACY_EMBEDDING_KEYS`, `LEGACY_EMBEDDING_KEY_TARGETS`, `MEMORY_GITIGNORE_CONTENT`, `REPO_ROOT`, `WORK_SIZE_KEYS`, `assertInsideDir`, `atomicWriteJson`, `atomicWriteText`, `compareTimestamps`, `describeLegacyEmbeddingKeys`, `ensureMemoryGitignore`, `ensureTierDirs`, `expandCortexRootPlaceholder`, `findLegacyEmbeddingKeys`, `formatIsoTimestamp`, `formatLegacyEmbeddingContextNotice`, `formatLegacyEmbeddingUserNotices`, `generateDocId`, `getConfigProblems`, `getGlobalDir`, `getProjectMemoryDir`, `getTierPaths`, `getTrustedProjectsPath`, `hasProjectMemoryDir`, `isMainModule`, `isProjectEnabled`, `isProjectTrusted`, `isValidId`, `loadConfig`, `normalizeRelPath`, `parseTimestampMs`, `projectPathKey`, `readTrustedProjects`, `resolveGlobalDir`, `resolveHomeDir`, `resolveProjectRoot`, `resolveWorkSizeConfig`, `sanitizeProjectConfig`, `sanitizeRelFilePath`, `trustedPathKey`, `validateDocId` |
 | **`trust.mjs`** | 프로젝트 승인 목록의 쓰기 쪽(승인, 취소, 조회), 사람이 확인한 승인 목록, 두 목록의 차이 감지, 안내 문구와 1회 안내 기록 | `ACKNOWLEDGED_APPROVALS_FILE`, `ACKNOWLEDGE_COMMAND`, `APPROVALS_CHANGED_AGENT_NOTE`, `APPROVALS_CHANGE_MAX_FOLDERS`, `APPROVAL_STATE_FILE_NAMES`, `PROJECT_APPROVAL_INSTRUCTION`, `PROJECT_NOT_APPROVED_CODE`, `ProjectNotApprovedError`, `TRUST_COMMAND`, `UNAPPROVED_FOLDER_NOTICES_FILE`, `acknowledgeApproval`, `acknowledgeCurrentApprovals`, `acknowledgeRevocation`, `approveProject`, `describeApprovalsChange`, `describeProjectTrust`, `formatApprovalsChangedContext`, `formatApprovalsChangedWarning`, `formatProjectNotApprovedMessage`, `formatProjectNotApprovedNotice`, `formatProjectNotApprovedUserNotice`, `formatUnapprovedFolderNotice`, `formatUnapprovedFolderUserNotice`, `getAcknowledgedApprovalsPath`, `getTrustedProjectsPath`, `getUnapprovedFolderNoticesPath`, `hasUnapprovedFolderNoticeRecord`, `isHomeOrRootFolder`, `isProjectTrusted`, `listTrustedProjects`, `readAcknowledgedApprovals`, `recordUnapprovedFolderNotice`, `resolveApprovalTarget`, `revokeProject` |
 | **`trust-cli.mjs`** | 승인 명령줄(`cortex-trust`, `npm run trust`): `approve`, `revoke`, `status`, `list`, `acknowledge` | `ACKNOWLEDGE_DIALOG_MAX_FOLDERS`, `APPROVE_DIALOG_MEANING`, `TRUST_CLI_USAGE`, `TRUST_EXIT_ERROR`, `TRUST_EXIT_NOT_APPROVED`, `TRUST_EXIT_OK`, `buildAcknowledgeDialogMessage`, `buildApproveDialogMessage`, `resolveTrustCliCwd`, `runTrustCli` |
 | **`confirm.mjs`** | 사람에게 확인받기: Windows 확인 대화상자, 터미널 질문으로 대체, 물을 수 없을 때의 거부 | `CONFIRM_DIALOG_SCRIPT`, `CONFIRM_DIALOG_SHOW_LINE`, `CONFIRM_DIALOG_TITLE`, `CONFIRM_TERMINAL_PROMPT`, `CONFIRM_TERMINAL_WORD`, `confirmWithUser`, `resolveWindowsPowerShell`, `showWindowsConfirmDialog` |
@@ -62,6 +62,7 @@
   state/unapproved-folder-notices.json     .memory/가 없는 미승인 폴더의 1회 안내 기록
   state/approval-checks/                   세션별로 승인 목록을 마지막으로 확인한 기록
   state/inbox/<탭 ID>/                     릴레이 받은편지함
+  state/work-size/                         탭·세션별 작업 규모(S/L)와 편집 누적 상태
   state/cleared-sessions/                  /clear로 끝난 세션의 기록(10분 뒤 정리)
   state/checkpoints/                       Antigravity 대화별 상태(승인되지 않았거나 .memory/가 없는 프로젝트의 것)
   state/deferred-index.json                색인을 미룬 문서의 기록
@@ -148,6 +149,11 @@
   excludedProjects: [],
   headCoreEnabled: true,
   hookBudget: 9000,
+  workSize: {
+    enabled: true,
+    maxFilesPerWindow: 1,
+    maxCharsPerFile: 1000,
+  },
   embedding: {
     provider: 'none',       // none | auto | gemini | openai | ollama | onnx
     chunkMaxChars: 800,
@@ -171,6 +177,9 @@
 | `excludedProjects` | `[]` | 끌 프로젝트 규칙 목록. 어떤 설정으로도 뒤집을 수 없습니다. |
 | `headCoreEnabled` | `true` | 훅이 `HEAD_CORE` 프롬프트를 주입할지 여부([`../hooks/README.md`](../hooks/README.md)) |
 | `hookBudget` | `9000` | 훅 한 번이 주입하는 글자 수 한도. 상한은 9,000자입니다([9. 주입 분량](#9-주입-분량과-주입-표시-budgetmjs)). |
+| `workSize.enabled` | `true` | 훅이 주 대화(HEAD)의 파일 편집 수·글자 수를 세어 한도 초과 시 막고 L 상태를 관리할지 여부. `false`이면 세기·막기·안내·검수 기록을 모두 하지 않고 상태 파일도 건드리지 않습니다([`../hooks/README.md`](../hooks/README.md)). |
+| `workSize.maxFilesPerWindow` | `1` | 누적 구간 안에서 HEAD가 직접 고칠 수 있는 최대 파일 수(1 이상의 정수). |
+| `workSize.maxCharsPerFile` | `1000` | 누적 구간 안에서 파일 하나에 새로 쓸 수 있는 최대 누적 글자 수(1 이상의 정수). |
 | `embedding.provider` | `'none'` | 임베딩 프로바이더. `none`이면 아무것도 임베딩하지 않고 이 PC 밖으로 나가는 것도 없습니다. `auto`는 사용자가 직접 고르는 값이며 기본값이 아닙니다. |
 | `embedding.chunkMaxChars` | `800` | 임베딩할 조각의 최대 글자 수 |
 | `embedding.chunkOverlap` | `100` | 이웃 조각끼리 겹치는 글자 수 |
@@ -181,7 +190,7 @@
 | `embedding.openai` | `{ model: '', dimensions: 0, apiKeyEnv: '', apiKey: '', baseUrl: '' }` | OpenAI 전용 설정 묶음 |
 | `embedding.ollama` | `{ baseUrl: '', model: '', dimensions: 0 }` | Ollama 전용 설정 묶음 |
 | `embedding.onnx` | `{ enabled: false, model: '' }` | ONNX 전용 설정 묶음 |
-| `projects` | `{}` | 프로젝트별 설정. 키는 프로젝트의 절대 경로입니다. 지금은 `embedding`만 읽습니다. |
+| `projects` | `{}` | 프로젝트별 설정. 키는 프로젝트의 절대 경로입니다. `embedding`과 `workSize`를 읽습니다. |
 | `enabled` | 없음(기본값 객체에 없는 키) | `false`로 두면 전체를 끕니다. |
 | `claudeExtraArgs`, `agyExtraArgs` | 없음(기본값 객체에 없는 키) | 탭 복구 명령 뒤에 붙일 인자 배열. 이 폴더의 코드는 읽지 않고 탭 복구 스크립트가 읽습니다([`../../scripts/README.md`](../../scripts/README.md#탭-하나에-대한-판정)). |
 
@@ -195,27 +204,30 @@
 
 1. `DEFAULT_CONFIG`
 2. 전역 설정 파일 `<전역 저장소>/config.json`
-3. 전역 설정 파일의 `projects["<이 프로젝트의 경로>"].embedding`
+3. 전역 설정 파일의 `projects["<이 프로젝트의 경로>"].embedding` 및 `projects["<이 프로젝트의 경로>"].workSize`
 4. 프로젝트의 `.memory/config.json`에서 `sanitizeProjectConfig`가 남긴 키. 사용자가 그 폴더를 승인했을 때만 읽습니다.
 5. `overrides`(명령줄 옵션 등 코드에서 넘긴 값)
 
-맨 위 단계의 키는 통째로 바뀌고, `embedding`은 키별로 합쳐지며, 프로바이더 묶음은 다시 그 안에서 키별로 합쳐집니다. 그래서 `ollama.model`만 덮어써도 물려받은 `ollama.baseUrl`은 남습니다. 전역 설정 파일이 JSON이 아니거나 객체가 아니면 표준 오류에 `[herdr-cortex] Warning: ...` 한 줄을 남기고 기본값으로 진행합니다. 프로젝트 파일은 읽지 못해도 말없이 건너뜁니다. 두 파일 모두 맨 앞의 BOM은 떼고 읽습니다.
+맨 위 단계의 키는 통째로 바뀌고, `workSize`와 `embedding`은 키별로 합쳐지며, 프로바이더 묶음은 다시 그 안에서 키별로 합쳐집니다. 그래서 `ollama.model`만 덮어써도 물려받은 `ollama.baseUrl`은 남고, 프로젝트별로 `workSize.enabled`만 덮어써도 나머지 한도 값은 유지됩니다. `workSize`의 값이 잘못된 경우(`enabled`가 불리언이 아니거나 `maxFilesPerWindow`·`maxCharsPerFile`가 1 이상의 정수가 아닌 경우, `workSize` 자체가 객체가 아닌 경우, 모르는 키가 있는 경우)에는 해당 항목을 기본값(`DEFAULT_WORK_SIZE`)으로 되돌리고 `getConfigProblems(config)`에 `invalid_work_size`로 기록하며 표준 오류에 한 번 경고합니다. 전역 설정 파일이 JSON이 아니거나 객체가 아니면 표준 오류에 `[herdr-cortex] Warning: ...` 한 줄을 남기고 기본값으로 진행합니다. 프로젝트 파일은 읽지 못해도 말없이 건너뜁니다. 두 파일 모두 맨 앞의 BOM은 떼고 읽습니다.
 
 ### 프로젝트별 설정은 전역 설정 파일에
 
-프로젝트마다 다른 임베딩 설정은 사용자의 전역 설정 파일에 적습니다.
+프로젝트마다 다른 임베딩·작업 규모 설정은 사용자의 전역 설정 파일에 적습니다.
 
 ```json
 {
   "embedding": { "provider": "none" },
   "projects": {
-    "D:\\work\\app": { "embedding": { "provider": "ollama", "ollama": { "model": "bge-m3" } } }
+    "D:\\work\\app": {
+      "embedding": { "provider": "ollama", "ollama": { "model": "bge-m3" } },
+      "workSize": { "maxFilesPerWindow": 2, "maxCharsPerFile": 1500 }
+    }
   }
 }
 ```
 
 - 키는 절대 경로여야 하고, 프로젝트 루트와 **정확히 같은 폴더**일 때만 적용됩니다(양쪽을 `projectPathKey`로 바꿔 비교). 상위 폴더나 같은 이름의 다른 폴더에는 적용되지 않습니다.
-- 항목에서 읽는 것은 `embedding`뿐입니다.
+- 항목에서 읽는 것은 `embedding`과 `workSize`입니다. (저장소 안의 `.memory/config.json`은 `workSize`를 바꿀 수 없습니다.)
 - 전역 계층의 임베딩은 이 겹침을 따르지 않고 항상 전역 설정만 따릅니다(`CortexStore`의 `globalConfig`). 전역 기억은 모든 프로젝트가 함께 쓰기 때문입니다.
 
 ### 프로젝트의 `.memory/config.json`이 정할 수 있는 것

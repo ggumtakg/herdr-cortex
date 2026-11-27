@@ -90,9 +90,11 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
       assert.match(coreContent, new RegExp(assetName), `HEAD_CORE.md missing asset "${assetName}"`);
     }
     assert.match(coreContent, /cortex_prompt\(\)/);
-    // Relay details stay in start-job / delegate, and unimplemented edit-counting hooks are not claimed
+    // Relay details stay in start-job / delegate, and HEAD_CORE documents hook S/L counting + cortex-work release
     assert.doesNotMatch(coreContent, /relay_tabs/);
-    assert.doesNotMatch(coreContent, /훅이 편집을 세어/);
+    assert.match(coreContent, /아래 기준으로 스스로 판정한다/);
+    assert.match(coreContent, /훅이 세며/);
+    assert.match(coreContent, /cortex-work/);
 
     const coreExplicit = await registry.callTool('cortex_prompt', { kind: 'core', name: 'HEAD_CORE' });
     assert.equal(coreExplicit.isError, false);
@@ -139,6 +141,7 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
           /ACCEPT/,
           /memory_save/,
           /둘 다/,
+          /훅에 기록되며.*풀린다/,
           /DEVELOPMENT_STANDARD/,
           /product-planning/,
         ],

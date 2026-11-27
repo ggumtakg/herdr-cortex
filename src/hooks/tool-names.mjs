@@ -62,3 +62,12 @@ export const CLAUDE_PRE_TOOL_USE_MATCHER = [
   ...FILE_WRITE_TOOL_NAMES,
   ...SHELL_TOOL_NAMES,
 ].join('|');
+
+/**
+ * Matcher the installer registers for the Claude Code PostToolUse hook: shell tools (to detect `git commit`)
+ * and this server's `memory_save` tool (to clear cumulative edit counts and record L completion).
+ */
+export const CLAUDE_POST_TOOL_USE_MATCHER = [
+  ...SHELL_TOOL_NAMES,
+  `mcp__${MCP_SERVER_NAME}__memory_save`,
+].join('|');

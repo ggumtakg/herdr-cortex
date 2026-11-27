@@ -2,7 +2,7 @@
 
 > [← 루트 README](../README.md)
 
-이 폴더에는 사용자의 PowerShell에서 직접 쓰는 것들이 들어 있습니다. PowerShell 프로필이 불러오는 스크립트(`auto-revive.ps1`)가 셸 명령 여섯 개를 만들고, 재부팅 뒤 빈 셸로 다시 열린 Herdr 탭에서 에이전트를 되살립니다. 루트의 [`install.ps1`](../install.ps1)과 [`uninstall.ps1`](../uninstall.ps1)이 쓰는 보조 함수, `cortex-status`와 `cortex-worker` 명령의 본체, 그리고 예전 호출 방식을 위한 얇은 Node 래퍼 두 개도 여기에 있습니다.
+이 폴더에는 사용자의 PowerShell에서 직접 쓰는 것들이 들어 있습니다. PowerShell 프로필이 불러오는 스크립트(`auto-revive.ps1`)가 셸 명령 일곱 개를 만들고, 재부팅 뒤 빈 셸로 다시 열린 Herdr 탭에서 에이전트를 되살립니다. 루트의 [`install.ps1`](../install.ps1)과 [`uninstall.ps1`](../uninstall.ps1)이 쓰는 보조 함수, `cortex-status`·`cortex-work`·`cortex-worker` 명령의 본체, 그리고 예전 호출 방식을 위한 얇은 Node 래퍼 두 개도 여기에 있습니다.
 
 Windows PowerShell 5.1과 PowerShell 7 이상에서 동작하도록 작성되어 있습니다. 다만 자동 테스트는 Windows PowerShell 5.1(`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`)로만 실행합니다.
 
@@ -12,13 +12,14 @@ Windows PowerShell 5.1과 PowerShell 7 이상에서 동작하도록 작성되어
 
 | 파일 | 실행 방식 | 역할 | 정의하는 것 |
 | :--- | :--- | :--- | :--- |
-| **`auto-revive.ps1`** | PowerShell 프로필이 점(`.`)으로 불러옴 | 셸 명령을 만들고, 셸이 시작될 때 이 탭을 자동으로 복구합니다. | 전역 함수(셸 명령) `revive-agents`, `revive-agy`, `revive-status`, `cortex-trust`, `cortex-status`, `cortex-worker`. 내부 함수 `Get-HerdrRecordedNode`, `Resolve-HerdrNode`, `Write-HerdrNodeMissing`, `Invoke-HerdrNodeScript`, `Invoke-HerdrHcJson`, `Get-HerdrAutoRevivePlan`, `Invoke-HerdrAutoRevive` |
+| **`auto-revive.ps1`** | PowerShell 프로필이 점(`.`)으로 불러옴 | 셸 명령을 만들고, 셸이 시작될 때 이 탭을 자동으로 복구합니다. | 전역 함수(셸 명령) `revive-agents`, `revive-agy`, `revive-status`, `cortex-trust`, `cortex-status`, `cortex-work`, `cortex-worker`. 내부 함수 `Get-HerdrRecordedNode`, `Resolve-HerdrNode`, `Write-HerdrNodeMissing`, `Invoke-HerdrNodeScript`, `Invoke-HerdrHcJson`, `Get-HerdrAutoRevivePlan`, `Invoke-HerdrAutoRevive` |
 | **`revive-agents.ps1`** | 직접 실행(`revive-agents` 명령이 호출) | `hc ls --json`으로 탭 목록을 읽고, 빈 셸 탭마다 복구 명령을 `hc send`로 입력합니다. | 매개변수 `-DryRun`, `-Status`, `-DelayMs <밀리초>`(기본 300) |
 | **`revive-common.ps1`** | 점으로 불러옴 | 위 두 스크립트가 함께 쓰는 판정 함수입니다. 탭 하나에 무엇을 할지는 여기서만 정합니다. | `Test-HerdrTerminalId`, `Test-HerdrSessionId`, `ConvertTo-HerdrPathKey`, `Test-HerdrBareShell`, `Get-HerdrTerminalMeta`, `Read-HerdrSavedSession`, `Read-HerdrReviveConfig`, `Get-HerdrTitleAgent`, `Get-HerdrRunningAgent`, `Get-HerdrAgentExe`, `Format-HerdrSetLocation`, `Resolve-HerdrRevivePlans` |
 | **`store-location.ps1`** | 점으로 불러옴 | 홈 폴더와 전역 저장소 위치를 정하는 한 곳입니다. Node 쪽의 `resolveHomeDir`·`resolveGlobalDir`([`src/core/config.mjs`](../src/core/README.md))와 같은 순서를 씁니다. | `Get-HerdrTestHome`, `Get-HerdrEffectiveHome`, `Get-HerdrCortexGlobalDir` |
 | **`install-tools.ps1`** | 점으로 불러옴. `-Action`을 주면 한 가지 작업을 하고 결과를 JSON 한 줄로 출력 | 프로필 블록을 파일의 원래 인코딩 그대로 넣고 빼는 함수와 실행 정책 기록 함수입니다. | `Get-HerdrBackupStamp`, `New-HerdrDatedBackup`, `Get-HerdrAnsiEncoding`, `Get-HerdrTextEncoding`, `Test-HerdrBytesEqual`, `ConvertTo-HerdrFileBytes`, `Read-HerdrProfile`, `Find-HerdrBlockSpans`, `Remove-HerdrSpans`, `Get-HerdrLineBreak`, `Set-HerdrBlockInText`, `Remove-HerdrBlockFromText`, `Set-HerdrProfileBlock`, `Remove-HerdrProfileBlock`, `ConvertTo-HerdrPathExpression`, `Get-HerdrProfileBlockLines`, `Get-HerdrPolicyState`, `Invoke-HerdrPolicyChange`, `Set-HerdrCurrentUserPolicy`, `Test-HerdrPolicyBlocksProfile`, `Get-HerdrPolicyRecordPath`, `Read-HerdrPolicyRecord`, `Write-HerdrPolicyRecord` |
 | **`cortex-status.mjs`** | `node --no-warnings scripts/cortex-status.mjs [--cwd <폴더>] [--json]` | `cortex-status` 명령의 본체입니다. 설정 파일과 로컬 색인만 읽고 네트워크 요청은 하지 않습니다. | Export: `collectStatus`, `formatStatus` |
-| **`cortex-worker.mjs`** | `node --no-warnings scripts/cortex-worker.mjs --role <developer\|coder\|reviewer\|researcher> --agent <antigravity\|claude> --model <모델> --brief <지시 파일> [--out <결과 파일>] [--timeout <분>] [--allow <규칙>]... [--cwd <폴더>]` | `cortex-worker` 명령의 본체입니다. 환경 변수와 세션 한정 권한을 맞추어 `agy -p` 또는 `claude -p` 헤드리스 워커를 실행합니다. | Export: `VALID_ROLES`, `DEFAULT_TIMEOUT_MINUTES`, `WORKER_USAGE`, `HOST_SPECS`, `formatAgyTimeout`, `buildWorkerEnv`, `buildWorkerPrompt`, `parseWorkerArgs`, `resolveExecutable`, `quoteCmdArg`, `buildSpawnSpec`, `runWorker` |
+| **`cortex-work.mjs`** | `node --no-warnings scripts/cortex-work.mjs <status\|release\|reset> [--tab <탭 ID>] [--all] [--json]` | `cortex-work` 명령의 본체입니다. 탭 안에 기록된 폴더별 작업 규모(`S`/`L`)와 편집 누적을 조회하거나, 현재 폴더(또는 `--all`로 탭 전체)의 상태를 해제·초기화합니다. | Export: `WORK_CLI_USAGE`, `WORK_EXIT_ERROR`, `WORK_EXIT_OK`, `runWorkCli` |
+| **`cortex-worker.mjs`** | `node --no-warnings scripts/cortex-worker.mjs --role <developer\|coder\|reviewer\|researcher> --agent <antigravity\|claude> --model <모델> --brief <지시 파일> [--out <결과 파일>] [--timeout <분>] [--allow <규칙>]... [--cwd <폴더>]` | `cortex-worker` 명령의 본체입니다. 환경 변수와 세션 한정 권한을 맞추어 `agy -p` 또는 `claude -p` 헤드리스 워커를 실행하고, `--role reviewer`가 정상 종료되면 출력의 판정(`ACCEPT`/`NEEDS_FIX`)을 호출 탭의 `L` 상태에 기록합니다. | Export: `VALID_ROLES`, `DEFAULT_TIMEOUT_MINUTES`, `WORKER_USAGE`, `HOST_SPECS`, `formatAgyTimeout`, `buildWorkerEnv`, `buildWorkerPrompt`, `parseWorkerArgs`, `resolveExecutable`, `quoteCmdArg`, `buildSpawnSpec`, `runWorker` |
 | **`merge-hooks.mjs`** | `node scripts/merge-hooks.mjs <install\|uninstall> [repoRoot]` | [`src/hooks/installer.mjs`](../src/hooks/README.md)의 `installCortex`·`uninstallCortex`를 그대로 부르는 래퍼입니다. 인자가 `install`도 `uninstall`도 아니면 사용법을 출력하고 종료 코드 1로 끝납니다. | Export 없음(불러오는 즉시 실행됨) |
 | **`record-session.mjs`** | `node scripts/record-session.mjs <antigravity\|claude>` (표준 입력으로 훅 JSON) | [`src/revive/tracker.mjs`](../src/revive/README.md)의 `recordSession`을 부르는 래퍼입니다. 오류가 나도 항상 종료 코드 0으로 끝나며, `antigravity`일 때는 `{}`를 출력합니다. | Export 없음(불러오는 즉시 실행됨) |
 
@@ -53,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | 대상 | 하는 일 |
 | :--- | :--- |
 | **전역 저장소** `%USERPROFILE%\.herdr-cortex\` | `docs\`, `sessions\`, `config.json`을 만듭니다. `config.json`이 이미 있으면 그대로 두되, 이전 버전 설치기가 쓴 기본값과 완전히 같으면(임베딩 `auto`, 사용자가 고친 적 없음) 백업 후 현재 기본값(임베딩 꺼짐)으로 바꿉니다. 사용자가 고친 파일은 건드리지 않고 문제만 경고합니다. 설치에 쓴 Node 경로는 `state\install.json`에 기록합니다. |
-| **Claude Code 훅** `~\.claude\settings.json` | `SessionStart`에 두 개(`session-start core`, `session-start context`), `SessionEnd`·`PreCompact`·`UserPromptSubmit`·`PreToolUse`에 하나씩(총 여섯 개) 훅을 추가합니다. 각 훅은 `command`에 **Node 실행 파일의 절대 경로**, `args`에 인자 목록을 적는 형식이어서 셸을 거치지 않고 실행되며 `node`가 PATH에 없어도 됩니다. 이 도구의 훅은 인자 끝의 `--id herdr-cortex`(또는 이전 버전의 `--marker herdr-cortex`)로 구분하고, 다시 설치하면 이전 단일 `session-start` 등록을 포함해 그 표시가 있는 훅만 새 등록으로 바꿉니다. 사용자가 등록한 다른 훅은 그대로 둡니다. |
+| **Claude Code 훅** `~\.claude\settings.json` | `SessionStart`에 두 개(`session-start core`, `session-start context`), `SessionEnd`·`PreCompact`·`UserPromptSubmit`·`PreToolUse`·`PostToolUse`·`SubagentStop`에 하나씩(7개 이벤트, 총 여덟 개) 훅을 추가합니다. 각 훅은 `command`에 **Node 실행 파일의 절대 경로**, `args`에 인자 목록을 적는 형식이어서 셸을 거치지 않고 실행되며 `node`가 PATH에 없어도 됩니다. 이 도구의 훅은 인자 끝의 `--id herdr-cortex`(또는 이전 버전의 `--marker herdr-cortex`)로 구분하고, 다시 설치하면 이전 등록을 포함해 그 표시가 있는 훅만 새 등록으로 바꿉니다. 사용자가 등록한 다른 훅은 그대로 둡니다. |
 | **Claude Code MCP 서버** `~\.claude.json` | `claude` 명령을 찾으면 `claude mcp add --scope user --transport stdio herdr-cortex -- <node 경로> --no-warnings <저장소>\src\mcp\server.mjs`로 등록합니다. `claude`를 찾지 못했거나 그 명령이 실패하면 파일을 직접 고치고 그렇게 했다고 알립니다. 예전 이름 `cortex`로 등록된 항목은 이 도구의 것일 때만 지웁니다. 등록 뒤 1.5초를 기다렸다가 다시 읽어, 실행 중인 Claude Code가 파일을 덮어써 등록이 사라졌으면 경고합니다. |
 | **Claude Code 스킬** `~\.claude\skills\cortex-*` | `prompts\skills\`의 스킬 5개를 `cortex-<이름>`으로 복사하며, 하위 파일을 포함해 `{{HERDR_CORTEX_ROOT}}` 자리표시자를 설치된 저장소 루트 경로(`/` 구분자)로 치환합니다. 이 도구가 만든 폴더(표시 파일 `.herdr-cortex-managed`가 있음)만 바꿉니다. |
 | **Antigravity** `~\.gemini\` | `agy`가 PATH에 있거나 `~\.gemini` 폴더가 이미 있을 때만 건드립니다. `config\hooks.json`에 `SessionStart`와 `PreInvocation` 훅을, `antigravity-cli\mcp_config.json`에 MCP 서버를 등록합니다. `config\mcp_config.json`은 이미 있을 때만 갱신합니다. |
@@ -105,6 +106,9 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 | 명령 | 하는 일 |
 | :--- | :--- |
 | `cortex-status` | 설치 상태와 현재 폴더의 상태를 한 화면에 보여 줍니다(아래 "진단 항목"). |
+| `cortex-work status [--tab <탭 ID>]` | 이 탭(또는 `--tab`으로 지정한 탭)에 기록된 폴더별 작업 규모(`S`/`L`), 누적 편집 파일, 남은 완료 조건을 보여 줍니다(`--json` 지원). |
+| `cortex-work release [--tab <탭 ID>] [--all]` | 기본으로 이 셸의 현재 폴더(하위 폴더에 있으면 그 폴더를 포함하는 기록된 프로젝트 폴더)의 `L` 상태를 끝내고 `S`로 되돌립니다(`--all`을 붙이면 그 탭에 기록된 모든 폴더에 작용). 에이전트가 직접 실행하려 하면 `PreToolUse`가 사용자 확인(`ask`)을 요구하거나 차단(`deny`)합니다. |
+| `cortex-work reset [--tab <탭 ID>] [--all]` | 기본으로 현재 폴더(또는 `--all`로 그 탭의 모든 기록된 폴더)에서 작업 규모(`S`/`L`)는 그대로 두고 파일별 편집 누적만 비웁니다. |
 | `cortex-worker` | 지시 파일을 읽어 `agy -p` 또는 `claude -p` 헤드리스 워커를 격리된 환경과 세션 한정 권한으로 실행합니다(아래 "`cortex-worker` 워커 실행"). |
 | `cortex-trust approve [폴더]` | 그 폴더 하나를 승인합니다. 확인 대화상자가 먼저 뜨고 "예"를 눌러야 승인됩니다. |
 | `cortex-trust revoke [폴더]` | 승인을 거둡니다. 대화상자는 뜨지 않습니다. |
@@ -137,6 +141,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 | `Embedding` | 임베딩이 꺼져 있는지, 켜져 있으면 어느 프로바이더·모델·호스트로 보내는지, 포기한 문서 수 |
 | `Index` | 계층(project, global)별 문서 수와 임베딩 상태, 아직 색인되지 않은 문서 수, 중복 ID 수 |
 | `Relay inbox` | 이 탭의 받은편지함(대기, 전달 후 보관, 깨진 파일 수). Herdr 탭이 아니면 메시지가 있는 받은편지함 목록 |
+| `Work size` | 이 탭의 현재 폴더 작업 규모(`S`/`L`), 구간 내 편집 파일 수, 한도(또는 `L`일 때 남은 완료 조건) |
 | `Config` | 설정 파일에서 발견한 문제 수 |
 | `Result` 또는 `Needs attention` | 문제가 없으면 한 줄, 있으면 주의할 항목 목록 |
 

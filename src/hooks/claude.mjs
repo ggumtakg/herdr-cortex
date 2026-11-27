@@ -69,9 +69,25 @@ import {
   formatRecentTurns,
   hasClaudeSessionStartMarker,
 } from './recent-turns.mjs';
+import {
+  WORK_SIZE_COMPLETED_NOTICE,
+  commandRunsGitCommit,
+  consumeWorkSizeCompletedNotice,
+  evaluateWorkSizeEdit,
+  getWorkSizeDir,
+  getWorkSizeSessionNotice,
+  isPathInsideMemoryDir,
+  parseReviewVerdict,
+  recordGitCommitForWorkSize,
+  recordMemorySaveForWorkSize,
+  recordReviewVerdict,
+  resolveWorkSizeProjectRoot,
+  resolveWorkSizeScope,
+} from './work-size.mjs';
 
 export const CLAUDE_HOOK_MAX_CHARS = HOOK_MAX_CHARS;
-export { EMPTY_MEMORY_NOTICE, HEAD_CORE_MAX_CHARS };
+export const CLAUDE_PROJECT_DIR_ENV = 'CLAUDE_PROJECT_DIR';
+export { EMPTY_MEMORY_NOTICE, HEAD_CORE_MAX_CHARS, WORK_SIZE_COMPLETED_NOTICE, isPathInsideMemoryDir };
 
 /**
  * Instruction for the compaction summary. Claude Code takes the plain stdout of a PreCompact hook as
@@ -102,6 +118,13 @@ export const SUBAGENT_MEMORY_DIR_DENY_REASON =
 export const SUBAGENT_TRUST_CHANGE_DENY_REASON =
   '[herdr-cortex] Subagents must not change herdr-cortex project approvals or files in the herdr-cortex state folder. '
   + 'Approving a project is the user\'s decision: hand the request back to the main conversation.';
+
+export const WORK_COMMAND_DENY_REASON =
+  '[herdr-cortex] Subagents and delegated workers must not release or reset herdr-cortex work-size state (`cortex-work`). '
+  + 'Only the user may release or reset work-size limits.';
+
+export const WORK_STATE_SHELL_DENY_REASON =
+  '[herdr-cortex] Subagents and delegated workers must not modify or delete files in the herdr-cortex work-size state folder.';
 
 /**
  * Notes injected at session start when the turns before a /clear or a compaction could not be restored.
@@ -167,31 +190,6 @@ function isWriteProtectedCortexCall(toolName, rawInput = {}) {
 }
 
 export { isCortexToolName };
-
-// Windows ignores trailing dots and spaces in a file name, so ".memory." and ".memory " name the same folder.
-function isMemoryDirSegment(segment) {
-  return segment.replace(/[. ]+$/, '').toLowerCase() === '.memory';
-}
-
-function hasMemoryDirSegment(filePath) {
-  return String(filePath).split(/[\\/]+/).some((segment) => isMemoryDirSegment(segment));
-}
-
-/**
- * True when `targetPath` (relative paths are resolved against `cwd`) lies in or under a folder named
- * `.memory` (case-insensitive), in any project. Checked on the path as written and on its real path,
- * so a junction or symlink pointing into `.memory/` counts as well.
- */
-export function isPathInsideMemoryDir(targetPath, cwd = process.cwd()) {
-  if (typeof targetPath !== 'string' || !targetPath.trim()) return false;
-  const resolved = path.resolve(cwd || process.cwd(), targetPath.trim());
-  if (hasMemoryDirSegment(resolved)) return true;
-  try {
-    return hasMemoryDirSegment(projectPathKey(resolved));
-  } catch {
-    return false;
-  }
-}
 
 // `.memory` as a whole path segment: preceded by the start of the string, whitespace, a quote, a path
 // separator or shell punctuation, and followed by the end of the string or one of the same (trailing dots
@@ -341,6 +339,114 @@ function clipForReason(value, maxChars = 300) {
 export function formatTrustCommandAskReason(command) {
   return `[herdr-cortex] herdr-cortex project approvals are about to be changed by this command: "${clipForReason(command)}". `
     + 'Approvals decide which project folders\' .memory/ is read and written. Allow it only if you want that change.';
+}
+
+const WORK_COMMAND_NAMES = new Set([
+  'cortex-work',
+  'cortex-work.ps1',
+  'cortex-work.cmd',
+  'cortex-work.bat',
+  'cortex-work.exe',
+]);
+const WORK_CLI_SCRIPT_NAME = 'cortex-work.mjs';
+
+/**
+ * Classify a shell command line that invokes `cortex-work` (`scripts/cortex-work.mjs`):
+ * - 'runs-cli'  : runs `release`, `reset`, or an ambiguous/compound `cortex-work` command (`ask` for main, `deny` for subagent/worker);
+ * - 'read-only' : a single plain `cortex-work status` call (with optional `--tab <id>` / `--json` / `--all`), or a read-only shell command (`cat`, `git diff`, ...);
+ * - ''          : unrelated command.
+ */
+export function classifyWorkCommand(command) {
+  if (typeof command !== 'string' || !command.trim()) return '';
+  const { words, complex } = splitShellWords(command);
+
+  const invocations = [];
+  let npmSeen = false;
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (word === null) {
+      npmSeen = false;
+      continue;
+    }
+    const base = shellWordBaseName(word);
+    if (WORK_COMMAND_NAMES.has(base) || base === WORK_CLI_SCRIPT_NAME) {
+      invocations.push(i);
+    } else if (NPM_COMMAND_NAMES.has(base)) {
+      npmSeen = true;
+    } else if (npmSeen && (base === 'run' || base === 'run-script') && words[i + 1] && words[i + 1].toLowerCase() === 'work') {
+      invocations.push(i + 1);
+    }
+  }
+
+  if (invocations.length === 0) return '';
+  if (isReadOnlyShellCommand(command)) return 'read-only';
+  if (complex || invocations.length !== 1) return 'runs-cli';
+
+  const rawArgs = words.slice(invocations[0] + 1);
+  const subcommands = [];
+  let unsafeOption = false;
+  for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    const lower = arg.toLowerCase();
+    if (arg === '--' || lower === '--json' || lower === '--all') continue;
+    if (lower === '--tab') {
+      if (i + 1 >= rawArgs.length) {
+        unsafeOption = true;
+        break;
+      }
+      i++;
+      continue;
+    }
+    if (lower.startsWith('--tab=')) continue;
+    if (arg.startsWith('-')) {
+      unsafeOption = true;
+      break;
+    }
+    subcommands.push(lower);
+  }
+
+  return !unsafeOption && subcommands.length === 1 && subcommands[0] === 'status'
+    ? 'read-only'
+    : 'runs-cli';
+}
+
+export function formatWorkCommandAskReason(command) {
+  return `[herdr-cortex] 작업 규모(S/L) 상태를 바꾸는 명령입니다: "${clipForReason(command)}". `
+    + '사용자가 직접 풀려는 경우에만 허용하세요.';
+}
+
+const SHELL_WORK_SIZE_DIR_RE = /(?:^|[^A-Za-z0-9_-])state\.*[\\/]+work-size\.*(?=$|[^A-Za-z0-9_-])/i;
+
+/**
+ * Heuristic: does a shell command line reference the work-size state folder (either by `state/work-size` /
+ * `state\work-size` notation or by `<globalDir>/state/work-size` real/written path)?
+ */
+export function commandReferencesWorkSizeState(command, globalDir) {
+  if (typeof command !== 'string' || !command.trim()) return false;
+  if (SHELL_WORK_SIZE_DIR_RE.test(command)) return true;
+
+  const haystack = process.platform === 'win32' ? command.toLowerCase() : command;
+  const dirForms = comparablePaths(getWorkSizeDir(globalDir));
+  for (const rawForm of dirForms) {
+    const variants = [rawForm, rawForm.replace(/\\/g, '/'), rawForm.replace(/\//g, '\\')];
+    for (const candidate of variants) {
+      if (!candidate) continue;
+      let from = 0;
+      for (;;) {
+        const at = haystack.indexOf(candidate, from);
+        if (at === -1) break;
+        const after = haystack[at + candidate.length];
+        if (!isNameChar(after)) return true;
+        from = at + 1;
+      }
+    }
+  }
+  return false;
+}
+
+export function formatWorkSizeStateShellAskReason(command) {
+  return `[herdr-cortex] 작업 규모(S/L) 상태 폴더를 건드리는 명령입니다: "${clipForReason(command)}". `
+    + '사용자가 직접 상태를 정리하려는 경우에만 허용하세요.';
 }
 
 export function formatStateFileWriteAskReason(targetPath, { approvalsFile = false } = {}) {
@@ -829,6 +935,29 @@ export function handleClaudeSessionStart(
     if (text && used + sepCost(0) + text.length <= maxChars) pushSection(text);
   };
 
+  if (!worker) {
+    try {
+      const workSizeNotice = getWorkSizeSessionNotice({
+        cwd: projectDir,
+        env,
+        projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId: extractSessionId(payload),
+        config,
+        loadConfigForRoot: (root) => (
+          projectPathKey(root) === projectPathKey(resolveProjectRoot(projectDir))
+            ? config
+            : loadConfig({ projectDir: root, globalDir: effectiveGlobalDir })
+        ),
+        isEnabledForRoot: isProjectEnabled,
+      });
+      pushNote(workSizeNotice);
+    } catch {
+      // Never block SessionStart on work-size state read errors.
+    }
+  }
+
   const wantsRecentTurns = !worker && (source === 'compact' || source === 'clear') && Boolean(payload.transcript_path || payload.transcriptPath);
 
   // The index is synced under a time budget: documents that do not fit are left to the MCP server and
@@ -1042,6 +1171,7 @@ export function handleClaudeUserPrompt(
     env = process.env,
     terminalId = env?.HC_TERMINAL_ID,
     globalDir,
+    now = Date.now,
   } = {},
 ) {
   if (isSubagentPayload(payload)) {
@@ -1057,15 +1187,50 @@ export function handleClaudeUserPrompt(
   }
   const maxChars = resolveHookBudget(config);
 
+  const sessionId = extractSessionId(payload);
   const approvalsNotice = checkApprovalsForSession({
     globalDir: effectiveGlobalDir,
-    sessionId: extractSessionId(payload),
+    sessionId,
   });
-  const contextParts = approvalsNotice ? [approvalsNotice.contextText] : [];
+  const contextParts = [];
+  let used = 0;
+  const pushContextPart = (text) => {
+    if (!text) return;
+    const sep = contextParts.length > 0 ? 2 : 0;
+    if (used + sep + text.length > maxChars) return;
+    contextParts.push(text);
+    used += sep + text.length;
+  };
+  if (approvalsNotice) pushContextPart(approvalsNotice.contextText);
+
+  if (!worker) {
+    try {
+      const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+      const completedNotice = consumeWorkSizeCompletedNotice({
+        cwd: projectDir,
+        env,
+        projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId,
+        config,
+        loadConfigForRoot: (root) => (
+          projectPathKey(root) === projectPathKey(resolveProjectRoot(projectDir))
+            ? config
+            : loadConfig({ projectDir: root, globalDir: effectiveGlobalDir })
+        ),
+        isEnabledForRoot: isProjectEnabled,
+        now: nowDate,
+      });
+      if (completedNotice) pushContextPart(completedNotice);
+    } catch {
+      // ignore work-size state errors in hook
+    }
+  }
 
   if (!worker && isValidTerminalId(terminalId)) {
-    const inboxBudget = approvalsNotice ? maxChars - approvalsNotice.contextText.length - 2 : maxChars;
-    if (inboxBudget >= 120 || !approvalsNotice) {
+    const inboxBudget = contextParts.length > 0 ? maxChars - used - 2 : maxChars;
+    if (inboxBudget >= 120 || contextParts.length === 0) {
       // One consumer at a time: when another process is delivering this terminal's messages right now,
       // nothing is injected and the messages stay for the next prompt.
       const delivered = deliverInboxForHook(terminalId, {
@@ -1075,7 +1240,7 @@ export function handleClaudeUserPrompt(
         // A message that fits an ordinary prompt waits for one instead of being announced as too long.
         fullBlockChars: maxChars,
       });
-      if (delivered.text) contextParts.push(delivered.text);
+      if (delivered.text) pushContextPart(delivered.text);
     }
   }
 
@@ -1183,7 +1348,61 @@ export function formatOtherProjectWriteReason(targetDir) {
  * - For HEAD, strip any LLM-spoofed `_caller_agent_id`.
  * Any other tool call returns {} right away (the hook prints nothing).
  */
-export function handleClaudePreToolUse(payload = {}, { globalDir } = {}) {
+function extractClaudeEditInput(toolName, rawInput) {
+  const name = typeof toolName === 'string' ? toolName.trim() : '';
+  if (!FILE_WRITE_TOOLS.has(name)) return null;
+
+  if (name === 'Write') {
+    const filePath = typeof rawInput.file_path === 'string' ? rawInput.file_path : '';
+    const addedChars = typeof rawInput.content === 'string' ? rawInput.content.length : 0;
+    return filePath.trim() ? { filePath, addedChars } : null;
+  }
+
+  if (name === 'Edit') {
+    const filePath = typeof rawInput.file_path === 'string' ? rawInput.file_path : '';
+    const addedChars = typeof rawInput.new_string === 'string' ? rawInput.new_string.length : 0;
+    return filePath.trim() ? { filePath, addedChars } : null;
+  }
+
+  if (name === 'MultiEdit') {
+    const filePath = typeof rawInput.file_path === 'string' ? rawInput.file_path : '';
+    if (!filePath.trim()) return null;
+    let addedChars = 0;
+    if (Array.isArray(rawInput.edits)) {
+      for (const edit of rawInput.edits) {
+        if (edit && typeof edit === 'object') {
+          if (typeof edit.new_string === 'string') addedChars += edit.new_string.length;
+          else if (typeof edit.content === 'string') addedChars += edit.content.length;
+        }
+      }
+    }
+    return { filePath, addedChars };
+  }
+
+  if (name === 'NotebookEdit') {
+    const filePath = typeof rawInput.notebook_path === 'string' && rawInput.notebook_path.trim()
+      ? rawInput.notebook_path
+      : (typeof rawInput.file_path === 'string' ? rawInput.file_path : '');
+    if (!filePath.trim()) return null;
+    let addedChars = 0;
+    if (typeof rawInput.new_source === 'string') addedChars = rawInput.new_source.length;
+    else if (typeof rawInput.content === 'string') addedChars = rawInput.content.length;
+    else if (typeof rawInput.new_string === 'string') addedChars = rawInput.new_string.length;
+    return { filePath, addedChars };
+  }
+
+  return null;
+}
+
+export function handleClaudePreToolUse(
+  payload = {},
+  {
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
+    globalDir,
+    now = Date.now,
+  } = {},
+) {
   const toolName = payload.tool_name || payload.toolName || '';
   const rawInput = payload.tool_input && typeof payload.tool_input === 'object' && !Array.isArray(payload.tool_input)
     ? payload.tool_input
@@ -1191,18 +1410,66 @@ export function handleClaudePreToolUse(payload = {}, { globalDir } = {}) {
 
   const hostAgentId = String(payload.agent_id || payload.agentId || '').trim();
   const callerIsSubagent = Boolean(hostAgentId) || isSubagentPayload(payload);
+  const worker = isWorkerSession({ env });
 
   if (!isCortexToolName(toolName)) {
     const cwd = extractCwd(payload, process.cwd());
+    const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
     if (callerIsSubagent && subagentTouchesMemoryDir(toolName, rawInput, cwd)) {
       return preToolUseDecision('deny', SUBAGENT_MEMORY_DIR_DENY_REASON);
     }
-    const trustChange = inspectTrustChange(toolName, rawInput, cwd, resolveCortexGlobalDir(globalDir));
+    const trustChange = inspectTrustChange(toolName, rawInput, cwd, effectiveGlobalDir);
     if (callerIsSubagent && trustChange.subagentDenied) {
       return preToolUseDecision('deny', SUBAGENT_TRUST_CHANGE_DENY_REASON);
     }
     if (!callerIsSubagent && trustChange.askReason) {
       return preToolUseDecision('ask', trustChange.askReason);
+    }
+
+    const trimmedTool = typeof toolName === 'string' ? toolName.trim() : '';
+    if (SHELL_TOOLS.has(trimmedTool)) {
+      if (commandReferencesWorkSizeState(rawInput.command, effectiveGlobalDir) && !isReadOnlyShellCommand(rawInput.command)) {
+        if (callerIsSubagent || worker) {
+          return preToolUseDecision('deny', WORK_STATE_SHELL_DENY_REASON);
+        }
+        return preToolUseDecision('ask', formatWorkSizeStateShellAskReason(rawInput.command));
+      }
+
+      const workCmdKind = classifyWorkCommand(rawInput.command);
+      if (workCmdKind === 'runs-cli') {
+        if (callerIsSubagent || worker) {
+          return preToolUseDecision('deny', WORK_COMMAND_DENY_REASON);
+        }
+        return preToolUseDecision('ask', formatWorkCommandAskReason(rawInput.command));
+      }
+      return {};
+    }
+
+    if (!callerIsSubagent && !worker && FILE_WRITE_TOOLS.has(trimmedTool)) {
+      try {
+        const editInput = extractClaudeEditInput(trimmedTool, rawInput);
+        if (editInput) {
+          const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+          const evaluated = evaluateWorkSizeEdit({
+            filePath: editInput.filePath,
+            addedChars: editInput.addedChars,
+            cwd,
+            env,
+            projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+            globalDir: effectiveGlobalDir,
+            terminalId,
+            sessionId: extractSessionId(payload),
+            loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+            isEnabledForRoot: isProjectEnabled,
+            now: nowDate,
+          });
+          if (evaluated.action === 'deny') {
+            return preToolUseDecision('deny', evaluated.denyReason);
+          }
+        }
+      } catch {
+        // State read/write errors never block tool calls.
+      }
     }
     return {};
   }
@@ -1241,6 +1508,168 @@ export function handleClaudePreToolUse(payload = {}, { globalDir } = {}) {
   };
 }
 
+function isPostToolResponseFailure(toolResponse, { isShell = false } = {}) {
+  if (!toolResponse || typeof toolResponse !== 'object') return false;
+  if (Array.isArray(toolResponse)) {
+    if (isShell) return false;
+    const texts = toolResponse
+      .filter((item) => item && typeof item === 'object' && typeof item.text === 'string')
+      .map((item) => item.text.trim())
+      .filter(Boolean);
+    if (texts.length === 0) return false;
+    return texts.every((text) => {
+      if (/^Error:/i.test(text)) return true;
+      try {
+        const parsed = JSON.parse(text);
+        return Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.error && !parsed.id);
+      } catch {
+        return false;
+      }
+    });
+  }
+  if (toolResponse.isError === true || toolResponse.is_error === true || toolResponse.interrupted === true) {
+    return true;
+  }
+  if (isShell) {
+    for (const key of ['exit_code', 'exitCode', 'returnCode']) {
+      if (typeof toolResponse[key] === 'number' && toolResponse[key] !== 0) return true;
+    }
+    return false;
+  }
+  if (typeof toolResponse.error === 'string' && toolResponse.error && !toolResponse.id) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Claude Code PostToolUse handler (runs after a tool succeeds; opens no SQLite database):
+ * - Bash / PowerShell running `git commit` inside the project root (excluding `--dry-run` / `--allow-empty` /
+ *   outside `-C` / quoted text) clears the cumulative edit window;
+ * - `memory_save` clears the cumulative edit window and, when in `L`, records `memorySaved` (finishing `L` if
+ *   `reviewAccepted` was already recorded).
+ */
+export function handleClaudePostToolUse(
+  payload = {},
+  {
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
+    globalDir,
+    now = Date.now,
+  } = {},
+) {
+  if (isSubagentPayload(payload) || isWorkerSession({ env })) return {};
+
+  const toolName = String(payload.tool_name || payload.toolName || '').trim();
+  const rawInput = payload.tool_input && typeof payload.tool_input === 'object' && !Array.isArray(payload.tool_input)
+    ? payload.tool_input
+    : {};
+  const toolResponse = payload.tool_response ?? payload.toolResponse;
+
+  if (SHELL_TOOLS.has(toolName)) {
+    if (isPostToolResponseFailure(toolResponse, { isShell: true })) return {};
+    if (!commandRunsGitCommit(rawInput.command)) return {};
+    try {
+      const cwd = extractCwd(payload, process.cwd());
+      const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+      const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+      recordGitCommitForWorkSize({
+        command: rawInput.command,
+        cwd,
+        env,
+        projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId: extractSessionId(payload),
+        loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+        isEnabledForRoot: isProjectEnabled,
+        now: nowDate,
+      });
+    } catch {
+      // ignore state errors in hook
+    }
+    return {};
+  }
+
+  if (cortexToolBaseName(toolName) === 'memory_save') {
+    if (isPostToolResponseFailure(toolResponse, { isShell: false })) return {};
+    try {
+      const cwd = extractCwd(payload, process.cwd());
+      const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+      const sessionId = extractSessionId(payload);
+      const scope = resolveWorkSizeScope({ terminalId, sessionId });
+      const wsRoot = resolveWorkSizeProjectRoot({
+        cwd,
+        env,
+        projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+        globalDir: effectiveGlobalDir,
+        scope,
+      });
+      if (otherProjectWriteTarget(toolName, rawInput, wsRoot)) return {};
+      const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+      recordMemorySaveForWorkSize({
+        cwd,
+        env,
+        projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+        globalDir: effectiveGlobalDir,
+        terminalId,
+        sessionId,
+        loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+        isEnabledForRoot: isProjectEnabled,
+        now: nowDate,
+      });
+    } catch {
+      // ignore state errors in hook
+    }
+  }
+
+  return {};
+}
+
+/**
+ * Claude Code SubagentStop handler: reads `last_assistant_message` for a structured reviewer verdict
+ * (`ACCEPT` or `NEEDS_FIX`) and records it against an active `L` job of the parent tab/session.
+ * Note: SubagentStop payloads naturally carry `agent_id` of the stopped subagent, so `isSubagentPayload`
+ * is NOT used to skip here.
+ */
+export function handleClaudeSubagentStop(
+  payload = {},
+  {
+    env = process.env,
+    terminalId = env?.HC_TERMINAL_ID,
+    globalDir,
+    now = Date.now,
+  } = {},
+) {
+  if (isWorkerSession({ env })) return {};
+
+  const lastMessage = payload.last_assistant_message ?? payload.lastAssistantMessage;
+  const verdict = parseReviewVerdict(lastMessage);
+  if (!verdict) return {};
+
+  try {
+    const cwd = extractCwd(payload, process.cwd());
+    const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+    const nowDate = new Date(Number(typeof now === 'function' ? now() : now) || Date.now());
+    recordReviewVerdict({
+      verdict,
+      cwd,
+      env,
+      projectDirEnvVar: CLAUDE_PROJECT_DIR_ENV,
+      globalDir: effectiveGlobalDir,
+      terminalId,
+      sessionId: extractSessionId(payload),
+      loadConfigForRoot: (root) => loadConfig({ projectDir: root, globalDir: effectiveGlobalDir }),
+      isEnabledForRoot: isProjectEnabled,
+      now: nowDate,
+    });
+  } catch {
+    // ignore state errors in hook
+  }
+
+  return {};
+}
+
 function normalizeEventName(eventName) {
   return String(eventName || '').trim().toLowerCase();
 }
@@ -1257,6 +1686,10 @@ export function runClaudeHook(eventName, payload = {}, options = {}) {
       return handleClaudeUserPrompt(payload, options);
     case 'pre-tool-use':
       return handleClaudePreToolUse(payload, options);
+    case 'post-tool-use':
+      return handleClaudePostToolUse(payload, options);
+    case 'subagent-stop':
+      return handleClaudeSubagentStop(payload, options);
     default:
       return {};
   }

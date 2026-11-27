@@ -17,8 +17,11 @@ import {
   isMainModule,
   isProjectEnabled,
   loadConfig,
+  projectPathKey,
   resolveGlobalDir,
   resolveHomeDir,
+  resolveProjectRoot,
+  resolveWorkSizeConfig,
 } from '../src/core/config.mjs';
 import { getDuplicateDocIds, readDeferredIndex } from '../src/core/db.mjs';
 import { CortexStore } from '../src/core/store.mjs';
@@ -40,6 +43,7 @@ import {
 } from '../src/hooks/installer.mjs';
 import { countInboxMessages, getInboxRootDir, peekInbox } from '../src/relay/inbox.mjs';
 import { isValidTerminalId } from '../src/revive/tracker.mjs';
+import { readWorkSizeState, tabWorkSizeScope } from '../src/hooks/work-size.mjs';
 
 const REINSTALL_ADVICE = 'run install.ps1 again';
 
@@ -306,9 +310,15 @@ export async function collectStatus({
       configProblems.push(`${globalConfigPath} is ignored: ${err.message}`);
     }
   }
-  // The embedding lines repeat the embedding problems; the rest is listed under Config.
+  // The embedding lines repeat the embedding problems; non-embedding config problems belong under Configuration.
+  const nonEmbeddingMessages = new Set([
+    ...getConfigProblems(config).filter((problem) => problem.code === 'invalid_work_size').map((problem) => problem.message),
+    ...getConfigProblems(globalConfig).filter((problem) => problem.code === 'invalid_work_size').map((problem) => problem.message),
+  ]);
   const embeddingLines = formatEmbeddingStatus(embedding);
-  const embeddingProblemLines = embeddingLines.filter((line) => /^embedding config problem/.test(line));
+  const embeddingProblemLines = embeddingLines.filter(
+    (line) => /^embedding config problem/.test(line) && ![...nonEmbeddingMessages].some((msg) => line.includes(msg)),
+  );
   for (const line of embeddingProblemLines) warnings.push(line.replace(/^embedding config problem/, 'Embedding configuration'));
   for (const message of configProblems) {
     if (!embeddingProblemLines.some((line) => line.includes(message))) warnings.push(`Configuration: ${message}`);
@@ -323,6 +333,27 @@ export async function collectStatus({
   } else {
     relay.others = inspectAllInboxes(resolvedGlobal);
   }
+
+  // Work size (current tab in this folder, or recorded ancestor folder containing `folder`)
+  const validTabId = terminalId && isValidTerminalId(terminalId) ? terminalId : '';
+  const activeWorkState = validTabId
+    ? readWorkSizeState(resolvedGlobal, tabWorkSizeScope(validTabId), { cwd: folder })
+    : null;
+  const wsConfigForFolder = activeWorkState && projectPathKey(activeWorkState.cwd) !== projectPathKey(resolveProjectRoot(folder))
+    ? withoutConsoleWarnings(() => loadConfig({ projectDir: activeWorkState.cwd, globalDir: resolvedGlobal }))
+    : config;
+  const workSizeCfg = resolveWorkSizeConfig(wsConfigForFolder);
+  const workSize = {
+    enabled: workSizeCfg.enabled,
+    maxFilesPerWindow: workSizeCfg.maxFilesPerWindow,
+    maxCharsPerFile: workSizeCfg.maxCharsPerFile,
+    terminalId: validTabId,
+    size: activeWorkState ? activeWorkState.size : 'S',
+    filesInWindow: activeWorkState ? Object.keys(activeWorkState.files).length : 0,
+    escalatedAt: activeWorkState?.escalatedAt || null,
+    reviewAccepted: activeWorkState ? activeWorkState.reviewAccepted : false,
+    memorySaved: activeWorkState ? activeWorkState.memorySaved : false,
+  };
 
   return {
     repoRoot: resolvedRoot,
@@ -340,6 +371,7 @@ export async function collectStatus({
     embeddingLines: embeddingLines.filter((line) => !/^embedding config problem/.test(line)),
     tiers,
     relay,
+    workSize,
     configProblems,
     warnings,
   };
@@ -429,6 +461,23 @@ export function formatStatus(status) {
     for (const inbox of relay.others) lines.push(`${label('')}tab ${inbox.terminalId}: ${formatInbox(inbox)}`);
   } else {
     lines.push(`${label('Relay inbox')}not in a Herdr tab (HC_TERMINAL_ID is not set); no inbox holds messages`);
+  }
+
+  const ws = status.workSize;
+  if (ws) {
+    if (!ws.enabled) {
+      lines.push(`${label('Work size')}off (workSize.enabled is false)`);
+    } else if (!ws.terminalId) {
+      lines.push(`${label('Work size')}not in a Herdr tab (HC_TERMINAL_ID is not set); limit=${ws.maxFilesPerWindow} file(s), ${ws.maxCharsPerFile} chars`);
+    } else if (ws.size === 'L') {
+      const pending = [
+        ...(!ws.reviewAccepted ? ['review ACCEPT'] : []),
+        ...(!ws.memorySaved ? ['memory_save'] : []),
+      ].join(', ') || 'none';
+      lines.push(`${label('Work size')}tab ${ws.terminalId}: L (files in window=${ws.filesInWindow}, waiting for: ${pending})`);
+    } else {
+      lines.push(`${label('Work size')}tab ${ws.terminalId}: S (files in window=${ws.filesInWindow}, limit=${ws.maxFilesPerWindow} file(s), ${ws.maxCharsPerFile} chars)`);
+    }
   }
 
   lines.push(`${label('Config')}${status.configProblems.length === 0 ? 'no problems' : `${status.configProblems.length} problem(s), see below`}`);

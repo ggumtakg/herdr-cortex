@@ -23,7 +23,12 @@ import {
   resolveHomeDir,
 } from '../core/config.mjs';
 import { describeEmbeddingStatus, formatEmbeddingStatus } from '../embeddings/resolve.mjs';
-import { CLAUDE_PRE_TOOL_USE_MATCHER, LEGACY_MCP_SERVER_NAME, MCP_SERVER_NAME } from './tool-names.mjs';
+import {
+  CLAUDE_POST_TOOL_USE_MATCHER,
+  CLAUDE_PRE_TOOL_USE_MATCHER,
+  LEGACY_MCP_SERVER_NAME,
+  MCP_SERVER_NAME,
+} from './tool-names.mjs';
 
 export const AGY_HOOK_KEY = 'herdr-cortex';
 export const LEGACY_AGY_HOOK_KEY = 'herdr-revive-tracker';
@@ -53,6 +58,8 @@ const CLAUDE_HOOK_EVENTS = [
   'PreCompact',
   'UserPromptSubmit',
   'PreToolUse',
+  'PostToolUse',
+  'SubagentStop',
 ];
 
 // Seconds. Claude Code gives a SessionEnd hook 1.5 s unless the registration says otherwise; the handler
@@ -70,8 +77,12 @@ export const CLAUDE_HOOK_SPECS = Object.freeze([
   { event: 'PreCompact', arg: 'pre-compact', matcher: '', timeout: 10 },
   { event: 'UserPromptSubmit', arg: 'user-prompt', matcher: '', timeout: 10 },
   // One entry for this server's tools and for the file and shell tools whose calls the subagent
-  // `.memory/` guard inspects.
+  // `.memory/` guard and HEAD work-size counter inspect.
   { event: 'PreToolUse', arg: 'pre-tool-use', matcher: CLAUDE_PRE_TOOL_USE_MATCHER, timeout: 10 },
+  // Clears cumulative per-file edit counts on `git commit` / `memory_save` and records `memory_save` for L jobs.
+  { event: 'PostToolUse', arg: 'post-tool-use', matcher: CLAUDE_POST_TOOL_USE_MATCHER, timeout: 10 },
+  // Reads reviewer verdicts (`ACCEPT` / `NEEDS_FIX`) from finished subagent outputs for L jobs.
+  { event: 'SubagentStop', arg: 'subagent-stop', matcher: '', timeout: 10 },
 ]);
 
 /** The Antigravity hooks this installer registers under the `herdr-cortex` group of `hooks.json`. */
@@ -1266,7 +1277,7 @@ export function checkClaudeHooks({ homeDir, repoRoot = REPO_ROOT } = {}) {
     result.events[event] = summarizeHookEvent(found, {
       expectedScript,
       expectedArgs: specs.map((spec) => spec.arg),
-      expectedMatcher: event === 'PreToolUse' ? specs[0].matcher : undefined,
+      expectedMatcher: event === 'PreToolUse' || event === 'PostToolUse' ? specs[0].matcher : undefined,
     });
   }
   result.ok = Object.values(result.events).every((event) => event.state === 'ok');

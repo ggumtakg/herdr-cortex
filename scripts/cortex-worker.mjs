@@ -8,7 +8,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { isMainModule } from '../src/core/config.mjs';
+import {
+  isMainModule,
+  isProjectEnabled,
+  loadConfig,
+  resolveGlobalDir,
+  resolveWorkSizeConfig,
+} from '../src/core/config.mjs';
+import { isWorkerSession } from '../src/core/role.mjs';
+import { isValidTerminalId } from '../src/revive/tracker.mjs';
+import {
+  parseReviewVerdict,
+  recordReviewVerdict,
+  resolveWorkSizeProjectRoot,
+  tabWorkSizeScope,
+} from '../src/hooks/work-size.mjs';
 
 export const VALID_ROLES = Object.freeze(['developer', 'coder', 'reviewer', 'researcher']);
 export const DEFAULT_TIMEOUT_MINUTES = 40;
@@ -776,6 +790,35 @@ export async function runWorker(
         if (outWriteError) {
           stderr.write(`[cortex-worker] 결과 파일(--out) 쓰기 실패 (${opts.outPath}): ${outWriteError?.message || outWriteError}\n`);
           if (exitCode === 0) exitCode = EXIT_ERROR;
+        }
+
+        if (!spawnError && !timedOut && exitCode === 0 && opts.role === 'reviewer' && !isWorkerSession({ env })) {
+          const callerTabId = getEnvValueCaseInsensitive(env, 'HC_TERMINAL_ID').trim();
+          if (isValidTerminalId(callerTabId)) {
+            const verdict = parseReviewVerdict(stdoutText);
+            if (verdict) {
+              try {
+                const globalDir = resolveGlobalDir({ env });
+                const wsRoot = resolveWorkSizeProjectRoot({
+                  cwd: opts.cwd,
+                  globalDir,
+                  scope: tabWorkSizeScope(callerTabId),
+                });
+                const config = loadConfig({ projectDir: wsRoot, globalDir });
+                if (isProjectEnabled(wsRoot, config) && resolveWorkSizeConfig(config).enabled) {
+                  recordReviewVerdict({
+                    verdict,
+                    cwd: wsRoot,
+                    globalDir,
+                    terminalId: callerTabId,
+                    config,
+                  });
+                }
+              } catch {
+                // Never fail cortex-worker on work-size state I/O errors.
+              }
+            }
+          }
         }
 
         stderr.write(

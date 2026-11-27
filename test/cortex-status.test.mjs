@@ -122,7 +122,7 @@ test('cortex-status: a fresh install reports every check as in order, without an
     assert.deepEqual(lineOf(lines, 'Global store'), [env.globalDir]);
     assert.deepEqual(lineOf(lines, 'Node'), [`${process.version} OK | ${process.execPath}`]);
     assert.deepEqual(lineOf(lines, '  recorded'), ['same path (exists)']);
-    assert.deepEqual(lineOf(lines, 'Claude hooks'), ['SessionStart=ok SessionEnd=ok PreCompact=ok UserPromptSubmit=ok PreToolUse=ok']);
+    assert.deepEqual(lineOf(lines, 'Claude hooks'), ['SessionStart=ok SessionEnd=ok PreCompact=ok UserPromptSubmit=ok PreToolUse=ok PostToolUse=ok SubagentStop=ok']);
     assert.deepEqual(lineOf(lines, 'Claude MCP'), ['"herdr-cortex" registered (node ok, server.mjs ok)']);
     assert.deepEqual(lineOf(lines, 'Antigravity'), ['not found (no "agy" on PATH and no ~/.gemini folder)']);
     assert.deepEqual(lineOf(lines, 'This folder'), [env.projectDir]);
@@ -134,6 +134,7 @@ test('cortex-status: a fresh install reports every check as in order, without an
       'global  docs=0 (embedded 0, pending 0, error 0) | not indexed=0 | duplicate ids=0',
     ]);
     assert.deepEqual(lineOf(lines, 'Relay inbox'), ['not in a Herdr tab (HC_TERMINAL_ID is not set); no inbox holds messages']);
+    assert.deepEqual(lineOf(lines, 'Work size'), ['not in a Herdr tab (HC_TERMINAL_ID is not set); limit=1 file(s), 1000 chars']);
     assert.deepEqual(lineOf(lines, 'Config'), ['no problems']);
     assert.deepEqual(lineOf(lines, 'Result'), ['everything checked is in order']);
     assert.ok(lines.every((line) => line.length < 400));
@@ -155,7 +156,7 @@ test('cortex-status: missing Node path, broken or missing registrations, an unap
     assert.match(bareText, /Claude Code hook SessionStart: not registered \(run install\.ps1 again\)/);
     assert.match(bareText, /Claude Code MCP: no server named "herdr-cortex" in .*\.claude\.json\. Close every Claude Code window, then run install\.ps1 again\./);
     const bareLines = formatStatus(bare);
-    assert.deepEqual(lineOf(bareLines, 'Claude hooks'), ['SessionStart=missing SessionEnd=missing PreCompact=missing UserPromptSubmit=missing PreToolUse=missing']);
+    assert.deepEqual(lineOf(bareLines, 'Claude hooks'), ['SessionStart=missing SessionEnd=missing PreCompact=missing UserPromptSubmit=missing PreToolUse=missing PostToolUse=missing SubagentStop=missing']);
     assert.deepEqual(lineOf(bareLines, 'Claude MCP'), ['"herdr-cortex" NOT registered']);
     assert.deepEqual(lineOf(bareLines, '  recorded'), ['none (no install record)']);
     assert.equal(bareLines.includes(`Needs attention (${bare.warnings.length}):`), true);
@@ -178,7 +179,7 @@ test('cortex-status: missing Node path, broken or missing registrations, an unap
     assert.match(goneText, /Antigravity MCP: node missing in /);
     const goneLines = formatStatus(gone);
     assert.deepEqual(lineOf(goneLines, '  recorded'), [`${vanishedNode} (MISSING)`]);
-    assert.deepEqual(lineOf(goneLines, 'Claude hooks'), ['SessionStart=node_missing SessionEnd=node_missing PreCompact=node_missing UserPromptSubmit=node_missing PreToolUse=node_missing']);
+    assert.deepEqual(lineOf(goneLines, 'Claude hooks'), ['SessionStart=node_missing SessionEnd=node_missing PreCompact=node_missing UserPromptSubmit=node_missing PreToolUse=node_missing PostToolUse=node_missing SubagentStop=node_missing']);
     assert.deepEqual(lineOf(goneLines, 'Claude MCP'), ['"herdr-cortex" registered (node MISSING, server.mjs ok)']);
     assert.deepEqual(lineOf(goneLines, 'Antigravity'), ['SessionStart=node_missing PreInvocation=node_missing | MCP=node_missing | found by: ~/.gemini folder']);
 
@@ -207,7 +208,7 @@ test('cortex-status: missing Node path, broken or missing registrations, an unap
     assert.match(brokenText, /embedding\.model is from the old config format and ignored/);
     assert.equal(broken.project.enabled, false);
     const brokenLines = formatStatus(broken);
-    assert.deepEqual(lineOf(brokenLines, 'Claude hooks'), ['SessionStart=ok SessionEnd=ok PreCompact=missing UserPromptSubmit=ok PreToolUse=ok']);
+    assert.deepEqual(lineOf(brokenLines, 'Claude hooks'), ['SessionStart=ok SessionEnd=ok PreCompact=missing UserPromptSubmit=ok PreToolUse=ok PostToolUse=ok SubagentStop=ok']);
     assert.deepEqual(lineOf(brokenLines, '  enabled'), ['no (matches excludedProjects) | headCore=on | hookBudget=9000']);
     assert.deepEqual(lineOf(brokenLines, 'Index')[0], 'project not read (excluded by configuration)');
     assert.deepEqual(lineOf(brokenLines, 'Embedding'), ['off (provider "olama" is not usable); nothing is sent anywhere.']);
@@ -376,10 +377,11 @@ test('cortex-status command line: prints the layout for the folder given with --
     assert.equal(lines[0], '=== herdr-cortex status ===');
     assert.deepEqual(lines.map((line) => line.split(':')[0].trimEnd()).filter((name) => !name.startsWith(' ')), [
       '=== herdr-cortex status ===', 'Repo', 'Global store', 'Node', 'sqlite-vec', 'Claude hooks', 'Claude MCP', 'Antigravity',
-      'This folder', 'Approvals', 'Embedding', 'Index', 'Index', 'Relay inbox', 'Config', 'Result',
+      'This folder', 'Approvals', 'Embedding', 'Index', 'Index', 'Relay inbox', 'Work size', 'Config', 'Result',
     ]);
     assert.ok(lines.includes(`This folder  : ${env.projectDir}`));
     assert.ok(lines.includes('Relay inbox  : tab t4: pending=0, held=0, broken=0'));
+    assert.ok(lines.includes('Work size    : tab t4: S (files in window=0, limit=1 file(s), 1000 chars)'));
 
     const json = spawnSync(process.execPath, ['--no-warnings', script, '--cwd', env.projectDir, '--json'], { env: childEnv, encoding: 'utf8' });
     assert.equal(json.status, 0, json.stderr);

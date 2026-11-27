@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Loaded by PowerShell $PROFILE.
-    1) Exposes the `revive-agents`, `revive-agy`, `revive-status`, `cortex-status`, `cortex-trust` and `cortex-worker` commands.
+    1) Exposes the `revive-agents`, `revive-agy`, `revive-status`, `cortex-status`, `cortex-trust`, `cortex-work` and `cortex-worker` commands.
     2) Automatically resumes Antigravity (agy) or Claude Code (claude) when Herdr-Core
        reopens a saved agent tab as a bare PowerShell after a reboot or core restart.
        Reads ~/.herdr-cortex/sessions/ first with automatic fallback to ~/.herdr-revive/sessions/.
@@ -10,6 +10,7 @@
 $script:HerdrCortexRoot = Split-Path -Parent $PSScriptRoot
 $script:HerdrReviveScript = Join-Path $PSScriptRoot "revive-agents.ps1"
 $script:HerdrStatusScript = Join-Path $PSScriptRoot "cortex-status.mjs"
+$script:HerdrWorkScript = Join-Path $PSScriptRoot "cortex-work.mjs"
 $script:HerdrWorkerScript = Join-Path $PSScriptRoot "cortex-worker.mjs"
 $script:HerdrTrustScript = Join-Path $script:HerdrCortexRoot "src\core\trust-cli.mjs"
 
@@ -159,7 +160,28 @@ function global:cortex-status {
     }
 }
 
-# cortex-worker --role <developer|coder|reviewer> --agent <antigravity|claude> --model <name> --brief <file> [--out <file>] [--timeout <minutes>] [--allow <rule>]... [--cwd <folder>]
+# cortex-work status|release|reset [--tab <id>] [--all] [--json]
+function global:cortex-work {
+    $node = Resolve-HerdrNode
+    if (-not $node) {
+        Write-HerdrNodeMissing
+        $global:LASTEXITCODE = 1
+        return
+    }
+    $workArgs = @("--global", $script:HerdrCortexDir) + $args
+    $loc = Get-Location
+    $prevCwd = [System.Environment]::CurrentDirectory
+    try {
+        if ($loc.Provider.Name -eq "FileSystem") {
+            [System.Environment]::CurrentDirectory = $loc.ProviderPath
+        }
+        Invoke-HerdrNodeScript -NodePath $node -ScriptPath $script:HerdrWorkScript -Arguments $workArgs
+    } finally {
+        try { [System.Environment]::CurrentDirectory = $prevCwd } catch {}
+    }
+}
+
+# cortex-worker --role <developer|coder|reviewer|researcher> --agent <antigravity|claude> --model <name> --brief <file> [--out <file>] [--timeout <minutes>] [--allow <rule>]... [--cwd <folder>]
 function global:cortex-worker {
     $node = Resolve-HerdrNode
     if (-not $node) {
