@@ -793,12 +793,17 @@ test('trust / hooks: hookBudget=256 preserves all pre-existing outputs, drops un
     assert.match(claudeApprovedCtx, /^# HEAD_CORE/);
     assert.ok(claudeApprovedCtx.length <= 256);
 
-    const agyApproved = agySteps(handleAntigravitySessionStart(
+    const agyApprovedRaw = handleAntigravitySessionStart(
       { conversationId: 'c-256-app', rootConversationId: 'c-256-app', cwd: approvedDir },
       agyOpts,
-    ));
+    );
+    const agyApproved = agySteps(agyApprovedRaw);
     assert.match(agyApproved, /^# HEAD_CORE/);
-    assert.ok(agyApproved.length <= 256);
+    const agyApprovedNonHeadLen = (agyApprovedRaw.injectSteps || [])
+      .map((s) => s.systemMessage.systemMessage)
+      .filter((s) => !s.startsWith('# HEAD_CORE'))
+      .reduce((n, s) => n + s.length, 0);
+    assert.ok(agyApprovedNonHeadLen <= 256, `Antigravity non-HEAD_CORE steps length=${agyApprovedNonHeadLen}`);
 
     // 1c. Excluded folder: empty {} in both hosts
     assert.deepEqual(

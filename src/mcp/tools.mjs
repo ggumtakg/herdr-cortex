@@ -3,6 +3,7 @@ import path from 'node:path';
 import {
   REPO_ROOT,
   assertInsideDir,
+  expandCortexRootPlaceholder,
   isProjectEnabled,
   isProjectTrusted,
   loadConfig,
@@ -424,7 +425,8 @@ function resolvePromptFile(promptsDir, kind, name) {
 export function createToolRegistry(
   store,
   {
-    promptsDir = path.join(REPO_ROOT, 'prompts'),
+    repoRoot = REPO_ROOT,
+    promptsDir = path.join(repoRoot, 'prompts'),
     getEmbeddingProvider = null,
     getEmbeddingProviders = null,
     embeddingQueue = null,
@@ -876,7 +878,7 @@ export function createToolRegistry(
       }
 
       const safePath = resolvePromptFile(promptsDir, args.kind, args.name);
-      const content = fs.readFileSync(safePath, 'utf8');
+      const content = expandCortexRootPlaceholder(fs.readFileSync(safePath, 'utf8'), repoRoot);
       return {
         kind: args.kind,
         name: args.name || '',

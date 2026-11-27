@@ -30,6 +30,13 @@ export const UNINDEXED_USER_NOTICE_MAX_FILES = 3;
 const UNINDEXED_NOTICE_MAX_NAME_CHARS = 120;
 
 /**
+ * One-line notice injected into model context (in approved, non-worker sessions) when there are 0 active
+ * memory documents in both the project and global tiers, so the agent knows herdr-cortex memory is active.
+ */
+export const EMPTY_MEMORY_NOTICE =
+  '[herdr-cortex] Memory is on and has no active documents to show yet; call memory_save when decisions are agreed, work is committed, or user preferences are confirmed.';
+
+/**
  * Sync limits for one hook run (the `syncOptions` of `CortexStore`).
  * `startedAt` is when the hook process started (epoch ms; defaults to now). `indexBudget` overrides single
  * values for tests: { budgetMs, maxFileBytes, bytesPerMs, perFileMs, now }.
@@ -73,7 +80,7 @@ export function loadHookOverview({ projectDir, globalDir, config, projectTrusted
   const projectMemExists = projectTrusted && fs.existsSync(getProjectMemoryDir(projectDir));
   const globalDocsExists = fs.existsSync(path.join(globalDir, 'docs'));
   if (!projectMemExists && !globalDocsExists) {
-    return { overview: null, unindexed: [] };
+    return { overview: null, unindexed: [], syncFailed: false };
   }
 
   const store = new CortexStore({
@@ -85,6 +92,7 @@ export function loadHookOverview({ projectDir, globalDir, config, projectTrusted
   });
 
   let overview = null;
+  let syncFailed = false;
   try {
     if (projectMemExists) {
       const ov = store.getOverview({ includeGlobal: globalDocsExists });
@@ -129,6 +137,7 @@ export function loadHookOverview({ projectDir, globalDir, config, projectTrusted
     }
   } catch {
     overview = null;
+    syncFailed = true;
   }
 
   let unindexed = [];
@@ -138,7 +147,7 @@ export function loadHookOverview({ projectDir, globalDir, config, projectTrusted
     unindexed = [];
   }
   store.close();
-  return { overview, unindexed };
+  return { overview, unindexed, syncFailed };
 }
 
 function formatBytes(size) {

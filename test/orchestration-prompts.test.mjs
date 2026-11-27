@@ -124,7 +124,8 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
           /coder/,
           /developer/,
           /plan-run/,
-          /\{\{HERDR_CORTEX_ROOT\}\}\/scripts\/cortex-worker\.mjs/,
+          // cortex_prompt replaces the {{HERDR_CORTEX_ROOT}} placeholder with the install path (no braces left).
+          /node --no-warnings [^{}\n]+\/scripts\/cortex-worker\.mjs/,
           /--role <역할> --agent <antigravity\|claude> --model <모델> --brief <지시 파일>/,
           /--out <결과 파일>/,
           /--allow <허용 규칙>/,

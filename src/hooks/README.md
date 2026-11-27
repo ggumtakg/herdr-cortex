@@ -17,9 +17,9 @@
 
 | 파일 | 역할 | Export |
 | :--- | :--- | :--- |
-| **`claude.mjs`** | Claude Code 훅 5종(`session-start`, `session-end`, `pre-compact`, `user-prompt`, `pre-tool-use`)의 처리기와 명령줄 진입점 | `CLAUDE_HOOK_MAX_CHARS`, `CLEAR_RECORD_DIR_NAME`, `CLEAR_RECORD_POLL_MS`, `CLEAR_RECORD_STALE_MS`, `CLEAR_RECORD_WAIT_MS`, `CLEAR_RECORD_WINDOW_MS`, `COMPACT_POINTER_INSTRUCTION`, `COMPACT_USER_INSTRUCTIONS_CLAUSE`, `SUBAGENT_CORTEX_WRITE_DENY_REASON`, `SUBAGENT_MEMORY_DIR_DENY_REASON`, `SUBAGENT_TRUST_CHANGE_DENY_REASON`, `TURNS_NOT_RESTORED_NO_TURNS_NOTE`, `TURNS_NOT_RESTORED_TOO_LARGE_NOTE`, `TURNS_NOT_RESTORED_UNIDENTIFIED_NOTE`, `USER_NOTICE_MAX_CHARS`, `buildCompactInstruction`, `classifyTrustCommand`, `commandReferencesMemoryDir`, `formatOtherProjectWriteReason`, `formatStateFileWriteAskReason`, `formatTrustCommandAskReason`, `getClearRecordsDir`, `handleClaudePreCompact`, `handleClaudePreToolUse`, `handleClaudeSessionEnd`, `handleClaudeSessionStart`, `handleClaudeUserPrompt`, `isCortexToolName`, `isPathInsideMemoryDir`, `renderClaudeHookStdout`, `restoreFailureNote`, `runClaudeHook` |
-| **`antigravity.mjs`** | Antigravity 훅 2종(`session-start`, `pre-invocation`)의 처리기와 명령줄 진입점, 대화 기록 앞부분으로 주 대화·서브에이전트를 가리는 역할 판별, 체크포인트 뒤 복원 | `detectAntigravityTranscriptRole`, `handleAntigravityPreInvocation`, `handleAntigravitySessionStart`, `runAntigravityHook` |
-| **`overview.mjs`** | 훅용 기억 개요 읽기. 시간·크기 한도 안에서만 색인을 갱신하고, 한도를 넘는 문서는 미룬 뒤 그 사실을 알리는 문구를 만듦 | `HOOK_INDEX_BUDGET_MS`, `HOOK_INDEX_BYTES_PER_MS`, `HOOK_INDEX_MAX_FILE_BYTES`, `HOOK_INDEX_PER_FILE_MS`, `UNINDEXED_NOTICE_MAX_FILES`, `UNINDEXED_USER_NOTICE_MAX_FILES`, `formatUnindexedNotice`, `formatUnindexedUserNotice`, `loadHookOverview`, `resolveHookSyncOptions` |
+| **`claude.mjs`** | Claude Code 훅 5종(`session-start`, `session-end`, `pre-compact`, `user-prompt`, `pre-tool-use`)의 처리기와 명령줄 진입점 | `CLAUDE_HOOK_MAX_CHARS`, `CLEAR_RECORD_DIR_NAME`, `CLEAR_RECORD_POLL_MS`, `CLEAR_RECORD_STALE_MS`, `CLEAR_RECORD_WAIT_MS`, `CLEAR_RECORD_WINDOW_MS`, `COMPACT_POINTER_INSTRUCTION`, `COMPACT_USER_INSTRUCTIONS_CLAUSE`, `EMPTY_MEMORY_NOTICE`, `HEAD_CORE_MAX_CHARS`, `SUBAGENT_CORTEX_WRITE_DENY_REASON`, `SUBAGENT_MEMORY_DIR_DENY_REASON`, `SUBAGENT_TRUST_CHANGE_DENY_REASON`, `TURNS_NOT_RESTORED_NO_TURNS_NOTE`, `TURNS_NOT_RESTORED_TOO_LARGE_NOTE`, `TURNS_NOT_RESTORED_UNIDENTIFIED_NOTE`, `USER_NOTICE_MAX_CHARS`, `buildCompactInstruction`, `classifyTrustCommand`, `commandReferencesMemoryDir`, `formatOtherProjectWriteReason`, `formatStateFileWriteAskReason`, `formatTrustCommandAskReason`, `getClearRecordsDir`, `handleClaudePreCompact`, `handleClaudePreToolUse`, `handleClaudeSessionEnd`, `handleClaudeSessionStart`, `handleClaudeUserPrompt`, `isCortexToolName`, `isPathInsideMemoryDir`, `renderClaudeHookStdout`, `restoreFailureNote`, `runClaudeHook` |
+| **`antigravity.mjs`** | Antigravity 훅 2종(`session-start`, `pre-invocation`)의 처리기와 명령줄 진입점, 대화 기록 앞부분으로 주 대화·서브에이전트를 가리는 역할 판별, 체크포인트 뒤 복원 | `EMPTY_MEMORY_NOTICE`, `HEAD_CORE_MAX_CHARS`, `detectAntigravityTranscriptRole`, `handleAntigravityPreInvocation`, `handleAntigravitySessionStart`, `runAntigravityHook` |
+| **`overview.mjs`** | 훅용 기억 개요 읽기와 기억 0건 안내 상수. 시간·크기 한도 안에서만 색인을 갱신하고, 한도를 넘는 문서는 미룬 뒤 그 사실을 알리는 문구를 만듦 | `EMPTY_MEMORY_NOTICE`, `HOOK_INDEX_BUDGET_MS`, `HOOK_INDEX_BYTES_PER_MS`, `HOOK_INDEX_MAX_FILE_BYTES`, `HOOK_INDEX_PER_FILE_MS`, `UNINDEXED_NOTICE_MAX_FILES`, `UNINDEXED_USER_NOTICE_MAX_FILES`, `formatUnindexedNotice`, `formatUnindexedUserNotice`, `loadHookOverview`, `resolveHookSyncOptions` |
 | **`recent-turns.mjs`** | 대화 기록 끝부분에서 사람이 직접 입력한 턴과 그 답을 뽑아 글자 수 안에 맞추는 공통 로직과 호스트별 어댑터, 대화 기록 앞부분의 `SessionStart` 주입 표식 확인 | `ANTIGRAVITY_TRANSCRIPT_ADAPTER`, `CLAUDE_TRANSCRIPT_ADAPTER`, `DEFAULT_MAX_TAIL_BYTES`, `DEFAULT_MAX_TURNS`, `DEFAULT_RECENT_TURNS_BUDGET`, `MAX_HEAD_SCAN_BYTES`, `MAX_TAIL_BYTES_CAP`, `MAX_TRANSCRIPT_RECORD_BYTES`, `RESTORE_FAILURE_NO_TURNS_WITHIN_CAP`, `RESTORE_FAILURE_RECORD_TOO_LARGE`, `extractAntigravityState`, `extractClaudeRecentTurns`, `extractRecentTurns`, `formatRecentTurns`, `hasClaudeSessionStartMarker`, `resolveAntigravityTranscriptPath`, `stripSystemReminders` |
 | **`approvals-watch.mjs`** | 승인 목록이 확인 대화상자를 거치지 않고 바뀌었는지를 세션마다 값싸게 확인 | `APPROVAL_CHECK_DIR_NAME`, `APPROVAL_CHECK_STALE_MS`, `checkApprovalsForSession`, `getApprovalChecksDir`, `pruneApprovalCheckRecords` |
 | **`shell-read-only.mjs`** | 셸 명령줄이 읽기만 하는 것으로 분명히 인식되는지 판정 | `READ_ONLY_GIT_SUBCOMMANDS`, `READ_ONLY_SHELL_VERBS`, `isReadOnlyShellCommand`, `splitPlainCommands` |
@@ -32,15 +32,18 @@
 
 ### Claude Code (`CLAUDE_HOOK_SPECS`)
 
-설치기는 `~/.claude/settings.json`의 `hooks`에 아래 다섯 항목을 추가합니다. 제한 시간의 단위는 초입니다.
+설치기는 `~/.claude/settings.json`의 `hooks`에 다섯 이벤트에 걸쳐 아래 여섯 항목을 추가합니다(`SessionStart`만 둘로 나누어 등록). 제한 시간의 단위는 초입니다.
 
 | 이벤트 | 매처 | 제한 시간 | 실행하는 하위 명령 |
 | :--- | :--- | :--- | :--- |
-| `SessionStart` | 빈 문자열(전부) | 10초 | `claude.mjs session-start` |
+| `SessionStart` | 빈 문자열(전부) | 10초 | `claude.mjs session-start core` |
+| `SessionStart` | 빈 문자열(전부) | 10초 | `claude.mjs session-start context` |
 | `SessionEnd` | 빈 문자열 | 5초(`CLAUDE_SESSION_END_TIMEOUT_SECONDS`) | `claude.mjs session-end` |
 | `PreCompact` | 빈 문자열 | 10초 | `claude.mjs pre-compact` |
 | `UserPromptSubmit` | 빈 문자열 | 10초 | `claude.mjs user-prompt` |
 | `PreToolUse` | `CLAUDE_PRE_TOOL_USE_MATCHER`(아래) | 10초 | `claude.mjs pre-tool-use` |
+
+Claude Code는 훅 하나가 내는 `additionalContext`를 10,000자로 제한하고 같은 이벤트의 훅들을 병렬로 실행해 각각의 `additionalContext`를 모두 모델에 전달합니다. 그래서 `SessionStart`를 `core`(`HEAD_CORE`만)와 `context`(기억 개요·받은편지함·최근 대화·각종 안내)로 나누어, `HEAD_CORE`가 길어져도 `hookBudget`(최대 9,000자)을 깎아 먹지 않게 합니다. 이전 버전의 단일 `session-start` 등록이 있는 설정에 설치기를 다시 돌리면 그 등록은 지워지고 새 두 항목으로 교체됩니다.
 
 `PreToolUse`의 매처는 이 서버의 도구와, 서브에이전트 검사 대상인 파일 쓰기 도구·셸 도구를 한 줄로 묶은 것입니다.
 
@@ -61,16 +64,16 @@ Antigravity가 감지된 경우에만 `~/.gemini/config/hooks.json`의 `herdr-co
 
 ### 훅 명령의 형식과 식별
 
-* **Claude Code는 exec 형식**으로 씁니다(`buildClaudeHookHandler`). `command`는 설치할 때의 Node 실행 파일 절대 경로이고, `args`는 `["--no-warnings", "<저장소>/src/hooks/claude.mjs", "<하위 명령>", "--id", "herdr-cortex"]`입니다. 셸을 거치지 않고 바로 실행되므로 경로에 공백이 있어도 되고 `node`가 PATH에 없어도 됩니다.
+* **Claude Code는 exec 형식**으로 씁니다(`buildClaudeHookHandler`). `command`는 설치할 때의 Node 실행 파일 절대 경로이고, `args`는 하위 명령을 공백 기준으로 쪼갠 배열 `["--no-warnings", "<저장소>/src/hooks/claude.mjs", "<이벤트>", ...("<선택 인자>"), "--id", "herdr-cortex"]`입니다(예: `"session-start"`, `"core"`가 각각 별개 원소). 셸을 거치지 않고 바로 실행되므로 경로에 공백이 있어도 되고 `node`가 PATH에 없어도 됩니다.
 * **Antigravity는 한 줄 문자열**로 씁니다(`buildShellHookCommand`). Antigravity가 훅을 어떤 셸에 넘기는지 문서에 없어서, cmd.exe·PowerShell·bash가 모두 같은 한 단어로 읽는 표기(`quotePathForShells`)를 씁니다. 경로 구분자는 `/`로 바꾸고, 영문자·숫자·`_`·`.`·`-` 밖의 글자가 있는 조각만 큰따옴표로 감쌉니다(예: `C:/"Program Files"/nodejs/node.exe --no-warnings C:/repo/src/hooks/antigravity.mjs session-start --id herdr-cortex`). 경로에 `"`, `$`, 백틱, `%`, 줄바꿈이 있으면 세 셸이 똑같이 읽는 표기가 없으므로 설치를 중단합니다.
-* **식별 기준은 표시 하나**입니다(`isOwnHook`). 훅 항목의 인자에 `--id`(`HOOK_ID_FLAG`)와 `herdr-cortex`(`CLAUDE_HOOK_MARKER`)가 연달아 있으면 이 설치기가 쓴 항목으로 봅니다. 명령 어딘가에 `herdr-cortex`라는 글자가 있거나 스크립트 이름이 같다는 것만으로는 해당하지 않습니다. 스크립트 경로가 이 저장소의 것인지는 식별 기준이 아니라 점검 항목이어서, 다른 폴더의 herdr-cortex를 가리키는 항목도 표시가 있으면 교체·제거 대상이 되고 `checkClaudeHooks`는 그런 항목을 `other_repo`로 보고합니다.
+* **식별 기준은 표시 하나**입니다(`isOwnHook`). 훅 항목의 인자에 `--id`(`HOOK_ID_FLAG`, 또는 이전 버전의 `--marker`)와 `herdr-cortex`(`CLAUDE_HOOK_MARKER`)가 연달아 있으면 이 설치기가 쓴 항목으로 봅니다. 명령 어딘가에 `herdr-cortex`라는 글자가 있거나 스크립트 이름이 같다는 것만으로는 해당하지 않습니다. 스크립트 경로가 이 저장소의 것인지는 식별 기준이 아니라 점검 항목이어서, 다른 폴더의 herdr-cortex를 가리키는 항목도 표시가 있으면 교체·제거 대상이 되고 `checkClaudeHooks`는 그런 항목을 `other_repo`로 보고합니다.
 * 이전 도구(herdr-revive)가 등록한 `node [--옵션] <...>/record-session.mjs <claude|antigravity>` 꼴의 항목은 `isLegacyReviveHook`이 알아보고 함께 제거합니다.
 
 ---
 
 ## 모든 처리기에 공통인 규칙
 
-* **주입 분량**: 훅 한 번이 주입하는 글자 수의 상한은 설정값 `hookBudget`이며, 256자 이상 9,000자 이하로 맞춰집니다(`src/core/budget.mjs`의 `resolveHookBudget`, `HOOK_MAX_CHARS`). `CLAUDE_HOOK_MAX_CHARS`는 `HOOK_MAX_CHARS`와 같은 값(9,000)입니다. 설정으로 9,000자보다 늘릴 수는 없고, 두 호스트에 똑같이 적용됩니다.
+* **주입 분량과 `HEAD_CORE` 분리**: 문맥 구획(기억 개요, 기억 0건 안내, 받은편지함, 최근 대화 턴, 각종 안내)을 합친 글자 수 상한은 설정값 `hookBudget`이며, 256자 이상 9,000자 이하로 맞춰집니다(`src/core/budget.mjs`의 `resolveHookBudget`, `HOOK_MAX_CHARS`; `CLAUDE_HOOK_MAX_CHARS`도 같은 값 9,000). 설정으로 9,000자보다 늘릴 수는 없고 두 호스트에 똑같이 적용됩니다. 반면 세션 시작 지침 `prompts/HEAD_CORE.md`는 `hookBudget`에서 제외되어 자체 상한 `HEAD_CORE_MAX_CHARS`(9,500자) 안에서 줄 단위로 맞춰집니다(Claude Code의 `session-start core` 훅과 Antigravity의 `HEAD_CORE` 단계; 아직 다시 설치하지 않은 옛 단일 등록 `session-start`의 `part: "all"`만은 예전처럼 `HEAD_CORE`도 `hookBudget` 안에서 함께 계산합니다). `HEAD_CORE.md`를 읽을 때 본문 속 자리표시자 `{{HERDR_CORTEX_ROOT}}`는 저장소 루트 절대 경로(`/` 구분자)로 글자 그대로 치환됩니다(`expandCortexRootPlaceholder`).
 * **기록이지 지시가 아니라는 머리말**: 기억 개요와 릴레이 받은편지함 블록은 제목 바로 다음 줄에 `UNTRUSTED_MEMORY_PREAMBLE`을 둡니다. 머리말은 예산에 포함되고, 머리말이 들어갈 자리가 없으면 그 블록은 통째로 내보내지 않습니다. 문서의 제목·요약·태그·세션·브랜치·기한과 메시지의 발신자·시각은 한 줄로 정리해 출력하고(`sanitizeInline`), 메시지 본문은 줄마다 `> `를 붙여 인용합니다.
 
   ```
@@ -78,7 +81,7 @@ Antigravity가 감지된 경우에만 `~/.gemini/config/hooks.json`의 `herdr-co
   ```
 * **실패해도 호스트를 막지 않음**: 두 진입점은 오류를 모두 삼키고 종료 코드 0으로 끝납니다. 훅이 실패하거나 제한 시간에 걸리면 주입도 검사도 없이 그대로 진행됩니다.
 * **서브에이전트 호출은 건너뜀**: 입력에 `agent_id`, `is_subagent`, 부모 대화·세션 ID가 있거나 `conversationId`와 `rootConversationId`가 다르면 서브에이전트로 보고(`src/revive/tracker.mjs`의 `isSubagentPayload`), 주입과 세션 기록을 하지 않습니다. `PreToolUse`만은 서브에이전트 호출을 검사 대상으로 삼습니다.
-* **워커 세션(`HERDR_CORTEX_ROLE=worker`)**: 환경변수 `HERDR_CORTEX_ROLE`의 값이 앞뒤 공백을 떼고 대소문자를 무시했을 때 `worker`이면 위임 워커 세션입니다(`src/core/role.mjs`의 `isWorkerSession`). 워커 세션에서는 탭별 세션 기록(`recordSession`), `/clear` 종료 기록(`SessionEnd`), `HEAD_CORE.md` 주입, 최근 대화 턴 복원, 릴레이 받은편지함 전달·알림 표시를 하지 않으므로 워커를 띄운 탭의 세션 기록과 받은편지함이 보존됩니다. `.memory/`가 없는 미승인 폴더의 1회 안내도 워커 세션에서는 내지도 기록하지도 않습니다(워커가 1회 안내를 소진해 주 대화가 받지 못하는 일을 막음). 기억 개요(`Cortex Memory Overview`), `.memory/`가 있는 미승인 폴더 안내, 색인되지 않은 문서 안내, 승인 목록 변경 경고는 그대로 동작합니다.
+* **워커 세션(`HERDR_CORTEX_ROLE=worker`)**: 환경변수 `HERDR_CORTEX_ROLE`의 값이 앞뒤 공백을 떼고 대소문자를 무시했을 때 `worker`이면 위임 워커 세션입니다(`src/core/role.mjs`의 `isWorkerSession`). 워커 세션에서는 탭별 세션 기록(`recordSession`), `/clear` 종료 기록(`SessionEnd`), `HEAD_CORE.md` 주입, 기억 0건 안내(`EMPTY_MEMORY_NOTICE`), 최근 대화 턴 복원, 릴레이 받은편지함 전달·알림 표시를 하지 않으므로 워커를 띄운 탭의 세션 기록과 받은편지함이 보존됩니다. `.memory/`가 없는 미승인 폴더의 1회 안내도 워커 세션에서는 내지도 기록하지도 않습니다(워커가 1회 안내를 소진해 주 대화가 받지 못하는 일을 막음). 기억 개요(`Cortex Memory Overview`), `.memory/`가 있는 미승인 폴더 안내, 색인되지 않은 문서 안내, 승인 목록 변경 경고는 그대로 동작합니다.
 * **제외된 프로젝트**: 설정으로 꺼진 프로젝트(`enabled: false`, `excludedProjects`, `mode: "opt-in"`에서 미등록)에서는 `PreToolUse`를 뺀 모든 처리기가 아무것도 내보내지 않습니다. 받은편지함도 전달하지 않고 `/clear` 기록도 쓰지 않습니다. 탭별 세션 기록(재부팅 복구용)만은 계속 갱신합니다.
 * **승인되지 않은 프로젝트**: 그 폴더의 `.memory/`는 읽지도 만들지도 않으며, 그 안의 `config.json`도 읽지 않습니다. 세션 시작 지침, 전역 기억, 받은편지함은 그대로 동작합니다. 폴더에 `.memory/`가 있으면 매 세션 그 사실을 알리고, `.memory/`가 없어도 주 대화에서는 폴더당 한 번 승인 전 안내를 내고 `<전역>/state/unapproved-folder-notices.json`에 기록합니다(아래 문구). 다만 작업 폴더가 사용자 홈 폴더(`resolveHomeDir`) 자체이거나 파일 시스템 루트(`C:\`, `/` 등, `isHomeOrRootFolder`)이면 홈·드라이브 전체 승인을 유도하지 않도록 `.memory/` 없는 1회 안내를 내지도 기록하지도 않으며, `hookBudget`에 들어가지 않거나 기존 구획을 밀어내게 되는 경우에도 그 안내만 빼고 기록하지 않습니다.
 * **무시되는 옛 임베딩 키 알림**: 세션 시작 때 불러온 설정에 옛 평면 임베딩 키(`legacy_embedding_keys`, 또는 승인된 폴더의 `<프로젝트>/.memory/config.json` 안 옛 키)가 있으면 어느 파일의 어떤 키가 무시되는지와 고치는 방법을 한 줄로 알립니다. 전역 최상위 `embedding`은 `embedding.provider`가 유효한 프로바이더 이름이어서 설치기가 실제로 이관·정리할 수 있을 때만 `install.ps1` 재실행을 안내하고, 프로바이더가 미정(`auto`, `none`, 미설정, 모르는 값 등)일 때는 그 이유와 함께 프로바이더 지정 후 재실행 또는 직접 이동·삭제를 안내합니다. 프로젝트별 설정도 지원하는 키 이동과 쓰이지 않는 키 삭제를 함께 안내합니다. Claude Code는 `systemMessage`로, Antigravity는 모델 문맥(`injectSteps`)으로 내보냅니다.
@@ -93,7 +96,7 @@ Antigravity가 감지된 경우에만 `~/.gemini/config/hooks.json`의 `herdr-co
 node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|user-prompt|pre-tool-use> [part] --id herdr-cortex
 ```
 
-표준 입력의 JSON을 읽습니다. `--id`와 `--marker`는 다음 값과 함께 건너뜁니다. `part`는 `session-start`에서만 쓰이는 선택 인자로 `all`(기본값), `core`(세션 시작 지침만), `context`(세션 시작 지침을 뺀 나머지)를 받으며, 설치기는 `part` 없이 등록합니다. 알 수 없는 이벤트 이름은 아무것도 출력하지 않습니다.
+표준 입력의 JSON을 읽습니다. `--id`와 `--marker`는 다음 값과 함께 건너뜁니다. `part`는 `session-start`에서만 쓰이는 선택 인자로 `core`(세션 시작 지침만), `context`(세션 시작 지침을 뺀 나머지), `all`(기본값, 둘을 한 번에)을 받습니다. 설치기는 `core`와 `context` 두 훅을 따로 등록하며, 아직 다시 설치하지 않은 이전 설정은 인자 없는 `all`로 동작합니다. 알 수 없는 이벤트 이름은 아무것도 출력하지 않습니다.
 
 표준 출력의 모양은 이벤트마다 다릅니다(`renderClaudeHookStdout`).
 
@@ -108,18 +111,28 @@ node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|u
 
 ### SessionStart: 무엇을 어떤 순서로 주입하는가
 
-먼저 탭별 세션 기록을 갱신합니다(`recordSession`, 제외된 프로젝트에서도 수행). 그다음 아래 순서로 구획을 쌓으며, 구획 사이의 빈 줄(2자)까지 포함해 전체가 `hookBudget`을 넘지 않게 합니다. 결과는 `additionalContext` 하나로 나갑니다.
+설치기가 등록한 두 `SessionStart` 훅은 병렬로 실행됩니다.
+
+* **`part: "core"` (`claude.mjs session-start core`)**: `prompts/HEAD_CORE.md`(`{{HERDR_CORTEX_ROOT}}` 치환 후)만 자체 상한 `HEAD_CORE_MAX_CHARS`(9,500자) 안에서 줄 단위로 맞추어 `additionalContext`로 내보냅니다. 탭 기록 쓰기(`recordSession`), 색인 동기화, 받은편지함 전달, 승인 점검, `systemMessage` 출력은 일절 하지 않습니다. `source`가 `resume` 또는 `fork`일 때 대화 기록(`transcript_path` 또는 `transcriptPath`)을 처음부터 최대 32MiB(`MAX_HEAD_SCAN_BYTES`)까지 읽어 `SessionStart` 훅 주입 기록 안에 현재 `HEAD_CORE`의 첫 비어 있지 않은 줄이 이미 있으면 건너뛰며, `headCoreEnabled: false`·제외된 프로젝트·서브에이전트·워커 세션에서도 내보내지 않습니다.
+* **`part: "context"` (`claude.mjs session-start context`)**: 먼저 탭별 세션 기록을 갱신하고(`recordSession`, 제외된 프로젝트에서도 수행), 아래 표의 2~8번 구획을 순서대로 쌓으며 구획 사이의 빈 줄(2자)까지 포함해 전체가 `hookBudget` 전체를 쓰도록 맞춥니다(`HEAD_CORE` 몫을 덜어 내지 않음). 사용자 화면용 `systemMessage`도 이쪽에서만 냅니다.
+* **`part: "all"` (인자 없음, 재설치 전 옛 등록 호환)**: 아래 1~8번 전체를 한 번에 처리해 `hookBudget` 안에 맞춥니다.
 
 | 순서 | 구획 | 조건과 분량 |
 | :--- | :--- | :--- |
-| 1 | 세션 시작 지침 `prompts/HEAD_CORE.md` | `source`가 `resume` 또는 `fork`이면 대화 기록(`transcript_path` 또는 `transcriptPath`)을 처음부터 최대 32MiB(`MAX_HEAD_SCAN_BYTES`)까지 읽으며 `SessionStart` 훅이 주입한 문맥 기록(`attachment.type: "hook_additional_context"`, `hookEvent: "SessionStart"`) 안에 현재 `HEAD_CORE.md`의 첫 번째 비어 있지 않은 줄이 이미 있을 때만 건너뛰고(찾는 즉시 읽기를 멈춤), 표식이 없거나(설치 전 시작된 대화, 제목 변경, 도구 결과·메시지에만 같은 글이 있는 경우, 상한 초과) 경로가 없거나 읽지 못하면 주입합니다. `headCoreEnabled: false`이거나 파일이 없어도 넣지 않습니다. 예산을 넘으면 줄 단위로 뒤쪽을 덜어 내며, 기존 필수 안내(`.memory/`가 있는 미승인 안내, 승인 목록 변경 경고)와 예산에 실제로 들어가는 1회 미승인 안내의 자리를 남겨 둡니다 |
+| 1 (`all`·`core`) | 세션 시작 지침 `prompts/HEAD_CORE.md` | `core`에서는 단독으로 `HEAD_CORE_MAX_CHARS`(9,500자)까지, `all`에서는 필수 안내·1회 미승인 안내 자리를 남긴 `hookBudget` 안에서 줄 단위로 뒤쪽을 덜어 냄. `resume`·`fork` 중복 생략 조건과 `headCoreEnabled: false`·워커 제외 규칙은 위와 같음 |
 | 2 | 미승인 안내(`formatProjectNotApprovedNotice` / `formatUnapprovedFolderNotice`) | 작업 폴더가 승인되지 않았을 때. `.memory/`가 있으면 매 세션 내고, `.memory/`가 없으면 워커·홈 폴더·파일 시스템 루트가 아닌 세션에서 예산에 들어갈 때만 폴더당 첫 한 번 내고 `<전역>/state/unapproved-folder-notices.json`에 기록합니다 |
 | 3 | 승인 목록 변경 경고 | 아래 "승인 목록 변경 경고" 참고 |
 | 4 | 색인되지 않은 문서 안내(`formatUnindexedNotice`) | 색인 갱신이 문서를 미뤘을 때 |
-| 5 | 릴레이 받은편지함 | 탭 ID가 유효하고 남은 예산이 120자 이상일 때. 기억 개요가 있거나 최근 대화를 복원할 차례이면 `min(2000, max(300, 남은 예산의 35%))`자(남은 예산의 35%, 300자 이상 2,000자 이하), 아니면 남은 예산 전부 |
+| 5 | 릴레이 받은편지함 | 탭 ID가 유효하고 남은 예산이 120자 이상일 때. 기억 개요가 있거나 최근 대화를 복원할 차례이면 `min(2000, max(300, 남은 예산의 35%))`자(남은 예산의 35%, 300자 이상 2,000자 이하), 아니면(기억 0건 안내가 나갈 때 그 길이와 2자를 남긴) 남은 예산 전부 |
 | 6 | 최근 대화를 복원하지 못했다는 한 줄 | 자리가 있을 때만(같은 문장이 `systemMessage`로도 나감) |
-| 7 | 기억 개요(`fitOverviewToBudget`) | 최근 대화 몫을 뺀 남은 예산이 120자 이상일 때. 프로젝트 기억과 전역 기억에서 뽑은 `P0` 기준선, 활성 세션과 브랜치, 열린 할 일, 최근 결정과 기준선, 최근 작업, 전역 선호가 들어갑니다. 예산에 맞지 않으면 문장 중간을 자르지 않고 항목 수와 세부 항목을 6단계(`full` → `standard` → `focused` → `compact` → `minimal` → `essential`)로 줄여 맞추며, `P0` 기준선은 가장 먼저, 마지막 단계까지 남깁니다([`src/core/README.md`](../core/README.md#개요를-한도에-맞추기)) |
-| 8 | 최근 대화 턴 | `source`가 `compact` 또는 `clear`이고 `transcript_path`가 있으며 남은 예산이 200자 이상일 때. 기억 개요가 있으면 `min(4500, max(400, 남은 예산의 55%))`자(남은 예산의 55%, 400자 이상 4,500자 이하), 없으면 `min(4500, 남은 예산)`자. 최대 5턴 |
+| 7 | 기억 개요(`fitOverviewToBudget`) 또는 기억 0건 안내(`EMPTY_MEMORY_NOTICE`) | 활성 문서가 하나라도 있고 최근 대화 몫을 뺀 남은 예산이 120자 이상이면 기억 개요(`P0` 기준선, 활성 세션과 브랜치, 열린 할 일, 최근 결정과 기준선, 최근 작업, 전역 선호)를 6단계(`full` → `essential`)로 줄여 넣습니다([`src/core/README.md`](../core/README.md#개요를-한도에-맞추기)). 보여 줄 기억이 0건(프로젝트·전역 모두 활성 문서 0건이거나 저장소 폴더가 아직 없음, 미색인 문서도 없음)이고 승인된 프로젝트의 비워커 세션이면 개요 대신 한 줄 안내 `EMPTY_MEMORY_NOTICE`(아래)를 예산 안에서 모델 문맥에만 넣습니다 |
+| 8 | 최근 대화 턴 | `source`가 `compact` 또는 `clear`이고 `transcript_path`가 있으며 남은 예산이 200자 이상일 때. 기억 개요가 있으면 `min(4500, max(400, 남은 예산의 55%))`자(남은 예산의 55%, 400자 이상 4,500자 이하), 없으면 `min(4500, 남은 예산)`자(기억 0건 안내가 있으면 그 자리는 남김). 최대 5턴 |
+
+기억이 0건인 승인된 프로젝트에서 나가는 안내 문구(`EMPTY_MEMORY_NOTICE`, 상태 기록 없이 매 세션 조건만 확인하며 문서가 1건이라도 생기면 개요로 대체됨)는 다음과 같습니다. 승인되지 않은 폴더(전역 기억도 0건인 경우 포함), 워커 세션, 서브에이전트, 제외된 프로젝트, `part: "core"`에서는 내지 않습니다.
+
+```
+[herdr-cortex] Memory is on and has no active documents to show yet; call memory_save when decisions are agreed, work is committed, or user preferences are confirmed.
+```
 
 미승인 안내는 `.memory/` 유무에 따라 모델용과 사용자용 두 쌍입니다(`src/core/trust.mjs`). `.memory/`가 없을 때의 두 줄은 폴더당 한 번만 나갑니다.
 
@@ -300,7 +313,7 @@ Claude Code는 이 훅의 일반 표준 출력을 압축 요약의 지시문으�
 node --no-warnings src/hooks/antigravity.mjs <session-start|pre-invocation> --id herdr-cortex
 ```
 
-출력은 항상 JSON 한 줄입니다. 주입할 것이 있으면 구획 하나를 단계 하나로 하는 `{ "injectSteps": [ { "systemMessage": { "systemMessage": "<글>" } }, ... ] }`이고, 없으면 `{}`입니다. 분량 상한은 Claude Code와 같은 `hookBudget`(최대 9,000자)이며, 구획 길이의 합으로 셉니다. 세션 시작 지침은 줄 단위로, 색인 안내·기억 개요·받은편지함은 각자의 방식으로 남은 예산에 맞춘 뒤 넣으며, 그래도 들어가지 않는 구획은 통째로 빠집니다. 받은편지함에는 한 번에 최대 2,500자를 쓰고 남은 예산이 120자 미만이면 전달하지 않습니다. 2,500자 블록에 혼자서도 들어가지 못하는 메시지는 긴 메시지로 한 번만 알립니다(전달 규칙은 위 "받은편지함 전달"과 같음).
+출력은 항상 JSON 한 줄입니다. 주입할 것이 있으면 구획 하나를 단계 하나로 하는 `{ "injectSteps": [ { "systemMessage": { "systemMessage": "<글>" } }, ... ] }`이고, 없으면 `{}`입니다. 세션 시작 지침(`HEAD_CORE.md`, `{{HERDR_CORTEX_ROOT}}` 치환 포함)은 자체 단계로 내보내며 `hookBudget` 계산에서 빼고 `HEAD_CORE_MAX_CHARS`(9,500자) 안에서 줄 단위로 맞춥니다(`SessionStart`, 첫 `PreInvocation`, 체크포인트 뒤 복원 세 경로 모두). 나머지 단계들의 길이 합 상한이 Claude Code와 같은 `hookBudget`(최대 9,000자)입니다. 색인 안내·기억 개요(또는 승인된 프로젝트의 기억 0건 안내 `EMPTY_MEMORY_NOTICE`)·받은편지함·최근 대화는 각자의 방식으로 남은 `hookBudget`에 맞춘 뒤 넣으며, 그래도 들어가지 않는 구획은 통째로 빠집니다. 받은편지함에는 한 번에 최대 2,500자를 쓰고 남은 예산이 120자 미만이면 전달하지 않습니다. 2,500자 블록에 혼자서도 들어가지 못하는 메시지는 긴 메시지로 한 번만 알립니다(전달 규칙은 위 "받은편지함 전달"과 같음).
 
 **역할 판별(`detectAntigravityTranscriptRole`)**: 훅 입력만으로 주 대화와 서브에이전트를 가릴 수 없을 때가 있어, 대화 기록의 앞 16KiB(16,384바이트)를 읽습니다. `USER_INPUT` 또는 `USER_EXPLICIT` 단계가 있으면 `root`, 그런 단계 없이 `[Message] timestamp=... sender=<ID>` 꼴의 글이 있으면 `subagent`, 파일이 없거나 비었거나 아직 판단할 내용이 없으면 `unknown`입니다.
 
@@ -408,7 +421,7 @@ node --no-warnings src/hooks/installer.mjs <command>
 | 2 | `~/.gemini/config/hooks.json` | Antigravity가 감지된 때만. `herdr-cortex` 묶음에 두 훅을 넣습니다. 그 전에 이 묶음과 이전 도구의 `herdr-revive-tracker` 묶음(`LEGACY_AGY_HOOK_KEY`)에서 표시가 있는 항목과 이전 도구의 항목만 걷어 내고, 다른 항목은 그대로 둡니다 |
 | 3 | `~/.gemini/antigravity-cli/mcp_config.json` | Antigravity가 감지된 때만. `mcpServers["herdr-cortex"]`를 씁니다(파일이 없으면 만듦) |
 | 4 | `~/.gemini/config/mcp_config.json` | Antigravity가 감지되고 이 파일이 이미 있을 때만 같은 항목을 갱신합니다. 만들지는 않습니다 |
-| 5 | `~/.claude/settings.json` | 표시가 있는 기존 훅 항목과 이전 도구의 항목을 하나씩 걷어 내고 다섯 훅을 이벤트마다 묶음 하나(`{ matcher, hooks: [항목] }`)로 덧붙입니다. 사용자의 다른 훅과 그 훅이 남아 있는 묶음은 그대로 둡니다. 이 파일의 `mcpServers`에 herdr-cortex의 항목(`herdr-cortex` 또는 `cortex`)이 있으면 지웁니다 |
+| 5 | `~/.claude/settings.json` | 표시가 있는 기존 훅 항목과 이전 도구의 항목을 하나씩 걷어 내고 다섯 이벤트(여섯 항목: `SessionStart` 두 개와 나머지 네 이벤트 각 한 개)를 항목마다 묶음 하나(`{ matcher, hooks: [항목] }`)로 덧붙입니다. 사용자의 다른 훅과 그 훅이 남아 있는 묶음은 그대로 둡니다. 이 파일의 `mcpServers`에 herdr-cortex의 항목(`herdr-cortex` 또는 `cortex`)이 있으면 지웁니다 |
 | 6 | `~/.claude.json` (사용자 범위 MCP 등록) | 아래 "Claude Code MCP 등록" 참고 |
 | 7 | `~/.claude/skills/cortex-<이름>/` | 아래 "스킬" 참고 |
 | 8 | `<전역>/state/install.json` | 설치 기록(`INSTALL_RECORD_FILE`): `version`, `installedAt`, `repoRoot`, `nodePath`, `nodeVersion`, `antigravity` |
@@ -425,7 +438,7 @@ node --no-warnings src/hooks/installer.mjs <command>
 
 **어떤 MCP 항목이 herdr-cortex의 것인가(`describeMcpEntry`)**: 등록 이름은 기준이 아닙니다. 항목이 Node로 `src/mcp/server.mjs`의 절대 경로를 실행하고, 그 파일이 이 저장소의 것이거나, `package.json`의 `name`이 `herdr-cortex`인 폴더의 것이거나, 폴더가 이미 없어졌다면 폴더 이름이 `herdr-cortex`로 시작할 때 해당합니다. 옛 이름 `cortex`로 등록된 항목은 이 기준에 맞을 때만 지우고, 맞지 않으면 그대로 두고 `an MCP server named "cortex" that is not herdr-cortex was left untouched`라고 알립니다.
 
-**스킬**: `prompts/skills/` 아래의 폴더마다 `~/.claude/skills/cortex-<이름>/`으로 복사하고, `SKILL.md` 머리말의 `name:`을 설치된 폴더 이름으로 맞춘 뒤, 표시 파일 `.herdr-cortex-managed`(`SKILL_MANAGED_MARKER`)를 넣습니다. 같은 이름의 폴더가 이미 있으면 표시 파일이 있을 때만 교체하고, 없으면 사용자가 만든 스킬로 보고 건드리지 않습니다.
+**스킬**: `prompts/skills/` 아래의 폴더마다 `~/.claude/skills/cortex-<이름>/`으로 복사하고, `SKILL.md` 머리말의 `name:`을 설치된 폴더 이름으로 맞춘 뒤, `SKILL.md`와 모든 하위 파일 안의 `{{HERDR_CORTEX_ROOT}}` 자리표시자를 저장소 루트 절대 경로(`/` 구분자)로 글자 그대로 치환하고(자리표시자가 없는 하위 파일은 다시 쓰지 않음), 표시 파일 `.herdr-cortex-managed`(`SKILL_MANAGED_MARKER`)를 넣습니다. 같은 이름의 폴더가 이미 있으면 표시 파일이 있을 때만 교체하고, 없으면 사용자가 만든 스킬로 보고 건드리지 않습니다.
 
 **옛 기본 설정(`OLD_DEFAULT_CONFIGS`)과 옛 임베딩 키 이관(`migrateGlobalEmbeddingConfig`)**: `<전역>/config.json`이 이전 설치기가 쓴 기본값 두 가지(임베딩 프로바이더 `auto`, 그리고 여기에 `onnxEnabled: false`가 더해진 것) 가운데 하나와 완전히 같으면 사용자가 손대지 않은 것으로 보고, 백업을 만든 뒤 현재 기본값으로 바꿉니다. 사용자가 고친 파일에 옛 평면 임베딩 키(`LEGACY_EMBEDDING_KEYS`)가 있을 때는 `embedding.provider`가 특정 프로바이더(`gemini`, `openai`, `ollama`, `onnx`)이면 날짜 붙인 백업을 만든 뒤 그 프로바이더 묶음(`embedding.<프로바이더>.*`)으로 값을 옮기고 옛 키를 지우며(`[OK] Migrated legacy embedding setting(s) ...`), 새 묶음에 같은 키가 이미 있으면 기존 값을 지키고 옛 키만 지우며(`[OK] Removed legacy embedding key(s) ...`), 해당 프로바이더에 대응하는 키가 없는 옛 키(쓰이지 않던 값)도 같은 백업 아래 지우고 `[OK] Removed unused legacy embedding key(s) ...`로 알립니다(옮길 키 없이 지울 키만 있는 파일도 백업 뒤 고칩니다). `embedding.provider`가 `auto`·`none`·빈 값·모르는 이름이면 어느 묶음으로 옮길지 정할 수 없으므로 파일과 백업을 건드리지 않고 `[WARN]`으로 알립니다. 프로젝트별 설정(`projects[...]` 및 `<프로젝트>/.memory/config.json`)은 고치지 않으며, `config.json`이 깨져 있어도 설치를 막지는 않고 `[WARN]`으로 알립니다.
 
@@ -564,11 +577,11 @@ Antigravity 쪽 파일은 감지 여부와 무관하게 있으면 정리합니�
 
 | | |
 | :--- | :--- |
-| **무엇을** | Antigravity가 훅을 실행하는 셸, 실제 대화 기록의 형식, 사용자에게 보이는 출력 통로가 있는지, PowerShell 7에서 한 줄 명령 형식의 훅이 실행되는지, 훅과 MCP 설정 파일의 실제 위치와 모양 |
-| **왜 못 했나** | 개발 PC에 Antigravity가 설치되어 있지 않습니다. |
-| **지금의 근거** | 코드와 자동 테스트뿐입니다. 훅 명령은 어느 셸이 실행할지 몰라 cmd, PowerShell, bash가 모두 같은 뜻으로 읽는 한 줄로 적었습니다. |
-| **확인 방법** | Antigravity가 있는 PC에 설치한 뒤 `cortex-status`의 `Antigravity` 줄을 보고, 새 대화에서 기억 요약이 들어오는지와 `relay_tabs` 같은 도구가 있는지 확인합니다. |
-| **틀렸을 때 증상** | 훅이 돌지 않아 주입과 세션 기록이 없거나, 주 대화와 서브에이전트를 잘못 구분하거나, 직전 대화를 추출하지 못합니다. Claude Code 쪽 동작에는 영향이 없습니다. |
+| **무엇을** | Antigravity가 훅 출력 전체나 `injectSteps` 단계 하나에 글자·바이트 한도를 두는지, 훅을 실행하는 셸, 실제 대화 기록의 형식, 사용자에게 보이는 출력 통로가 있는지, PowerShell 7에서 한 줄 명령 형식의 훅이 실행되는지 |
+| **왜 못 했나** | `agy` 1.5.18의 `--help`, `agy changelog`(1.0.0~1.5.18), 내장 `hooks.md` 문서를 확인했으나 `injectSteps` 단계나 표준 출력의 길이 한도는 적혀 있지 않았고, 실제 대화에서의 잘림 여부도 관측하지 못했습니다. |
+| **지금의 근거** | 길이 한도는 문서에 없으므로 임의로 추정하지 않고 `HEAD_CORE` 단계는 `HEAD_CORE_MAX_CHARS`(9,500자), 나머지 단계 합은 `hookBudget`(최대 9,000자)으로 제한합니다. 훅 명령은 어느 셸이 실행할지 몰라 cmd, PowerShell, bash가 모두 같은 뜻으로 읽는 한 줄로 적었습니다. |
+| **확인 방법** | Antigravity가 있는 환경에서 `cortex-status`의 `Antigravity` 줄을 보고, 큰 `HEAD_CORE`와 기억 개요가 함께 있을 때 새 대화에서 두 단계가 잘리지 않고 모두 들어오는지 확인합니다. |
+| **틀렸을 때 증상** | 문서화되지 않은 길이 한도가 있다면 `injectSteps`의 뒤쪽이 잘리거나 훅 출력이 무시될 수 있고, 셸·대화 기록 가정이 다르면 주입·역할 판별·직전 대화 추출이 되지 않습니다. Claude Code 쪽 동작에는 영향이 없습니다. |
 
 #### Codex
 

@@ -5,6 +5,7 @@ import {
   REPO_ROOT,
   assertInsideDir,
   atomicWriteJson,
+  expandCortexRootPlaceholder,
   formatLegacyEmbeddingUserNotices,
   getTierPaths,
   getTrustedProjectsPath,
@@ -17,7 +18,13 @@ import {
   projectPathKey,
   resolveProjectRoot,
 } from '../core/config.mjs';
-import { HOOK_MAX_CHARS, fitOverviewToBudget, resolveHookBudget, sanitizeInline } from '../core/budget.mjs';
+import {
+  HEAD_CORE_MAX_CHARS,
+  HOOK_MAX_CHARS,
+  fitOverviewToBudget,
+  resolveHookBudget,
+  sanitizeInline,
+} from '../core/budget.mjs';
 import { isWorkerSession } from '../core/role.mjs';
 import {
   APPROVAL_STATE_FILE_NAMES,
@@ -48,7 +55,13 @@ import {
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
 import { deliverInboxForHook } from '../relay/inbox.mjs';
-import { formatUnindexedNotice, formatUnindexedUserNotice, loadHookOverview, resolveHookSyncOptions } from './overview.mjs';
+import {
+  EMPTY_MEMORY_NOTICE,
+  formatUnindexedNotice,
+  formatUnindexedUserNotice,
+  loadHookOverview,
+  resolveHookSyncOptions,
+} from './overview.mjs';
 import {
   RESTORE_FAILURE_NO_TURNS_WITHIN_CAP,
   RESTORE_FAILURE_RECORD_TOO_LARGE,
@@ -58,6 +71,7 @@ import {
 } from './recent-turns.mjs';
 
 export const CLAUDE_HOOK_MAX_CHARS = HOOK_MAX_CHARS;
+export { EMPTY_MEMORY_NOTICE, HEAD_CORE_MAX_CHARS };
 
 /**
  * Instruction for the compaction summary. Claude Code takes the plain stdout of a PreCompact hook as
@@ -546,12 +560,12 @@ export function handleClaudeSessionEnd(
   return {};
 }
 
-function readHeadCore(promptsDir, config) {
+function readHeadCore(promptsDir, config, repoRoot = REPO_ROOT) {
   if (config.headCoreEnabled === false) return '';
   const corePath = path.join(promptsDir, 'HEAD_CORE.md');
   try {
     if (!fs.existsSync(corePath)) return '';
-    return fs.readFileSync(corePath, 'utf8').trim();
+    return expandCortexRootPlaceholder(fs.readFileSync(corePath, 'utf8'), repoRoot).trim();
   } catch {
     return '';
   }
@@ -567,7 +581,8 @@ function extractHeadCoreMarker(headCore) {
 }
 
 function trimLinesToBudget(text, budget) {
-  if (!text || text.length <= budget) return text;
+  if (!text || budget <= 0) return '';
+  if (text.length <= budget) return text;
   const lines = text.split('\n');
   const out = [];
   let len = 0;
@@ -646,7 +661,8 @@ export function handleClaudeSessionStart(
     globalDir,
     homeDir,
     legacyHome,
-    promptsDir = path.join(REPO_ROOT, 'prompts'),
+    repoRoot = REPO_ROOT,
+    promptsDir = path.join(repoRoot, 'prompts'),
     startedAt,
     indexBudget,
     turnOptions,
@@ -668,7 +684,7 @@ export function handleClaudeSessionStart(
   const maxChars = resolveHookBudget(config);
   const source = String(payload.source || '').trim().toLowerCase();
 
-  // Record revive session once (skip on worker sessions and legacy split part="core")
+  // Record revive session once (skip on worker sessions and split part="core", which runs in parallel with "context")
   const sessionRec = !worker && part !== 'core'
     ? recordSession({
         terminalId,
@@ -682,6 +698,32 @@ export function handleClaudeSessionStart(
 
   if (!isProjectEnabled(projectDir, config)) {
     return {};
+  }
+
+  // `part === 'core'` emits ONLY `HEAD_CORE` under its own `HEAD_CORE_MAX_CHARS` cap, with zero side effects
+  // (session recording, index sync, relay inbox, approval checks, or `systemMessage` all belong to `context`).
+  if (part === 'core') {
+    if (worker) return {};
+    const headCore = readHeadCore(promptsDir, config, repoRoot);
+    if (!headCore) return {};
+    const marker = extractHeadCoreMarker(headCore);
+    const transcriptPath = payload.transcript_path || payload.transcriptPath;
+    const skipDuplicateHeadCore = (source === 'resume' || source === 'fork')
+      && Boolean(marker)
+      && hasClaudeSessionStartMarker(
+        transcriptPath,
+        marker,
+        turnOptions && typeof turnOptions === 'object' ? turnOptions : undefined,
+      );
+    if (skipDuplicateHeadCore) return {};
+    const trimmed = trimLinesToBudget(headCore, HEAD_CORE_MAX_CHARS);
+    if (!trimmed) return {};
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'SessionStart',
+        additionalContext: trimmed,
+      },
+    };
   }
 
   // Nothing from the project's .memory/ is read, injected or created until the user approved the folder.
@@ -703,11 +745,8 @@ export function handleClaudeSessionStart(
   if (mandatoryNotApproved) userNotices.push(notApproved.userText);
 
   // Approvals changed without the confirmation dialog: announced once per session and change.
-  let approvalsNotice = null;
-  if (part !== 'core') {
-    pruneApprovalCheckRecords(effectiveGlobalDir);
-    approvalsNotice = checkApprovalsForSession({ globalDir: effectiveGlobalDir, sessionId: extractSessionId(payload) });
-  }
+  pruneApprovalCheckRecords(effectiveGlobalDir);
+  const approvalsNotice = checkApprovalsForSession({ globalDir: effectiveGlobalDir, sessionId: extractSessionId(payload) });
   const approvalsContext = approvalsNotice ? approvalsNotice.contextText : '';
 
   const sections = [];
@@ -724,8 +763,8 @@ export function handleClaudeSessionStart(
     + (approvalsContext ? approvalsContext.length + 2 : 0);
 
   let headCoreToInject = '';
-  if ((part === 'all' || part === 'core') && !worker) {
-    const headCore = readHeadCore(promptsDir, config);
+  if (part === 'all' && !worker) {
+    const headCore = readHeadCore(promptsDir, config, repoRoot);
     if (headCore) {
       const marker = extractHeadCoreMarker(headCore);
       const transcriptPath = payload.transcript_path || payload.transcriptPath;
@@ -743,7 +782,7 @@ export function handleClaudeSessionStart(
   }
 
   let includeOneTimeNotice = false;
-  if (oneTimeCandidate && part !== 'core') {
+  if (oneTimeCandidate) {
     const neededWithMandatory = oneTimeCandidate.length + (approvalsContext ? 2 + approvalsContext.length : 0);
     if (neededWithMandatory <= maxChars) {
       if (!headCoreToInject) {
@@ -759,21 +798,10 @@ export function handleClaudeSessionStart(
     }
   }
 
-  // 1. HEAD_CORE.md (in 'all' or 'core'); skipped in worker sessions, and on resume/fork when already injected
-  if (part === 'all' || part === 'core') {
-    if (headCoreToInject) {
-      const noticeReserve = mandatoryReserve + (includeOneTimeNotice ? oneTimeCandidate.length + 2 : 0);
-      pushSection(trimLinesToBudget(headCoreToInject, maxChars - noticeReserve));
-    }
-    if (part === 'core') {
-      if (sections.length === 0) return {};
-      return {
-        hookSpecificOutput: {
-          hookEventName: 'SessionStart',
-          additionalContext: sections.join('\n\n'),
-        },
-      };
-    }
+  // 1. HEAD_CORE.md (in legacy unified 'all' mode); skipped in worker sessions and on resume/fork when already injected
+  if (part === 'all' && headCoreToInject) {
+    const noticeReserve = mandatoryReserve + (includeOneTimeNotice ? oneTimeCandidate.length + 2 : 0);
+    pushSection(trimLinesToBudget(headCoreToInject, maxChars - noticeReserve));
   }
 
   if (mandatoryNotApproved) {
@@ -805,7 +833,7 @@ export function handleClaudeSessionStart(
 
   // The index is synced under a time budget: documents that do not fit are left to the MCP server and
   // named in a short notice, everything else is injected as usual.
-  const { overview, unindexed } = loadHookOverview({
+  const { overview, unindexed, syncFailed } = loadHookOverview({
     projectDir,
     globalDir: effectiveGlobalDir,
     config,
@@ -816,6 +844,7 @@ export function handleClaudeSessionStart(
     pushSection(formatUnindexedNotice(unindexed, { maxChars: maxChars - used - sepCost(0) }));
     userNotices.push(formatUnindexedUserNotice(unindexed));
   }
+  const wantsEmptyMemoryNotice = !overview && unindexed.length === 0 && !syncFailed && !worker && projectTrusted;
 
   // 2. Budget-first relay inbox delivery. The inbox belongs to the terminal and lives in the global store,
   // so it is delivered whether or not the current project is approved (an excluded project returned above).
@@ -824,9 +853,12 @@ export function handleClaudeSessionStart(
     const remaining = maxChars - used - sepCost(0);
     if (remaining >= 120) {
       try {
-        const inboxBudget = (overview || wantsRecentTurns)
-          ? Math.min(2000, Math.max(300, Math.floor(remaining * 0.35)))
-          : remaining;
+        let inboxBudget = remaining;
+        if (overview || wantsRecentTurns) {
+          inboxBudget = Math.min(2000, Math.max(300, Math.floor(remaining * 0.35)));
+        } else if (wantsEmptyMemoryNotice && remaining >= 120 + EMPTY_MEMORY_NOTICE.length + 2) {
+          inboxBudget = remaining - (EMPTY_MEMORY_NOTICE.length + 2);
+        }
         const delivered = deliverInboxForHook(terminalId, {
           globalDir: effectiveGlobalDir,
           projectDir,
@@ -852,7 +884,7 @@ export function handleClaudeSessionStart(
     if (remaining >= 200) {
       const recentBudget = overview
         ? Math.min(4500, Math.max(400, Math.floor(remaining * 0.55)))
-        : Math.min(4500, remaining);
+        : Math.min(4500, remaining - (wantsEmptyMemoryNotice && remaining >= 400 + EMPTY_MEMORY_NOTICE.length + 2 ? EMPTY_MEMORY_NOTICE.length + 2 : 0));
       const maxRecentChars = Math.min(recentBudget, remaining);
       const transcriptPath = payload.transcript_path || payload.transcriptPath;
       const readTurns = (file) => extractClaudeRecentTurns(file, {
@@ -930,7 +962,7 @@ export function handleClaudeSessionStart(
     if (turnsNote) userNotices.push(turnsNote);
   }
 
-  // 4. Non-truncating FIT_STEPS memory overview
+  // 4. Non-truncating FIT_STEPS memory overview (or one-line empty-memory notice in approved projects)
   if (overview) {
     const reserveForRecent = recentTurnsText ? recentTurnsText.length + 2 : 0;
     const overviewBudget = maxChars - used - sepCost(0) - reserveForRecent;
@@ -939,6 +971,11 @@ export function handleClaudeSessionStart(
       if (fitted.text) {
         pushSection(fitted.text);
       }
+    }
+  } else if (wantsEmptyMemoryNotice) {
+    const reserveForRecent = recentTurnsText ? recentTurnsText.length + 2 : 0;
+    if (used + sepCost(0) + EMPTY_MEMORY_NOTICE.length + reserveForRecent <= maxChars) {
+      pushSection(EMPTY_MEMORY_NOTICE);
     }
   }
 

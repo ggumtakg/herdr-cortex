@@ -5,6 +5,7 @@ import {
   REPO_ROOT,
   assertInsideDir,
   atomicWriteJson,
+  expandCortexRootPlaceholder,
   formatLegacyEmbeddingContextNotice,
   getProjectMemoryDir,
   getTierPaths,
@@ -14,7 +15,7 @@ import {
   isProjectTrusted,
   loadConfig,
 } from '../core/config.mjs';
-import { fitOverviewToBudget, resolveHookBudget } from '../core/budget.mjs';
+import { HEAD_CORE_MAX_CHARS, fitOverviewToBudget, resolveHookBudget } from '../core/budget.mjs';
 import { isWorkerSession } from '../core/role.mjs';
 import {
   formatProjectNotApprovedNotice,
@@ -32,7 +33,7 @@ import {
   resolveCortexGlobalDir,
 } from '../revive/tracker.mjs';
 import { deliverInboxForHook } from '../relay/inbox.mjs';
-import { formatUnindexedNotice, loadHookOverview, resolveHookSyncOptions } from './overview.mjs';
+import { EMPTY_MEMORY_NOTICE, formatUnindexedNotice, loadHookOverview, resolveHookSyncOptions } from './overview.mjs';
 import { checkApprovalsForSession, pruneApprovalCheckRecords } from './approvals-watch.mjs';
 import {
   DEFAULT_MAX_TAIL_BYTES,
@@ -41,6 +42,8 @@ import {
   resolveAntigravityTranscriptPath,
 } from './recent-turns.mjs';
 import { buildCompactInstruction, restoreFailureNote } from './claude.mjs';
+
+export { EMPTY_MEMORY_NOTICE, HEAD_CORE_MAX_CHARS };
 
 const SAFE_CONV_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
 const ROLE_PROBE_BYTES = 16 * 1024;
@@ -66,12 +69,12 @@ function wrapAntigravityInjectSteps(sections) {
   };
 }
 
-function readHeadCore(promptsDir, config) {
+function readHeadCore(promptsDir, config, repoRoot = REPO_ROOT) {
   if (config.headCoreEnabled === false) return '';
   const corePath = path.join(promptsDir, 'HEAD_CORE.md');
   try {
     if (!fs.existsSync(corePath)) return '';
-    return fs.readFileSync(corePath, 'utf8').trim();
+    return expandCortexRootPlaceholder(fs.readFileSync(corePath, 'utf8'), repoRoot).trim();
   } catch {
     return '';
   }
@@ -114,59 +117,35 @@ function resolveStartupNotApproved(projectDir, { projectTrusted, worker, globalD
 }
 
 function pushStartupHeadAndNotices({
+  pushHeadCore,
   pushSection,
   availableBudget,
   worker,
   promptsDir,
+  repoRoot,
   config,
   notApproved,
   legacyEmbeddingNotice,
   projectDir,
   globalDir,
 }) {
-  const headCore = !worker ? readHeadCore(promptsDir, config) : '';
+  const headCore = !worker ? readHeadCore(promptsDir, config, repoRoot) : '';
   const mandatoryNotApproved = !notApproved.recordOnce ? notApproved.contextText : '';
   const oneTimeCandidate = notApproved.recordOnce ? notApproved.contextText : '';
 
-  let reserve = mandatoryNotApproved.length;
-  const baseHead = headCore ? trimLinesToBudget(headCore, availableBudget() - reserve) : '';
-
-  let includeOneTime = false;
-  if (oneTimeCandidate && oneTimeCandidate.length <= availableBudget() - reserve) {
-    const withOneTime = headCore
-      ? trimLinesToBudget(headCore, availableBudget() - reserve - oneTimeCandidate.length)
-      : '';
-    if (!baseHead || Boolean(withOneTime)) {
-      includeOneTime = true;
-      reserve += oneTimeCandidate.length;
-    }
-  }
-
-  let reserveLegacy = false;
-  if (legacyEmbeddingNotice && legacyEmbeddingNotice.length <= availableBudget() - reserve) {
-    const headBeforeLegacy = headCore ? trimLinesToBudget(headCore, availableBudget() - reserve) : '';
-    const headWithLegacy = headCore
-      ? trimLinesToBudget(headCore, availableBudget() - reserve - legacyEmbeddingNotice.length)
-      : '';
-    if (!headBeforeLegacy || Boolean(headWithLegacy)) {
-      reserveLegacy = true;
-      reserve += legacyEmbeddingNotice.length;
-    }
-  }
-
   if (headCore) {
-    pushSection(trimLinesToBudget(headCore, availableBudget() - reserve));
+    pushHeadCore(headCore);
   }
   if (mandatoryNotApproved) {
     pushSection(mandatoryNotApproved);
-  } else if (includeOneTime && pushSection(oneTimeCandidate)) {
+  } else if (oneTimeCandidate && oneTimeCandidate.length <= availableBudget() && pushSection(oneTimeCandidate)) {
     try {
       recordUnapprovedFolderNotice(projectDir, { globalDir });
     } catch {
       // ignore state write errors in hook
     }
   }
-  if (legacyEmbeddingNotice && (reserveLegacy || legacyEmbeddingNotice.length <= availableBudget())) {
+  if (legacyEmbeddingNotice && legacyEmbeddingNotice.length <= availableBudget()) {
     pushSection(legacyEmbeddingNotice);
   }
 }
@@ -322,16 +301,25 @@ function isExplicitRootPayload(payload, convId) {
 }
 
 /**
- * Push the memory overview of an injection. The index is synced under the hook's limits first; documents
- * that sync left out are named in a one-line notice of their own, which is counted in the budget like every
- * other section. `remaining()` is the budget that is left, `reserve` keeps room for text that follows.
+ * Push the memory overview of an injection (or the one-line empty-memory notice when `allowEmptyNotice` is true
+ * and there are 0 active documents). The index is synced under the hook's limits first; documents that sync
+ * left out are named in a one-line notice of their own, which is counted in the budget like every other
+ * section. `remaining()` is the budget that is left, `reserve` keeps room for text that follows.
  */
-function pushOverviewSections({ pushSection, remaining, reserve = 0, ...overviewArgs }) {
-  const { overview, unindexed } = loadHookOverview(overviewArgs);
+function pushOverviewSections({ pushSection, remaining, reserve = 0, allowEmptyNotice = false, ...overviewArgs }) {
+  const { overview, unindexed, syncFailed } = loadHookOverview(overviewArgs);
   if (unindexed.length > 0) {
     pushSection(formatUnindexedNotice(unindexed, { maxChars: remaining() }));
   }
-  if (!overview) return;
+  if (!overview) {
+    if (allowEmptyNotice && unindexed.length === 0 && !syncFailed) {
+      const availableForEmpty = remaining() - reserve;
+      if (EMPTY_MEMORY_NOTICE.length <= availableForEmpty) {
+        pushSection(EMPTY_MEMORY_NOTICE);
+      }
+    }
+    return;
+  }
   const overviewBudget = remaining() - reserve;
   if (overviewBudget >= 120) {
     const fitted = fitOverviewToBudget(overview, overviewBudget);
@@ -357,7 +345,8 @@ export function handleAntigravitySessionStart(
     globalDir,
     homeDir,
     legacyHome,
-    promptsDir = path.join(REPO_ROOT, 'prompts'),
+    repoRoot = REPO_ROOT,
+    promptsDir = path.join(repoRoot, 'prompts'),
     startedAt,
     indexBudget,
   } = {},
@@ -415,6 +404,15 @@ export function handleAntigravitySessionStart(
   const sections = [];
   let used = 0;
 
+  // `HEAD_CORE` is emitted as its own step capped at `HEAD_CORE_MAX_CHARS`, excluded from `hookBudget`.
+  const pushHeadCore = (rawHeadCore) => {
+    const trimmed = trimLinesToBudget(rawHeadCore, HEAD_CORE_MAX_CHARS);
+    const clean = typeof trimmed === 'string' ? trimmed.trim() : '';
+    if (!clean) return false;
+    sections.push(clean);
+    return true;
+  };
+
   const pushSection = (text) => {
     const clean = typeof text === 'string' ? text.trim() : '';
     if (!clean) return false;
@@ -430,10 +428,12 @@ export function handleAntigravitySessionStart(
   pushSection(resolveApprovalsWarning(effectiveGlobalDir, convId));
 
   pushStartupHeadAndNotices({
+    pushHeadCore,
     pushSection,
     availableBudget: () => budget - used,
     worker,
     promptsDir,
+    repoRoot,
     config,
     notApproved,
     legacyEmbeddingNotice,
@@ -444,6 +444,7 @@ export function handleAntigravitySessionStart(
   pushOverviewSections({
     pushSection,
     remaining: () => budget - used,
+    allowEmptyNotice: !worker && projectTrusted,
     projectDir,
     globalDir: effectiveGlobalDir,
     config,
@@ -503,7 +504,8 @@ export function handleAntigravityPreInvocation(
     globalDir,
     homeDir,
     legacyHome,
-    promptsDir = path.join(REPO_ROOT, 'prompts'),
+    repoRoot = REPO_ROOT,
+    promptsDir = path.join(repoRoot, 'prompts'),
     startedAt,
     indexBudget,
     turnOptions,
@@ -567,6 +569,15 @@ export function handleAntigravityPreInvocation(
   const sections = [];
   let used = 0;
 
+  // `HEAD_CORE` is emitted as its own step capped at `HEAD_CORE_MAX_CHARS`, excluded from `hookBudget`.
+  const pushHeadCore = (rawHeadCore) => {
+    const trimmed = trimLinesToBudget(rawHeadCore, HEAD_CORE_MAX_CHARS);
+    const clean = typeof trimmed === 'string' ? trimmed.trim() : '';
+    if (!clean) return false;
+    sections.push(clean);
+    return true;
+  };
+
   const pushSection = (text) => {
     const clean = typeof text === 'string' ? text.trim() : '';
     if (!clean) return false;
@@ -588,6 +599,7 @@ export function handleAntigravityPreInvocation(
   }
 
   const overviewArgs = {
+    allowEmptyNotice: !worker && projectTrusted,
     projectDir,
     globalDir: effectiveGlobalDir,
     config,
@@ -607,10 +619,12 @@ export function handleAntigravityPreInvocation(
     });
     const legacyEmbeddingNotice = formatLegacyEmbeddingContextNotice(config);
     pushStartupHeadAndNotices({
+      pushHeadCore,
       pushSection,
       availableBudget: () => budget - used,
       worker,
       promptsDir,
+      repoRoot,
       config,
       notApproved: startupNotApproved,
       legacyEmbeddingNotice,
@@ -673,9 +687,9 @@ export function handleAntigravityPreInvocation(
 
         if (!injectedStartupThisTurn) {
           if (!worker) {
-            const headCore = readHeadCore(promptsDir, config);
+            const headCore = readHeadCore(promptsDir, config, repoRoot);
             if (headCore) {
-              pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
+              pushHeadCore(headCore);
             }
           }
           pushSection(notApprovedNotice);

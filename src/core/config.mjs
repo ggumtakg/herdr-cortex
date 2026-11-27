@@ -9,6 +9,19 @@ const __dirname = path.dirname(__filename);
 
 export const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
+export const CORTEX_ROOT_PLACEHOLDER = '{{HERDR_CORTEX_ROOT}}';
+
+/**
+ * Replace every `{{HERDR_CORTEX_ROOT}}` placeholder in a prompt asset with the installed repository root
+ * using forward slashes (`/`), leaving text that does not contain the placeholder untouched to the character.
+ */
+export function expandCortexRootPlaceholder(text, repoRoot = REPO_ROOT) {
+  if (typeof text !== 'string' || !text.includes(CORTEX_ROOT_PLACEHOLDER)) return text;
+  const resolved = path.resolve(String(repoRoot || REPO_ROOT)).replace(/\\/g, '/');
+  const normalizedRoot = /^(?:\/|[A-Za-z]:\/)$/.test(resolved) ? resolved : resolved.replace(/\/+$/, '');
+  return text.split(CORTEX_ROOT_PLACEHOLDER).join(normalizedRoot);
+}
+
 export const DEFAULT_CONFIG = Object.freeze({
   mode: 'all', // 'all' | 'opt-in'
   enabledProjects: [],

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  CORTEX_ROOT_PLACEHOLDER,
   DEFAULT_CONFIG,
   EMBEDDING_PROVIDER_NAMES,
   LEGACY_EMBEDDING_KEY_TARGETS,
@@ -12,6 +13,7 @@ import {
   assertInsideDir,
   atomicWriteJson,
   atomicWriteText,
+  expandCortexRootPlaceholder,
   findLegacyEmbeddingKeys,
   getConfigProblems,
   isMainModule,
@@ -57,10 +59,11 @@ const CLAUDE_HOOK_EVENTS = [
 // only writes one small record, the margin is for starting node.
 export const CLAUDE_SESSION_END_TIMEOUT_SECONDS = 5;
 
-/** The Claude Code hooks this installer registers: event, argument of `src/hooks/claude.mjs`, matcher, timeout. */
+/** The Claude Code hooks this installer registers: event, argument(s) of `src/hooks/claude.mjs`, matcher, timeout. */
 export const CLAUDE_HOOK_SPECS = Object.freeze([
-  // One unified SessionStart hook (no two-process split).
-  { event: 'SessionStart', arg: 'session-start', matcher: '', timeout: 10 },
+  // Two parallel SessionStart hooks: `core` emits HEAD_CORE under HEAD_CORE_MAX_CHARS, `context` emits the rest under hookBudget.
+  { event: 'SessionStart', arg: 'session-start core', matcher: '', timeout: 10 },
+  { event: 'SessionStart', arg: 'session-start context', matcher: '', timeout: 10 },
   // Records which session a /clear ended, so the next SessionStart restores turns from that session only.
   // The handler ignores every other end reason.
   { event: 'SessionEnd', arg: 'session-end', matcher: '', timeout: CLAUDE_SESSION_END_TIMEOUT_SECONDS },
@@ -117,10 +120,11 @@ function clone(value) {
  * other character, and nothing depends on `node` being on PATH.
  */
 export function buildClaudeHookHandler({ nodePath, scriptPath, arg, timeout }) {
+  const argParts = String(arg ?? '').trim().split(/\s+/).filter(Boolean);
   return {
     type: 'command',
     command: nodePath,
-    args: ['--no-warnings', scriptPath, arg, HOOK_ID_FLAG, CLAUDE_HOOK_MARKER],
+    args: ['--no-warnings', scriptPath, ...argParts, HOOK_ID_FLAG, CLAUDE_HOOK_MARKER],
     timeout,
   };
 }
@@ -219,13 +223,16 @@ function isNodeExecutable(word) {
 }
 
 /**
- * True when a hook entry was written by this installer: its arguments contain the pair `--id herdr-cortex`.
- * Nothing else makes a hook ours: not the word "herdr-cortex" somewhere in the command, not a script name.
+ * True when a hook entry was written by this installer: its arguments contain the pair `--id herdr-cortex`
+ * (or `--marker herdr-cortex` from an earlier version). Nothing else makes a hook ours: not the word
+ * "herdr-cortex" somewhere in the command, not a script name.
  */
 export function isOwnHook(hook) {
   const argv = hookArgv(hook);
   for (let i = 1; i < argv.length - 1; i++) {
-    if (argv[i] === HOOK_ID_FLAG && argv[i + 1] === CLAUDE_HOOK_MARKER) return true;
+    if ((argv[i] === HOOK_ID_FLAG || argv[i] === '--marker') && argv[i + 1] === CLAUDE_HOOK_MARKER) {
+      return true;
+    }
   }
   return false;
 }
@@ -253,11 +260,23 @@ export function isLegacyReviveHook(hook) {
 export function describeOwnHook(hook) {
   const argv = hookArgv(hook);
   const scriptIndex = argv.findIndex((word, index) => index > 0 && /\.mjs$/i.test(word));
+  const argTokens = [];
+  if (scriptIndex > 0) {
+    for (let i = scriptIndex + 1; i < argv.length; i++) {
+      if (argv[i] === HOOK_ID_FLAG || argv[i] === '--marker') {
+        i++;
+        continue;
+      }
+      if (!argv[i].startsWith('-')) {
+        argTokens.push(argv[i]);
+      }
+    }
+  }
   return {
     form: isPlainObject(hook) && Array.isArray(hook.args) ? 'exec' : 'shell',
     nodePath: argv[0] || '',
     scriptPath: scriptIndex > 0 ? argv[scriptIndex] : '',
-    arg: scriptIndex > 0 ? argv[scriptIndex + 1] || '' : '',
+    arg: argTokens.join(' '),
   };
 }
 
@@ -870,21 +889,49 @@ function syncClaudeSkills(homeDir, repoRoot, isInstall) {
     }
 
     fs.cpSync(srcDir, destDir, { recursive: true });
-    // Sync SKILL.md frontmatter `name:` to match the installed cortex-<skill> directory name
+    // Sync SKILL.md frontmatter `name:` to match the installed cortex-<skill> directory name, and expand
+    // `{{HERDR_CORTEX_ROOT}}` in SKILL.md and every nested file (leaving files without changes untouched).
     const skillMdPath = path.join(destDir, 'SKILL.md');
-    if (fs.existsSync(skillMdPath)) {
-      const rawSkill = fs.readFileSync(skillMdPath, 'utf8').replace(/^\uFEFF/, '');
+    if (fs.existsSync(skillMdPath) && fs.statSync(skillMdPath).isFile()) {
+      const rawFile = fs.readFileSync(skillMdPath, 'utf8');
+      const rawSkill = rawFile.replace(/^\uFEFF/, '');
       const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---/.exec(rawSkill);
+      let nextSkill = rawFile;
       if (fmMatch) {
         const fmBody = fmMatch[1];
         const eol = rawSkill.includes('\r\n') ? '\r\n' : '\n';
         const updatedFmBody = /^name\s*:\s*.*$/m.test(fmBody)
           ? fmBody.replace(/^name\s*:\s*.*$/m, `name: ${destName}`)
           : `name: ${destName}${eol}${fmBody}`;
-        const updatedSkill = `---${eol}${updatedFmBody}${eol}---${rawSkill.slice(fmMatch[0].length)}`;
-        atomicWriteText(skillMdPath, updatedSkill);
+        nextSkill = `---${eol}${updatedFmBody}${eol}---${rawSkill.slice(fmMatch[0].length)}`;
+      }
+      nextSkill = expandCortexRootPlaceholder(nextSkill, repoRoot);
+      if (nextSkill !== rawFile) {
+        atomicWriteText(skillMdPath, nextSkill);
       }
     }
+
+    const expandSubtreePlaceholders = (dir) => {
+      for (const child of fs.readdirSync(dir, { withFileTypes: true })) {
+        const childPath = assertInsideDir(destDir, path.join(dir, child.name));
+        if (child.isSymbolicLink()) continue;
+        if (child.isDirectory()) {
+          expandSubtreePlaceholders(childPath);
+          continue;
+        }
+        if (!child.isFile()) continue;
+        if (childPath === skillMdPath || child.name === SKILL_MANAGED_MARKER) continue;
+        const buf = fs.readFileSync(childPath);
+        if (!buf.includes(CORTEX_ROOT_PLACEHOLDER)) continue;
+        const rawText = buf.toString('utf8');
+        const expanded = expandCortexRootPlaceholder(rawText, repoRoot);
+        if (expanded !== rawText) {
+          atomicWriteText(childPath, expanded);
+        }
+      }
+    };
+    expandSubtreePlaceholders(destDir);
+
     atomicWriteText(path.join(destDir, SKILL_MANAGED_MARKER), `managed-by=herdr-cortex\nsource=${srcDir}\n`);
     installed.push(destName);
   }
@@ -1104,7 +1151,7 @@ function sameFile(a, b) {
 }
 
 // Problems of one of our hook entries: [{ code, message }]. `expectedScript` is the hook script of this repository.
-function checkOwnHookEntry(hook, { expectedScript, expectedArg }) {
+function checkOwnHookEntry(hook, { expectedScript, expectedArgs }) {
   const problems = [];
   const info = describeOwnHook(hook);
   if (!path.isAbsolute(info.nodePath)) {
@@ -1117,23 +1164,67 @@ function checkOwnHookEntry(hook, { expectedScript, expectedArg }) {
   } else if (!sameFile(info.scriptPath, expectedScript)) {
     problems.push({ code: 'other_repo', message: `points at another folder: ${info.scriptPath}` });
   }
-  if (expectedArg && info.arg !== expectedArg) {
-    problems.push({ code: 'other_event', message: `runs "${info.arg}" instead of "${expectedArg}"` });
+  if (Array.isArray(expectedArgs) && expectedArgs.length > 0 && !expectedArgs.includes(info.arg)) {
+    const target = expectedArgs.map((arg) => `"${arg}"`).join(' / ');
+    problems.push({ code: 'other_event', message: `runs "${info.arg}" instead of ${target}` });
   }
   return { info, problems };
 }
 
-function summarizeHookEvent(found, { expectedScript, expectedArg, expectedMatcher }) {
+function summarizeHookEvent(found, { expectedScript, expectedArg, expectedArgs: expectedArgsOption, expectedMatcher }) {
   if (found.length === 0) {
     return { state: 'missing', count: 0, problems: [{ code: 'missing', message: 'not registered' }] };
   }
-  const problems = [];
-  if (found.length > 1) problems.push({ code: 'duplicate', message: `registered ${found.length} times` });
-  const first = checkOwnHookEntry(found[0].hook, { expectedScript, expectedArg });
-  problems.push(...first.problems);
-  if (expectedMatcher !== undefined && found[0].matcher !== expectedMatcher) {
-    problems.push({ code: 'matcher', message: `matcher is "${found[0].matcher}" instead of "${expectedMatcher}"` });
+  const expectedArgs = Array.isArray(expectedArgsOption)
+    ? expectedArgsOption
+    : (expectedArg ? [expectedArg] : []);
+  const rawProblems = [];
+
+  if (expectedArgs.length <= 1 && found.length > 1) {
+    rawProblems.push({ code: 'duplicate', message: `registered ${found.length} times` });
   }
+
+  const checked = found.map((item) => ({
+    matcher: item.matcher,
+    ...checkOwnHookEntry(item.hook, { expectedScript, expectedArgs }),
+  }));
+
+  if (expectedArgs.length > 1) {
+    const counts = new Map(expectedArgs.map((arg) => [arg, 0]));
+    for (const item of checked) {
+      if (counts.has(item.info.arg)) counts.set(item.info.arg, counts.get(item.info.arg) + 1);
+    }
+    if ([...counts.values()].some((count) => count > 1) || found.length > expectedArgs.length) {
+      rawProblems.push({ code: 'duplicate', message: `registered ${found.length} times` });
+    }
+  }
+
+  for (const item of checked) {
+    rawProblems.push(...item.problems);
+    if (expectedMatcher !== undefined && item.matcher !== expectedMatcher) {
+      rawProblems.push({ code: 'matcher', message: `matcher is "${item.matcher}" instead of "${expectedMatcher}"` });
+    }
+  }
+
+  if (expectedArgs.length > 1) {
+    const seenArgs = new Set(checked.map((item) => item.info.arg));
+    for (const reqArg of expectedArgs) {
+      if (!seenArgs.has(reqArg)) {
+        rawProblems.push({ code: 'missing', message: `missing "${reqArg}" hook` });
+      }
+    }
+  }
+
+  const seenMessages = new Set();
+  const problems = [];
+  for (const problem of rawProblems) {
+    const key = `${problem.code}\0${problem.message}`;
+    if (seenMessages.has(key)) continue;
+    seenMessages.add(key);
+    problems.push(problem);
+  }
+
+  const first = checked[0];
   return {
     state: problems.length === 0 ? 'ok' : problems[0].code,
     count: found.length,
@@ -1162,18 +1253,20 @@ export function checkClaudeHooks({ homeDir, repoRoot = REPO_ROOT } = {}) {
   }
   const hooks = isPlainObject(data.hooks) ? data.hooks : {};
   const expectedScript = path.join(path.resolve(repoRoot), 'src', 'hooks', 'claude.mjs');
-  for (const spec of CLAUDE_HOOK_SPECS) {
+  for (const event of CLAUDE_HOOK_EVENTS) {
+    const specs = CLAUDE_HOOK_SPECS.filter((spec) => spec.event === event);
+    if (specs.length === 0) continue;
     const found = [];
-    for (const group of Array.isArray(hooks[spec.event]) ? hooks[spec.event] : []) {
+    for (const group of Array.isArray(hooks[event]) ? hooks[event] : []) {
       if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
       for (const hook of group.hooks) {
         if (isOwnHook(hook)) found.push({ hook, matcher: typeof group.matcher === 'string' ? group.matcher : '' });
       }
     }
-    result.events[spec.event] = summarizeHookEvent(found, {
+    result.events[event] = summarizeHookEvent(found, {
       expectedScript,
-      expectedArg: spec.arg,
-      expectedMatcher: spec.event === 'PreToolUse' ? spec.matcher : undefined,
+      expectedArgs: specs.map((spec) => spec.arg),
+      expectedMatcher: event === 'PreToolUse' ? specs[0].matcher : undefined,
     });
   }
   result.ok = Object.values(result.events).every((event) => event.state === 'ok');

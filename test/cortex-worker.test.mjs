@@ -9,9 +9,12 @@ import { REPO_ROOT } from '../src/core/config.mjs';
 import { installCortex } from '../src/hooks/installer.mjs';
 import {
   HOST_SPECS,
+  VALID_ROLES,
+  WORKER_USAGE,
   buildSpawnSpec,
   buildWorkerEnv,
   buildWorkerPrompt,
+  parseWorkerArgs,
   resolveExecutable,
   runWorker,
 } from '../scripts/cortex-worker.mjs';
@@ -809,6 +812,57 @@ test('PowerShell cortex-worker command: exposed by auto-revive.ps1, uses recorde
     assert.equal(calls[0].roleEnv, 'worker');
     assert.equal(calls[0].hasTerminalId, false);
     assert.ok(calls[0].argv[1].includes(briefFile));
+    assertRealHomeUntouched();
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('cortex-worker: --role researcher is accepted in VALID_ROLES, usage, prompt builder, and headless execution', async () => {
+  const env = makeTempEnv('herdr-cortex-worker-researcher-');
+  try {
+    assert.deepEqual(VALID_ROLES, ['developer', 'coder', 'reviewer', 'researcher']);
+    assert.match(WORKER_USAGE, /--role <developer\|coder\|reviewer\|researcher>/);
+
+    const briefPath = path.join(env.projectDir, 'research-brief.md');
+    fs.writeFileSync(briefPath, '# 조사 지시\n관련 코드와 문서를 조사하라.\n', 'utf8');
+
+    const parsed = parseWorkerArgs(
+      ['--role', 'researcher', '--agent', 'antigravity', '--model', 'gemini-4-neon-medium', '--brief', briefPath],
+      { cwd: env.projectDir },
+    );
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.options.role, 'researcher');
+
+    const prompt = buildWorkerPrompt({ role: 'researcher', briefPath });
+    assert.equal(
+      prompt,
+      `너는 researcher 워커다. 먼저 cortex_prompt(kind: 'agent', name: 'researcher')로 역할을 읽고, 지시 파일 <${briefPath}>을 읽고 그대로 수행해라. 마지막 메시지로 결과를 돌려줘라.`,
+    );
+
+    const agy = makeFakeHostCli(env, 'agy', { winKind: 'cmd' });
+    const outSink = makeMemorySink();
+    const errSink = makeMemorySink();
+    const exitCode = await runWorker(
+      ['--role', 'researcher', '--agent', 'antigravity', '--model', 'gemini-4-neon-medium', '--brief', briefPath, '--cwd', env.projectDir],
+      {
+        cwd: env.root,
+        env: childEnvFor(env, { extra: { FAKE_HOST_STDOUT: '조사 결과 보고 완료\n' } }),
+        stdout: outSink,
+        stderr: errSink,
+      },
+    );
+    assert.equal(exitCode, 0, errSink.text());
+    assert.equal(outSink.text(), '조사 결과 보고 완료\n');
+    assert.match(
+      errSink.text().trim(),
+      /^\[cortex-worker\] role=researcher agent=antigravity model=gemini-4-neon-medium elapsed=\d+\.\ds exit=0$/,
+    );
+
+    const calls = agy.calls();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].roleEnv, 'worker');
+    assert.equal(calls[0].argv[1], prompt);
     assertRealHomeUntouched();
   } finally {
     env.cleanup();

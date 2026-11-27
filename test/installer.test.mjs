@@ -165,17 +165,32 @@ test('installer: Claude Code hooks are written in exec form with the absolute No
 
     const settings = readJson(env.settingsPath);
     assert.deepEqual(Object.keys(settings.hooks).sort(), [...CLAUDE_EVENTS].sort());
-    const expectedArg = { SessionStart: 'session-start', SessionEnd: 'session-end', PreCompact: 'pre-compact', UserPromptSubmit: 'user-prompt', PreToolUse: 'pre-tool-use' };
+    const expectedArgsByEvent = {
+      SessionStart: [['session-start', 'core'], ['session-start', 'context']],
+      SessionEnd: [['session-end']],
+      PreCompact: [['pre-compact']],
+      UserPromptSubmit: [['user-prompt']],
+      PreToolUse: [['pre-tool-use']],
+    };
     for (const event of CLAUDE_EVENTS) {
-      assert.equal(settings.hooks[event].length, 1, event);
-      const [handler] = settings.hooks[event][0].hooks;
-      // exec form: the executable alone in `command`, every argument its own `args` element, no shell involved
-      assert.deepEqual(Object.keys(handler).sort(), ['args', 'command', 'timeout', 'type'], event);
-      assert.equal(handler.type, 'command');
-      assert.equal(handler.command, nodePath, event);
-      assert.deepEqual(handler.args, ['--no-warnings', CLAUDE_HOOK_SCRIPT, expectedArg[event], '--id', 'herdr-cortex'], event);
-      assert.equal(path.isAbsolute(handler.command), true);
-      assert.deepEqual(describeOwnHook(handler), { form: 'exec', nodePath, scriptPath: CLAUDE_HOOK_SCRIPT, arg: expectedArg[event] });
+      const expectedSpecs = expectedArgsByEvent[event];
+      assert.equal(settings.hooks[event].length, expectedSpecs.length, event);
+      for (let i = 0; i < expectedSpecs.length; i++) {
+        const [handler] = settings.hooks[event][i].hooks;
+        const subArgs = expectedSpecs[i];
+        // exec form: the executable alone in `command`, every argument its own `args` element, no shell involved
+        assert.deepEqual(Object.keys(handler).sort(), ['args', 'command', 'timeout', 'type'], event);
+        assert.equal(handler.type, 'command');
+        assert.equal(handler.command, nodePath, event);
+        assert.deepEqual(handler.args, ['--no-warnings', CLAUDE_HOOK_SCRIPT, ...subArgs, '--id', 'herdr-cortex'], event);
+        assert.equal(path.isAbsolute(handler.command), true);
+        assert.deepEqual(describeOwnHook(handler), {
+          form: 'exec',
+          nodePath,
+          scriptPath: CLAUDE_HOOK_SCRIPT,
+          arg: subArgs.join(' '),
+        });
+      }
     }
 
     // MCP entries (Claude Code and Antigravity)
@@ -395,8 +410,10 @@ test('installer: a hook is ours only when it carries --id herdr-cortex; the user
       { matcher: 'startup', hooks: [userHooks.sameScriptName, userHooks.recordSession] },
       { matcher: '', hooks: [userHooks.sharedGroup] },
     ]);
-    assert.equal(installed.hooks.SessionStart.length, 4);
-    for (const event of CLAUDE_EVENTS) assert.equal(ownHooksOf(installed, event).length, 1, event);
+    assert.equal(installed.hooks.SessionStart.length, 5);
+    for (const event of CLAUDE_EVENTS) {
+      assert.equal(ownHooksOf(installed, event).length, event === 'SessionStart' ? 2 : 1, event);
+    }
     assert.deepEqual(installed.hooks.Stop, original.hooks.Stop);
     assert.deepEqual(installed.hooks.Notification, []);
 
@@ -747,7 +764,7 @@ test('installer: every file is checked before any is written; one malformed file
     assert.equal(okRun.status, 0, okRun.stderr);
     assert.match(okRun.stdout, /\[OK\] Claude Code hooks \(installed\)/);
     assertRealHomeUntouched();
-    assert.equal(readJson(env.settingsPath).hooks.SessionStart.length, 1);
+    assert.equal(readJson(env.settingsPath).hooks.SessionStart.length, 2);
     fs.writeFileSync(env.agyHooksPath, '{ broken');
     const partial = uninstallCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir });
     assert.equal(partial.ok, false);
@@ -862,7 +879,7 @@ test('installer: the Antigravity configuration is touched only when Antigravity 
       [true, 'path', false, 'missing', 'missing', 'missing'],
     );
     assert.equal(fs.existsSync(path.join(env.homeDir, '.gemini')), false, 'checking creates nothing');
-    assert.equal(readJson(env.settingsPath).hooks.SessionStart.length, 1, 'Claude Code is set up all the same');
+    assert.equal(readJson(env.settingsPath).hooks.SessionStart.length, 2, 'Claude Code is set up all the same');
 
     // agy on PATH: its files are created
     const viaPath = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, env: { PATH: binDir } });
@@ -1285,7 +1302,10 @@ test('status checks: hook registration is verified per event with the strict ide
     installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, antigravityPresent: false });
     const good = checkClaudeHooks({ homeDir: env.homeDir, repoRoot: REPO_ROOT });
     assert.equal(good.ok, true);
-    assert.deepEqual(Object.values(good.events).map((info) => [info.state, info.count, info.form, info.nodePath]), CLAUDE_EVENTS.map(() => ['ok', 1, 'exec', process.execPath]));
+    assert.deepEqual(
+      Object.entries(good.events).map(([event, info]) => [info.state, info.count, info.form, info.nodePath]),
+      CLAUDE_EVENTS.map((event) => ['ok', event === 'SessionStart' ? 2 : 1, 'exec', process.execPath]),
+    );
     const reg = checkClaudeMcpRegistration({ homeDir: env.homeDir, repoRoot: REPO_ROOT, nodePath: process.execPath });
     assert.deepEqual(
       [reg.readable, reg.registered, reg.ours, reg.thisRepo, reg.upToDate, reg.nodePath, reg.nodeExists, reg.scriptPath, reg.scriptExists, reg.legacyRegistered],
@@ -1335,6 +1355,144 @@ test('status checks: hook registration is verified per event with the strict ide
     atomicWriteJson(env.claudeJsonPath, { mcpServers: { 'herdr-cortex': { command: 'npx', args: ['x'] } } });
     const foreign = checkClaudeMcpRegistration({ homeDir: env.homeDir, repoRoot: REPO_ROOT });
     assert.deepEqual([foreign.registered, foreign.ours], [true, false]);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('installer: upgrades legacy single SessionStart hook (--id and --marker) to core+context without duplicates, checks partial/legacy status, and expands {{HERDR_CORTEX_ROOT}} in copied skills', () => {
+  const env = makeTempEnv('herdr-cortex-installer-split-skills-');
+  try {
+    // 1. Seed previous-version single `session-start` hook (both exec `--id` and legacy `--marker`) + user hook
+    const userHook = { type: 'command', command: 'echo custom-user-start', timeout: 5 };
+    atomicWriteJson(env.settingsPath, {
+      hooks: {
+        SessionStart: [
+          { matcher: '', hooks: [userHook] },
+          {
+            matcher: '',
+            hooks: [{
+              type: 'command',
+              command: process.execPath,
+              args: ['--no-warnings', CLAUDE_HOOK_SCRIPT, 'session-start', '--id', 'herdr-cortex'],
+              timeout: 10,
+            }],
+          },
+        ],
+        UserPromptSubmit: [
+          {
+            matcher: '',
+            hooks: [{
+              type: 'command',
+              command: `node --no-warnings "${CLAUDE_HOOK_SCRIPT}" user-prompt --marker herdr-cortex`,
+              timeout: 10,
+            }],
+          },
+        ],
+      },
+    });
+
+    // Before upgrade, checkClaudeHooks flags the old unsplit `session-start` registration
+    const preUpgrade = checkClaudeHooks({ homeDir: env.homeDir, repoRoot: REPO_ROOT });
+    assert.equal(preUpgrade.ok, false);
+    assert.equal(preUpgrade.events.SessionStart.state, 'other_event');
+
+    // Upgrade via installCortex, then run a second time for idempotency
+    const first = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, antigravityPresent: false, now: new Date(2026, 10, 27, 13, 0, 0) });
+    assert.equal(first.ok, true);
+    const second = installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, antigravityPresent: false, now: new Date(2026, 10, 27, 13, 1, 0) });
+    assert.equal(second.ok, true);
+    assert.equal(second.claudeSettings.changed, false);
+    assert.deepEqual(second.backups, []);
+
+    const upgraded = readJson(env.settingsPath);
+    assert.equal(upgraded.hooks.SessionStart.length, 3, 'user group + core + context');
+    assert.deepEqual(upgraded.hooks.SessionStart[0], { matcher: '', hooks: [userHook] });
+    const ownStart = ownHooksOf(upgraded, 'SessionStart');
+    assert.equal(ownStart.length, 2, 'legacy single session-start hook replaced by two hooks without duplicate');
+    assert.deepEqual(ownStart.map((h) => describeOwnHook(h).arg), ['session-start core', 'session-start context']);
+    assert.deepEqual(ownHooksOf(upgraded, 'UserPromptSubmit').map((h) => describeOwnHook(h).arg), ['user-prompt']);
+    assert.equal(checkClaudeHooks({ homeDir: env.homeDir, repoRoot: REPO_ROOT }).ok, true);
+
+    // Partial registration (only `core`, missing `context`) and duplicate `core` are caught by checkClaudeHooks
+    const onlyCore = JSON.parse(JSON.stringify(upgraded));
+    onlyCore.hooks.SessionStart = onlyCore.hooks.SessionStart.filter(
+      (g) => !g.hooks.some((h) => describeOwnHook(h).arg === 'session-start context'),
+    );
+    atomicWriteJson(env.settingsPath, onlyCore);
+    assert.equal(checkClaudeHooks({ homeDir: env.homeDir, repoRoot: REPO_ROOT }).events.SessionStart.state, 'missing');
+
+    const dupCore = JSON.parse(JSON.stringify(upgraded));
+    dupCore.hooks.SessionStart.push(JSON.parse(JSON.stringify(dupCore.hooks.SessionStart[1])));
+    atomicWriteJson(env.settingsPath, dupCore);
+    assert.equal(checkClaudeHooks({ homeDir: env.homeDir, repoRoot: REPO_ROOT }).events.SessionStart.state, 'duplicate');
+
+    // Re-install heals back to exact 2 hooks, and uninstall removes both while keeping user hook
+    assert.equal(installCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir, antigravityPresent: false }).ok, true);
+    assert.equal(ownHooksOf(readJson(env.settingsPath), 'SessionStart').length, 2);
+    assert.equal(uninstallCortex({ repoRoot: REPO_ROOT, homeDir: env.homeDir }).ok, true);
+    assert.deepEqual(readJson(env.settingsPath), {
+      hooks: {
+        SessionStart: [{ matcher: '', hooks: [userHook] }],
+      },
+    });
+
+    // 2. Skill copying expands {{HERDR_CORTEX_ROOT}} in SKILL.md and nested files (with spaces & $ in path),
+    //    and leaves files without the placeholder byte-for-byte untouched
+    const spacedRepo = path.join(env.root, 'herdr $cortex repo (space)');
+    const planSkillSrc = path.join(spacedRepo, 'prompts', 'skills', 'plan-run');
+    const plainSkillSrc = path.join(spacedRepo, 'prompts', 'skills', 'plain-skill');
+    fs.mkdirSync(path.join(planSkillSrc, 'steps'), { recursive: true });
+    fs.mkdirSync(plainSkillSrc, { recursive: true });
+    atomicWriteText(path.join(spacedRepo, 'src', 'mcp', 'server.mjs'), '// stub\n');
+    atomicWriteText(path.join(spacedRepo, 'src', 'hooks', 'claude.mjs'), '// stub\n');
+
+    atomicWriteText(
+      path.join(planSkillSrc, 'SKILL.md'),
+      '---\nname: plan-run\ndescription: Plan workflow\n---\n\nRun: node --no-warnings "{{HERDR_CORTEX_ROOT}}/scripts/cortex-worker.mjs"\n',
+    );
+    atomicWriteText(
+      path.join(planSkillSrc, 'steps', '01-step.md'),
+      '# Step 1\nFirst: "{{HERDR_CORTEX_ROOT}}/scripts/a.mjs"\nSecond: {{HERDR_CORTEX_ROOT}}/scripts/b.mjs\n',
+    );
+    const untouchedBytes = Buffer.from('# Untouched File\r\nLiteral $& and $$ with no placeholder.\r\n', 'utf8');
+    atomicWriteText(
+      path.join(plainSkillSrc, 'SKILL.md'),
+      '---\nname: cortex-plain-skill\ndescription: Plain skill\n---\n\nNo placeholder here ($& $$).\n',
+    );
+    fs.writeFileSync(path.join(plainSkillSrc, 'reference.md'), untouchedBytes);
+
+    const skillEnv = makeTempEnv('herdr-cortex-installer-skill-copy-');
+    try {
+      const skillRes = installCortex({ repoRoot: spacedRepo, homeDir: skillEnv.homeDir, antigravityPresent: false });
+      assert.equal(skillRes.ok, true);
+      const expectedRoot = spacedRepo.replace(/\\/g, '/');
+
+      const installedPlanSkill = fs.readFileSync(
+        path.join(skillEnv.homeDir, '.claude', 'skills', 'cortex-plan-run', 'SKILL.md'),
+        'utf8',
+      );
+      assert.match(installedPlanSkill, /^name: cortex-plan-run$/m);
+      assert.equal(installedPlanSkill.includes('{{HERDR_CORTEX_ROOT}}'), false);
+      assert.ok(installedPlanSkill.includes(`"${expectedRoot}/scripts/cortex-worker.mjs"`));
+
+      const installedStep = fs.readFileSync(
+        path.join(skillEnv.homeDir, '.claude', 'skills', 'cortex-plan-run', 'steps', '01-step.md'),
+        'utf8',
+      );
+      assert.equal(
+        installedStep,
+        `# Step 1\nFirst: "${expectedRoot}/scripts/a.mjs"\nSecond: ${expectedRoot}/scripts/b.mjs\n`,
+      );
+
+      const copiedUntouched = fs.readFileSync(
+        path.join(skillEnv.homeDir, '.claude', 'skills', 'cortex-plain-skill', 'reference.md'),
+      );
+      assert.equal(Buffer.compare(copiedUntouched, untouchedBytes), 0, 'file without placeholder is byte-identical');
+    } finally {
+      skillEnv.cleanup();
+    }
+    assertRealHomeUntouched();
   } finally {
     env.cleanup();
   }

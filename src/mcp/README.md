@@ -336,7 +336,7 @@ Project folder "<폴더>" is not approved for herdr-cortex, so its .memory/ is n
 | `agent` | `agents/<name>.md` |
 | `standard`, `core` | `<name>.md` |
 
-파일 읽기 결과: `kind`, `name`, `path`(프롬프트 폴더 기준 상대 경로), `content`. `skill`이나 `agent`에서 파일을 찾지 못하면 오류 메시지 끝에 `Available: <그 종류의 이름들>`이 붙습니다. `name`에 `..`이나 NUL 문자가 있으면 거부하고, 계산한 경로가 프롬프트 폴더 밖이면 읽지 않습니다. 이 도구는 프로젝트를 다루지 않으므로 `project_dir`가 없고 제외·승인 검사도 받지 않습니다.
+파일 읽기 결과: `kind`, `name`, `path`(프롬프트 폴더 기준 상대 경로), `content`. 문서 본문에 자리표시자 `{{HERDR_CORTEX_ROOT}}`가 들어 있으면 저장소 루트의 절대 경로(`/` 구분자)로 글자 그대로 치환되어 `content`로 나가고(`expandCortexRootPlaceholder`), 자리표시자가 없는 문서는 한 글자도 바뀌지 않습니다. `skill`이나 `agent`에서 파일을 찾지 못하면 오류 메시지 끝에 `Available: <그 종류의 이름들>`이 붙습니다. `name`에 `..`이나 NUL 문자가 있으면 거부하고, 계산한 경로가 프롬프트 폴더 밖이면 읽지 않습니다. 이 도구는 프로젝트를 다루지 않으므로 `project_dir`가 없고 제외·승인 검사도 받지 않습니다.
 
 ---
 

@@ -17,7 +17,7 @@
 
 | 파일 | 역할 | Export |
 | :--- | :--- | :--- |
-| **`config.mjs`** | 전역 저장소와 홈 폴더 위치 결정, 계층 폴더 구조, 설정 읽기와 병합, 프로젝트 사용 여부 판정, 승인 목록 읽기, ID·경로 검증, 원자적 파일 쓰기, 시각 형식 | `DEFAULT_CONFIG`, `EMBEDDING_PROVIDER_NAMES`, `GLOBAL_DIR_NAME`, `LEGACY_EMBEDDING_KEYS`, `LEGACY_EMBEDDING_KEY_TARGETS`, `MEMORY_GITIGNORE_CONTENT`, `REPO_ROOT`, `assertInsideDir`, `atomicWriteJson`, `atomicWriteText`, `compareTimestamps`, `describeLegacyEmbeddingKeys`, `ensureMemoryGitignore`, `ensureTierDirs`, `findLegacyEmbeddingKeys`, `formatIsoTimestamp`, `formatLegacyEmbeddingContextNotice`, `formatLegacyEmbeddingUserNotices`, `generateDocId`, `getConfigProblems`, `getGlobalDir`, `getProjectMemoryDir`, `getTierPaths`, `getTrustedProjectsPath`, `hasProjectMemoryDir`, `isMainModule`, `isProjectEnabled`, `isProjectTrusted`, `isValidId`, `loadConfig`, `normalizeRelPath`, `parseTimestampMs`, `projectPathKey`, `readTrustedProjects`, `resolveGlobalDir`, `resolveHomeDir`, `resolveProjectRoot`, `sanitizeProjectConfig`, `sanitizeRelFilePath`, `trustedPathKey`, `validateDocId` |
+| **`config.mjs`** | 전역 저장소와 홈 폴더 위치 결정, 계층 폴더 구조, 설정 읽기와 병합, 프로젝트 사용 여부 판정, 승인 목록 읽기, ID·경로 검증, 프롬프트 경로 자리표시자 치환, 원자적 파일 쓰기, 시각 형식 | `CORTEX_ROOT_PLACEHOLDER`, `DEFAULT_CONFIG`, `EMBEDDING_PROVIDER_NAMES`, `GLOBAL_DIR_NAME`, `LEGACY_EMBEDDING_KEYS`, `LEGACY_EMBEDDING_KEY_TARGETS`, `MEMORY_GITIGNORE_CONTENT`, `REPO_ROOT`, `assertInsideDir`, `atomicWriteJson`, `atomicWriteText`, `compareTimestamps`, `describeLegacyEmbeddingKeys`, `ensureMemoryGitignore`, `ensureTierDirs`, `expandCortexRootPlaceholder`, `findLegacyEmbeddingKeys`, `formatIsoTimestamp`, `formatLegacyEmbeddingContextNotice`, `formatLegacyEmbeddingUserNotices`, `generateDocId`, `getConfigProblems`, `getGlobalDir`, `getProjectMemoryDir`, `getTierPaths`, `getTrustedProjectsPath`, `hasProjectMemoryDir`, `isMainModule`, `isProjectEnabled`, `isProjectTrusted`, `isValidId`, `loadConfig`, `normalizeRelPath`, `parseTimestampMs`, `projectPathKey`, `readTrustedProjects`, `resolveGlobalDir`, `resolveHomeDir`, `resolveProjectRoot`, `sanitizeProjectConfig`, `sanitizeRelFilePath`, `trustedPathKey`, `validateDocId` |
 | **`trust.mjs`** | 프로젝트 승인 목록의 쓰기 쪽(승인, 취소, 조회), 사람이 확인한 승인 목록, 두 목록의 차이 감지, 안내 문구와 1회 안내 기록 | `ACKNOWLEDGED_APPROVALS_FILE`, `ACKNOWLEDGE_COMMAND`, `APPROVALS_CHANGED_AGENT_NOTE`, `APPROVALS_CHANGE_MAX_FOLDERS`, `APPROVAL_STATE_FILE_NAMES`, `PROJECT_APPROVAL_INSTRUCTION`, `PROJECT_NOT_APPROVED_CODE`, `ProjectNotApprovedError`, `TRUST_COMMAND`, `UNAPPROVED_FOLDER_NOTICES_FILE`, `acknowledgeApproval`, `acknowledgeCurrentApprovals`, `acknowledgeRevocation`, `approveProject`, `describeApprovalsChange`, `describeProjectTrust`, `formatApprovalsChangedContext`, `formatApprovalsChangedWarning`, `formatProjectNotApprovedMessage`, `formatProjectNotApprovedNotice`, `formatProjectNotApprovedUserNotice`, `formatUnapprovedFolderNotice`, `formatUnapprovedFolderUserNotice`, `getAcknowledgedApprovalsPath`, `getTrustedProjectsPath`, `getUnapprovedFolderNoticesPath`, `hasUnapprovedFolderNoticeRecord`, `isHomeOrRootFolder`, `isProjectTrusted`, `listTrustedProjects`, `readAcknowledgedApprovals`, `recordUnapprovedFolderNotice`, `resolveApprovalTarget`, `revokeProject` |
 | **`trust-cli.mjs`** | 승인 명령줄(`cortex-trust`, `npm run trust`): `approve`, `revoke`, `status`, `list`, `acknowledge` | `ACKNOWLEDGE_DIALOG_MAX_FOLDERS`, `APPROVE_DIALOG_MEANING`, `TRUST_CLI_USAGE`, `TRUST_EXIT_ERROR`, `TRUST_EXIT_NOT_APPROVED`, `TRUST_EXIT_OK`, `buildAcknowledgeDialogMessage`, `buildApproveDialogMessage`, `resolveTrustCliCwd`, `runTrustCli` |
 | **`confirm.mjs`** | 사람에게 확인받기: Windows 확인 대화상자, 터미널 질문으로 대체, 물을 수 없을 때의 거부 | `CONFIRM_DIALOG_SCRIPT`, `CONFIRM_DIALOG_SHOW_LINE`, `CONFIRM_DIALOG_TITLE`, `CONFIRM_TERMINAL_PROMPT`, `CONFIRM_TERMINAL_WORD`, `confirmWithUser`, `resolveWindowsPowerShell`, `showWindowsConfirmDialog` |
@@ -27,7 +27,7 @@
 | **`store.mjs`** | 두 계층의 문서 저장·갱신·읽기, 승인과 사용 여부 검사, 색인 동기화 한도, 개요 자료 만들기 | `CortexStore`, `DEFAULT_TOOL_SYNC_LIMITS`, `ProjectNotApprovedError`, `TOOL_SYNC_BUDGET_MS`, `TOOL_SYNC_BYTES_PER_MS`, `TOOL_SYNC_MAX_FILE_BYTES`, `TOOL_SYNC_PER_FILE_MS`, `UnsafeUpdateError`, `VALID_STATUSES`, `VALID_TYPES` |
 | **`search.mjs`** | 검색어 토큰화, 조건 거르기, 키워드 검색과 벡터 검색과 이웃 문서를 합치는 순위 계산 | `searchMemory`, `tokenizeQuery` |
 | **`graph.mjs`** | 문서와 파일 사이의 연결(간선) 조회, 여러 단계 탐색 | `exploreGraph`, `getNeighbors`, `normalizeGraphTarget` |
-| **`budget.mjs`** | 개요를 글자 수 한도에 맞추기, 훅 주입 한도, 주입 내용 첫 줄의 고정 문구, 한 줄 정리 | `FIT_STEPS`, `HOOK_MAX_CHARS`, `UNTRUSTED_MEMORY_PREAMBLE`, `fitOverviewToBudget`, `resolveHookBudget`, `sanitizeInline` |
+| **`budget.mjs`** | 개요를 글자 수 한도에 맞추기, 훅 주입 한도와 `HEAD_CORE` 별도 상한, 주입 내용 첫 줄의 고정 문구, 한 줄 정리 | `FIT_STEPS`, `HEAD_CORE_MAX_CHARS`, `HOOK_MAX_CHARS`, `UNTRUSTED_MEMORY_PREAMBLE`, `fitOverviewToBudget`, `resolveHookBudget`, `sanitizeInline` |
 | **`role.mjs`** | 환경변수 `HERDR_CORTEX_ROLE`로 위임 워커 세션 여부 판정 | `ROLE_ENV_VAR`, `WORKER_ROLE`, `isWorkerSession` |
 
 `store.mjs`의 `ProjectNotApprovedError`와 `UnsafeUpdateError`는 각각 `trust.mjs`, `frontmatter.mjs`의 것을 다시 내보낸 같은 클래스입니다. `trust.mjs`의 `getTrustedProjectsPath`, `isProjectTrusted`도 `config.mjs`의 것을 다시 내보낸 것입니다.
@@ -130,6 +130,7 @@
 - **경로 검증**: `assertInsideDir(baseDir, targetPath)`는 대상이 기준 폴더 밖으로 나가면(`..`로든, 심볼릭 링크·정션을 따라가서든) 오류를 던집니다. 아직 없는 파일은 존재하는 가장 깊은 상위 폴더의 실제 경로로 검사합니다. `sanitizeRelFilePath(raw, projectRoot)`는 문서의 `files` 값과 본문의 파일 참조를 `/`로 구분한 상대 경로로 정리합니다. NUL 문자, URL, `..`로 빠져나가는 경로, `C:foo` 같은 드라이브 상대 경로, UNC 경로는 `null`입니다. 절대 경로는 `projectRoot`가 주어지고 그 안에 있을 때만 프로젝트 기준 상대 경로로 바뀌고, 그 밖의 절대 경로는 `null`입니다. `normalizeRelPath(filePath)`는 `\`를 `/`로 바꾸고 앞의 `./`와 겹친 `/`를 정리합니다.
 - **파일 쓰기**: `atomicWriteText(filePath, content)`는 같은 폴더에 임시 파일(`.<이름>.tmp-<PID>-<시각>-<난수 8자>`)을 새로 만들어 UTF-8로 쓴 뒤 이름을 바꿔 제자리에 놓습니다. 이름 바꾸기가 `EBUSY`, `EPERM`, `EACCES`로 실패하면 15ms, 30ms, … 간격으로 8번까지 다시 시도하고, 끝내 실패하면 임시 파일을 지우고 오류를 던집니다. `atomicWriteJson(filePath, data)`는 들여쓰기 2칸의 JSON에 줄바꿈을 붙여 같은 방식으로 씁니다.
 - **진입점 판정**: `isMainModule(importMetaUrl, argv1)`은 그 모듈이 Node가 시작한 스크립트인지 알려 줍니다. 양쪽을 실제 경로로 바꾼 뒤(Windows에서는 대소문자 무시) 비교하므로 정션이나 심볼릭 링크 경로로 실행해도 맞게 판정합니다.
+- **프롬프트 경로 자리표시자**: `expandCortexRootPlaceholder(text, repoRoot = REPO_ROOT)`는 프롬프트 문서 안의 `CORTEX_ROOT_PLACEHOLDER`(`"{{HERDR_CORTEX_ROOT}}"`)를 `/` 구분자로 통일한 저장소 루트 절대 경로로 글자 그대로 바꿉니다(따옴표를 덧붙이지 않음). 자리표시자가 없는 문자열은 한 글자도 바꾸지 않고 그대로 돌려주며, `cortex_prompt` 도구·훅의 `HEAD_CORE` 주입·설치기의 스킬 복사가 모두 이 함수를 함께 씁니다.
 - **기타**: `REPO_ROOT`는 저장소 루트의 절대 경로입니다. `projectPathKey(path)`는 프로젝트 경로를 비교용으로 만든 값(절대 경로, 정션·심볼릭 링크를 푼 실제 경로, Windows에서는 소문자)입니다. `hasProjectMemoryDir(projectDir)`는 그 폴더에 `.memory/` 폴더가 있는지만 알려 줍니다.
 
 ---
@@ -888,9 +889,11 @@ P0 기준선(프로젝트의 원래 목표를 적은 문서)은 다른 결정들
 
 ## 9. 주입 분량과 주입 표시 (`budget.mjs`)
 
-### 훅 한 번의 한도
+### 훅 한 번의 한도와 `HEAD_CORE` 상한
 
-`HOOK_MAX_CHARS`는 `9000`입니다. 훅 한 번이 주입하는 글자 수의 상한이며 Claude Code와 Antigravity에 똑같이 적용됩니다. `resolveHookBudget(config)`는 설정의 `hookBudget`을 256~9,000자 범위로 맞춰 돌려줍니다. 설정으로 한도를 **낮출 수는 있어도 9,000자 위로 올릴 수는 없습니다.** 값이 없거나 0이거나 숫자가 아니면 9,000자입니다.
+`HOOK_MAX_CHARS`는 `9000`입니다. 훅이 주입하는 문맥 구획(기억 개요, 받은편지함, 최근 대화 턴, 각종 안내) 합산 글자 수의 상한이며 Claude Code와 Antigravity에 똑같이 적용됩니다. `resolveHookBudget(config)`는 설정의 `hookBudget`을 256~9,000자 범위로 맞춰 돌려줍니다. 설정으로 한도를 **낮출 수는 있어도 9,000자 위로 올릴 수는 없습니다.** 값이 없거나 0이거나 숫자가 아니면 9,000자입니다.
+
+`HEAD_CORE_MAX_CHARS`는 `9500`입니다. Claude Code의 분리 등록된 `session-start core` 훅과 Antigravity 훅의 `HEAD_CORE` 전용 단계는 `hookBudget`을 쓰지 않고 이 상한을 따로 씁니다(Claude Code의 단일 훅 `additionalContext` 한도 10,000자 아래로 유지). 아직 다시 설치하지 않은 환경의 단일 `session-start`(`part: "all"`)만은 예전처럼 `HEAD_CORE`까지 합쳐 `hookBudget` 안에 맞춥니다.
 
 ### 개요를 한도에 맞추기
 

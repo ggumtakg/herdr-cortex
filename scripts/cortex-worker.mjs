@@ -2,7 +2,7 @@
 /**
  * Headless worker launcher behind the `cortex-worker` shell command.
  * Usage:
- *   node --no-warnings scripts/cortex-worker.mjs --role <developer|coder|reviewer> --agent <antigravity|claude> --model <모델 이름> --brief <지시 파일 경로> [--out <결과 파일 경로>] [--timeout <분>] [--allow <허용 규칙>]... [--cwd <폴더>]
+ *   node --no-warnings scripts/cortex-worker.mjs --role <developer|coder|reviewer|researcher> --agent <antigravity|claude> --model <모델 이름> --brief <지시 파일 경로> [--out <결과 파일 경로>] [--timeout <분>] [--allow <허용 규칙>]... [--cwd <폴더>]
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,12 +10,12 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { isMainModule } from '../src/core/config.mjs';
 
-export const VALID_ROLES = Object.freeze(['developer', 'coder', 'reviewer']);
+export const VALID_ROLES = Object.freeze(['developer', 'coder', 'reviewer', 'researcher']);
 export const DEFAULT_TIMEOUT_MINUTES = 40;
 
 export const WORKER_USAGE = [
   'Usage: node --no-warnings scripts/cortex-worker.mjs \\',
-  '  --role <developer|coder|reviewer> --agent <antigravity|claude> \\',
+  '  --role <developer|coder|reviewer|researcher> --agent <antigravity|claude> \\',
   '  --model <모델 이름> --brief <지시 파일 경로> \\',
   '  [--out <결과 파일 경로>] [--timeout <분>] [--allow <허용 규칙>]... [--cwd <폴더>]',
 ].join('\n');

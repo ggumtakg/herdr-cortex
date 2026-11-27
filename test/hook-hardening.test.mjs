@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 import { REPO_ROOT, atomicWriteJson, atomicWriteText, projectPathKey } from '../src/core/config.mjs';
-import { HOOK_MAX_CHARS, resolveHookBudget } from '../src/core/budget.mjs';
+import { HEAD_CORE_MAX_CHARS, HOOK_MAX_CHARS, resolveHookBudget } from '../src/core/budget.mjs';
 import { serializeMarkdownDoc } from '../src/core/frontmatter.mjs';
 import {
   DEFERRED_INDEX_FILE,
@@ -751,7 +751,11 @@ test('/clear: the tab record still identifies the previous session exactly, and 
       }],
     });
     assert.ok(CLAUDE_SESSION_END_TIMEOUT_SECONDS >= 3);
-    for (const event of ['SessionStart', 'PreCompact', 'UserPromptSubmit', 'PreToolUse']) {
+    assert.equal(hooks.SessionStart.length, 2, 'SessionStart');
+    for (const group of hooks.SessionStart) {
+      assert.equal(group.hooks[0].timeout, 10, 'SessionStart');
+    }
+    for (const event of ['PreCompact', 'UserPromptSubmit', 'PreToolUse']) {
       assert.equal(hooks[event].length, 1, event);
       assert.equal(hooks[event][0].hooks[0].timeout, 10, event);
     }
@@ -1161,14 +1165,25 @@ test('hook budget: a configured hookBudget of 1,000,000 is capped at 9,000 chara
     store.close();
     atomicWriteJson(path.join(env.globalDir, 'config.json'), { hookBudget: 1_000_000 });
 
-    // SessionStart
+    const splitHeadAndRest = (res) => {
+      const steps = res.injectSteps.map((s) => s.systemMessage.systemMessage);
+      const headSteps = steps.filter((s) => s.startsWith('# HEAD_CORE'));
+      const restSteps = steps.filter((s) => !s.startsWith('# HEAD_CORE'));
+      return {
+        headLen: headSteps.reduce((n, s) => n + s.length, 0),
+        restLen: restSteps.reduce((n, s) => n + s.length, 0),
+      };
+    };
+
+    // SessionStart: HEAD_CORE has its own cap (HEAD_CORE_MAX_CHARS), remaining steps are capped at HOOK_MAX_CHARS
     const start = handleAntigravitySessionStart(
       { conversationId: 'conv-cap-1', rootConversationId: 'conv-cap-1', cwd: env.projectDir },
       env.hookOptions({ terminalId: 'tab-cap-1' }),
     );
     assert.match(agyText(start), /Budget cap decision/);
-    const startTotal = start.injectSteps.reduce((n, s) => n + s.systemMessage.systemMessage.length, 0);
-    assert.ok(startTotal <= HOOK_MAX_CHARS, `SessionStart injected ${startTotal} characters`);
+    const startLens = splitHeadAndRest(start);
+    assert.ok(startLens.headLen > 0 && startLens.headLen <= HEAD_CORE_MAX_CHARS, `SessionStart HEAD_CORE ${startLens.headLen}`);
+    assert.ok(startLens.restLen <= HOOK_MAX_CHARS, `SessionStart context steps injected ${startLens.restLen} characters`);
 
     // First PreInvocation (deferred startup injection)
     const transcript = path.join(env.root, 'agy-cap.jsonl');
@@ -1183,8 +1198,9 @@ test('hook budget: a configured hookBudget of 1,000,000 is capped at 9,000 chara
       env.hookOptions({ terminalId: 'tab-cap-2' }),
     );
     assert.match(agyText(firstPre), /Budget cap decision/);
-    const firstTotal = firstPre.injectSteps.reduce((n, s) => n + s.systemMessage.systemMessage.length, 0);
-    assert.ok(firstTotal <= HOOK_MAX_CHARS, `first PreInvocation injected ${firstTotal} characters`);
+    const firstLens = splitHeadAndRest(firstPre);
+    assert.ok(firstLens.headLen > 0 && firstLens.headLen <= HEAD_CORE_MAX_CHARS, `first PreInvocation HEAD_CORE ${firstLens.headLen}`);
+    assert.ok(firstLens.restLen <= HOOK_MAX_CHARS, `first PreInvocation context steps injected ${firstLens.restLen} characters`);
 
     // Checkpoint restore (HEAD_CORE + overview + recent turns)
     writeJsonl(transcript, [...steps, { type: 'CHECKPOINT', step_index: 99, status: 'DONE', created_at: '2026-11-23T12:00:00Z' }]);
@@ -1194,8 +1210,9 @@ test('hook budget: a configured hookBudget of 1,000,000 is capped at 9,000 chara
     );
     assert.match(agyText(restore), /Recent Conversation Turns/);
     assert.match(agyText(restore), /Budget cap decision/);
-    const restoreTotal = restore.injectSteps.reduce((n, s) => n + s.systemMessage.systemMessage.length, 0);
-    assert.ok(restoreTotal <= HOOK_MAX_CHARS, `checkpoint restore injected ${restoreTotal} characters`);
+    const restoreLens = splitHeadAndRest(restore);
+    assert.ok(restoreLens.headLen > 0 && restoreLens.headLen <= HEAD_CORE_MAX_CHARS, `checkpoint restore HEAD_CORE ${restoreLens.headLen}`);
+    assert.ok(restoreLens.restLen <= HOOK_MAX_CHARS, `checkpoint restore context steps injected ${restoreLens.restLen} characters`);
 
     // The Claude hook is unchanged
     const claude = contextOf(handleClaudeSessionStart({ session_id: 'sess-cap', cwd: env.projectDir }, env.hookOptions()));

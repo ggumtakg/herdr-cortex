@@ -79,11 +79,18 @@ export const FIT_STEPS = Object.freeze([
 ]);
 
 /**
- * Most characters one hook call injects, for every host (Claude Code and Antigravity). The configured
- * `hookBudget` can lower this, never raise it.
+ * Most characters one hook call injects for context sections (`hookBudget`), in both Claude Code and
+ * Antigravity. The configured `hookBudget` can lower this, never raise it.
  */
 export const HOOK_MAX_CHARS = 9000;
 const HOOK_MIN_CHARS = 256;
+
+/**
+ * Dedicated character cap for `HEAD_CORE` when emitted outside `hookBudget` (Claude Code `session-start core`
+ * and Antigravity's `HEAD_CORE` step in `injectSteps`), staying safely under Claude Code's 10,000-character
+ * per-hook `additionalContext` limit.
+ */
+export const HEAD_CORE_MAX_CHARS = 9500;
 
 /**
  * Injection budget of one hook call: the configured `hookBudget`, kept between 256 and HOOK_MAX_CHARS.

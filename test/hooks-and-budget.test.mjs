@@ -5,8 +5,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { REPO_ROOT, atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
+import {
+  CORTEX_ROOT_PLACEHOLDER,
+  REPO_ROOT,
+  atomicWriteJson,
+  atomicWriteText,
+  expandCortexRootPlaceholder,
+} from '../src/core/config.mjs';
+import { HEAD_CORE_MAX_CHARS, HOOK_MAX_CHARS } from '../src/core/budget.mjs';
 import { CortexStore } from '../src/core/store.mjs';
+import { createToolRegistry } from '../src/mcp/tools.mjs';
+import { hasUnapprovedFolderNoticeRecord } from '../src/core/trust.mjs';
+import { getApprovalChecksDir } from '../src/hooks/approvals-watch.mjs';
+import { peekInbox } from '../src/relay/inbox.mjs';
 import {
   isSubagentPayload,
   listSavedSessions,
@@ -20,9 +31,11 @@ import {
 import {
   CLAUDE_HOOK_MAX_CHARS,
   COMPACT_POINTER_INSTRUCTION,
+  EMPTY_MEMORY_NOTICE,
   TURNS_NOT_RESTORED_UNIDENTIFIED_NOTE,
   handleClaudePreCompact,
   handleClaudePreToolUse,
+  handleClaudeSessionEnd,
   handleClaudeSessionStart,
   handleClaudeUserPrompt,
 } from '../src/hooks/claude.mjs';
@@ -1012,13 +1025,19 @@ test('hooks/installer: idempotent install/uninstall round-trip preserves existin
     assert.ok(agyMcp.mcpServers[MCP_SERVER_KEY]);
     assert.ok(agyMcp.mcpServers.existingServer);
 
-    // Verify Claude settings: single unified SessionStart hook (no 2-process split race), all 4 hooks added once
+    // Verify Claude settings: two SessionStart hooks (core + context) and one each for the other four events
     const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf8'));
     assert.equal(claudeSettings.theme, 'dark');
-    assert.equal(claudeSettings.hooks.SessionStart.length, 2); // echo keep-me + cortex
-    const cortexStartEntry = claudeSettings.hooks.SessionStart.find((e) => e.hooks.some((h) => isOwnHook(h)));
-    assert.equal(cortexStartEntry.hooks.length, 1);
-    assert.deepEqual(cortexStartEntry.hooks[0].args.slice(-3), ['session-start', '--id', 'herdr-cortex']);
+    assert.equal(claudeSettings.hooks.SessionStart.length, 3); // echo keep-me + cortex core + cortex context
+    const cortexStartEntries = claudeSettings.hooks.SessionStart.filter((e) => e.hooks.some((h) => isOwnHook(h)));
+    assert.equal(cortexStartEntries.length, 2);
+    assert.deepEqual(
+      cortexStartEntries.map((e) => e.hooks[0].args.slice(-4)),
+      [
+        ['session-start', 'core', '--id', 'herdr-cortex'],
+        ['session-start', 'context', '--id', 'herdr-cortex'],
+      ],
+    );
     assert.equal(claudeSettings.hooks.PreCompact.length, 1);
     assert.equal(claudeSettings.hooks.SessionEnd.length, 1);
     assert.deepEqual(claudeSettings.hooks.SessionEnd[0].hooks[0].args.slice(-3), ['session-end', '--id', 'herdr-cortex']);
@@ -1312,6 +1331,473 @@ test('Post-review regression: P0-only baseline renders in Claude and Antigravity
     const agyText = (agyOut.injectSteps || []).map((s) => s.systemMessage?.systemMessage || '').join('\n');
     assert.match(agyText, /Sole P0 Baseline/);
   } finally {
+    env.cleanup();
+  }
+});
+
+test('HEAD_CORE split & budget isolation: `all` invariance, `core`+`context` equivalence, `core` zero side effects & 9,500 cap, and 4,500-char HEAD_CORE + full hookBudget overview in Claude & Antigravity', () => {
+  const env = makeTempEnv('cortex-head-core-split-');
+  try {
+    assert.equal(HEAD_CORE_MAX_CHARS, 9500);
+
+    // 1. `core` performs ZERO side effects (no session record, no inbox drain, no unapproved/approval state writes, no systemMessage)
+    const unapprovedDir = path.join(env.root, 'unapproved-core-check');
+    fs.mkdirSync(unapprovedDir, { recursive: true });
+    enqueueMessage('tab-core-side', { from_terminal_id: 'tab-0', message: 'MUST-STAY-PENDING' }, { globalDir: env.globalDir });
+
+    const coreSideOut = handleClaudeSessionStart(
+      { session_id: 'sess-core-only', source: 'startup', cwd: unapprovedDir },
+      { part: 'core', terminalId: 'tab-core-side', globalDir: env.globalDir, homeDir: env.homeDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.equal(coreSideOut.systemMessage, undefined);
+    assert.match(coreSideOut.hookSpecificOutput?.additionalContext || '', /^# HEAD_CORE/);
+    assert.equal(readSavedSession('tab-core-side', { globalDir: env.globalDir, legacyHome: env.homeDir }), null);
+    assert.equal(peekInbox('tab-core-side', { globalDir: env.globalDir }).count, 1);
+    assert.equal(hasUnapprovedFolderNoticeRecord(unapprovedDir, { globalDir: env.globalDir }), false);
+    assert.equal(fs.existsSync(getApprovalChecksDir(env.globalDir)), false);
+
+    // `core` skips worker sessions, subagents, excluded projects, headCoreEnabled:false, and duplicate resume/fork
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 'sess-core-worker', source: 'startup', cwd: env.projectDir },
+        { part: 'core', env: { HERDR_CORTEX_ROLE: 'worker' }, globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 'sess-core-sub', agent_id: 'sub-1', source: 'startup', cwd: env.projectDir },
+        { part: 'core', globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+    const resumeTranscript = path.join(env.root, 'resume-core.jsonl');
+    writeJsonl(resumeTranscript, [
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'SessionStart',
+          content: '# HEAD_CORE\n\n- Stay at low/mid resolution; delegate high-resolution implementation.',
+        },
+      },
+    ]);
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 'sess-core-resume', source: 'resume', transcript_path: resumeTranscript, cwd: env.projectDir },
+        { part: 'core', globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+
+    // `core` trims oversized HEAD_CORE at HEAD_CORE_MAX_CHARS (9,500) independent of hookBudget (even hookBudget: 256)
+    const hugePromptsDir = path.join(env.root, 'prompts-huge');
+    fs.mkdirSync(hugePromptsDir, { recursive: true });
+    const hugeLines = ['# HEAD 운영 원칙'];
+    while (hugeLines.join('\n').length < 11500) {
+      hugeLines.push(`- Rule line ${hugeLines.length}: ${'원칙 설명 '.repeat(12)}`.trim());
+    }
+    atomicWriteText(path.join(hugePromptsDir, 'HEAD_CORE.md'), `${hugeLines.join('\n')}\n`);
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { hookBudget: 256 });
+
+    const hugeCoreOut = handleClaudeSessionStart(
+      { session_id: 'sess-huge-core', source: 'startup', cwd: env.projectDir },
+      { part: 'core', globalDir: env.globalDir, promptsDir: hugePromptsDir },
+    );
+    const hugeCoreCtx = hugeCoreOut.hookSpecificOutput?.additionalContext || '';
+    assert.ok(hugeCoreCtx.length > 9000 && hugeCoreCtx.length <= HEAD_CORE_MAX_CHARS, `core length=${hugeCoreCtx.length}`);
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { hookBudget: 9000 });
+
+    // 2. `all` byte-for-byte invariance & `core`+`context` === `all` when everything fits in hookBudget
+    const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+    try {
+      store.saveDoc({
+        id: 'dec-inv-1',
+        type: 'decision',
+        title: 'Split hook invariant decision',
+        summary: 'Ensures unified all and core+context match byte-for-byte when within budget.',
+        session: 's-inv',
+      });
+    } finally {
+      store.close();
+    }
+
+    const compactTranscript = path.join(env.root, 'compact-eq.jsonl');
+    writeJsonl(compactTranscript, [
+      { type: 'user', origin: { kind: 'human' }, message: { role: 'user', content: 'Verify split hooks after compact' } },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Confirmed.' }] } },
+    ]);
+
+    const runPart = (part, sessionId, tabId, source = 'compact', transcript = compactTranscript) => handleClaudeSessionStart(
+      { session_id: sessionId, source, transcript_path: transcript, cwd: env.projectDir },
+      { part, terminalId: tabId, globalDir: env.globalDir, homeDir: env.homeDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+
+    enqueueMessage('tab-all-1', { id: 'msg-eq-1', from_terminal_id: 'tab-0', message: 'Hello split test', created_at: '2026-11-27T10:00:00.000+09:00' }, { globalDir: env.globalDir });
+    enqueueMessage('tab-ctx-1', { id: 'msg-eq-1', from_terminal_id: 'tab-0', message: 'Hello split test', created_at: '2026-11-27T10:00:00.000+09:00' }, { globalDir: env.globalDir });
+
+    const allOut = runPart('all', 'sess-all-1', 'tab-all-1');
+    const coreOut = runPart('core', 'sess-split-1', 'tab-ctx-1');
+    const ctxOut = runPart('context', 'sess-split-1', 'tab-ctx-1');
+
+    const allText = allOut.hookSpecificOutput.additionalContext;
+    const combinedText = `${coreOut.hookSpecificOutput.additionalContext}\n\n${ctxOut.hookSpecificOutput.additionalContext}`;
+    assert.equal(combinedText, allText, 'core + context matches all byte-for-byte when HEAD_CORE does not truncate overview');
+    assert.equal(coreOut.systemMessage, undefined);
+    assert.equal(ctxOut.systemMessage, allOut.systemMessage);
+
+    // Also verify `/clear` across `core` + `context` matches `all`
+    const clearedOldPath = path.join(env.root, 'cleared-old.jsonl');
+    const clearedNewPath = path.join(env.root, 'cleared-new.jsonl');
+    writeJsonl(clearedOldPath, [
+      { type: 'user', origin: { kind: 'human' }, message: { role: 'user', content: 'Turn before /clear' } },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Reply before /clear' }] } },
+    ]);
+    writeJsonl(clearedNewPath, []);
+
+    handleClaudeSessionEnd(
+      { session_id: 'cleared-old', reason: 'clear', transcript_path: clearedOldPath, cwd: env.projectDir },
+      { terminalId: 'tab-clr-all', globalDir: env.globalDir },
+    );
+    const clearAll = runPart('all', 'cleared-new', 'tab-clr-all', 'clear', clearedNewPath);
+
+    handleClaudeSessionEnd(
+      { session_id: 'cleared-old', reason: 'clear', transcript_path: clearedOldPath, cwd: env.projectDir },
+      { terminalId: 'tab-clr-split', globalDir: env.globalDir },
+    );
+    const clearCore = runPart('core', 'cleared-new-2', 'tab-clr-split', 'clear', clearedNewPath);
+    const clearCtx = runPart('context', 'cleared-new-2', 'tab-clr-split', 'clear', clearedNewPath);
+    assert.equal(
+      `${clearCore.hookSpecificOutput.additionalContext}\n\n${clearCtx.hookSpecificOutput.additionalContext}`,
+      clearAll.hookSpecificOutput.additionalContext,
+    );
+
+    // 3. Large 4,500-char HEAD_CORE + dense memory overview: `context` and Antigravity give overview the FULL hookBudget!
+    const prompts4500 = path.join(env.root, 'prompts-4500');
+    fs.mkdirSync(prompts4500, { recursive: true });
+    const lines4500 = ['# HEAD 운영 원칙'];
+    while (lines4500.join('\n').length < 4420) {
+      lines4500.push(`- 원칙 항목 ${lines4500.length}: 위임과 정본 보존 규칙을 지킨다.`);
+    }
+    const head4500Text = lines4500.join('\n');
+    assert.ok(head4500Text.length >= 4400 && head4500Text.length <= 4550, `head4500=${head4500Text.length}`);
+    atomicWriteText(path.join(prompts4500, 'HEAD_CORE.md'), `${head4500Text}\n`);
+
+    const denseStore = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+    try {
+      for (let i = 0; i < 30; i++) {
+        denseStore.saveDoc({
+          id: `dec-dense-${String(i).padStart(2, '0')}`,
+          type: 'decision',
+          title: `Dense architecture decision number ${i} for full budget verification`,
+          summary: `Detailed summary text ensuring full overview exceeds 4,500 chars and uses full 9,000-char hookBudget (${i}). `.repeat(3),
+          tags: ['arch', `tag-${i}`],
+          session: `sess-${i % 6}`,
+        });
+      }
+    } finally {
+      denseStore.close();
+    }
+
+    const legacyAllDense = handleClaudeSessionStart(
+      { session_id: 's-dense-all', source: 'startup', cwd: env.projectDir },
+      { part: 'all', globalDir: env.globalDir, promptsDir: prompts4500 },
+    ).hookSpecificOutput.additionalContext;
+    assert.ok(legacyAllDense.length <= HOOK_MAX_CHARS, 'legacy `all` stays within single-hook hookBudget');
+
+    const splitCoreDense = handleClaudeSessionStart(
+      { session_id: 's-dense-split', source: 'startup', cwd: env.projectDir },
+      { part: 'core', globalDir: env.globalDir, promptsDir: prompts4500 },
+    ).hookSpecificOutput.additionalContext;
+    const splitCtxDense = handleClaudeSessionStart(
+      { session_id: 's-dense-split', source: 'startup', cwd: env.projectDir },
+      { part: 'context', globalDir: env.globalDir, promptsDir: prompts4500 },
+    ).hookSpecificOutput.additionalContext;
+
+    assert.equal(splitCoreDense, head4500Text);
+    assert.equal(splitCtxDense.includes('# HEAD 운영 원칙'), false);
+    assert.ok(
+      splitCtxDense.length > 5000 && splitCtxDense.length <= HOOK_MAX_CHARS,
+      `context uses full hookBudget (${splitCtxDense.length} chars > 5,000, not squeezed by 4,500-char HEAD_CORE)`,
+    );
+
+    // Antigravity: all 3 paths (SessionStart, first PreInvocation, CHECKPOINT restore) exclude HEAD_CORE from hookBudget
+    const agyStartDense = handleAntigravitySessionStart(
+      { conversationId: 'agy-dense-1', rootConversationId: 'agy-dense-1', cwd: env.projectDir },
+      { globalDir: env.globalDir, promptsDir: prompts4500 },
+    );
+    const agyStartSteps = agyStartDense.injectSteps.map((s) => s.systemMessage.systemMessage);
+    assert.equal(agyStartSteps[0], head4500Text);
+    const agyStartRestLen = agyStartSteps.slice(1).reduce((n, s) => n + s.length, 0);
+    assert.ok(agyStartRestLen > 5000 && agyStartRestLen <= HOOK_MAX_CHARS, `Antigravity SessionStart rest=${agyStartRestLen}`);
+
+    const agyDenseTranscript = path.join(env.root, 'agy-dense.jsonl');
+    writeJsonl(agyDenseTranscript, [
+      { type: 'USER_INPUT', step_index: 1, userInput: { userResponse: 'First prompt' } },
+      { type: 'PLANNER_RESPONSE', step_index: 2, plannerResponse: { response: 'First answer' } },
+    ]);
+    const agyPreDense = handleAntigravityPreInvocation(
+      { conversationId: 'agy-dense-2', transcriptPath: agyDenseTranscript, cwd: env.projectDir, lastUserInput: 'First prompt' },
+      { globalDir: env.globalDir, promptsDir: prompts4500 },
+    );
+    const agyPreSteps = agyPreDense.injectSteps.map((s) => s.systemMessage.systemMessage);
+    assert.equal(agyPreSteps[0], head4500Text);
+    const agyPreRestLen = agyPreSteps.slice(1).reduce((n, s) => n + s.length, 0);
+    assert.ok(agyPreRestLen > 5000 && agyPreRestLen <= HOOK_MAX_CHARS, `Antigravity first PreInvocation rest=${agyPreRestLen}`);
+
+    writeJsonl(agyDenseTranscript, [
+      { type: 'USER_INPUT', step_index: 1, userInput: { userResponse: 'First prompt' } },
+      { type: 'PLANNER_RESPONSE', step_index: 2, plannerResponse: { response: 'First answer' } },
+      { type: 'CHECKPOINT', step_index: 3, status: 'DONE', created_at: '2026-11-27T12:00:00Z' },
+    ]);
+    const agyCpDense = handleAntigravityPreInvocation(
+      { conversationId: 'agy-dense-2', transcriptPath: agyDenseTranscript, cwd: env.projectDir, lastUserInput: 'After checkpoint' },
+      { globalDir: env.globalDir, promptsDir: prompts4500 },
+    );
+    const agyCpSteps = agyCpDense.injectSteps.map((s) => s.systemMessage.systemMessage);
+    assert.equal(agyCpSteps[0], head4500Text);
+    const agyCpRestLen = agyCpSteps.slice(1).reduce((n, s) => n + s.length, 0);
+    assert.ok(agyCpRestLen > 4500 && agyCpRestLen <= HOOK_MAX_CHARS, `Antigravity checkpoint restore rest=${agyCpRestLen}`);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('Empty memory (0-document) notice: condition matrix across approved/unapproved/worker/subagent/excluded/core and stateless disappearance when docs exist', () => {
+  const env = makeTempEnv('cortex-empty-notice-');
+  try {
+    assert.match(EMPTY_MEMORY_NOTICE, /^\[herdr-cortex\] /);
+    assert.equal(EMPTY_MEMORY_NOTICE.includes('\n'), false);
+    assert.ok(EMPTY_MEMORY_NOTICE.length <= 200, `EMPTY_MEMORY_NOTICE length=${EMPTY_MEMORY_NOTICE.length}`);
+    assert.match(EMPTY_MEMORY_NOTICE, /memory_save/);
+
+    // Remove global/docs so we first test when neither .memory/ nor global/docs exists yet
+    fs.rmSync(path.join(env.globalDir, 'docs'), { recursive: true, force: true });
+
+    // 1. Approved project with no store folders yet -> emits EMPTY_MEMORY_NOTICE in context & all, never in systemMessage, never creates .memory/
+    const ctxEmpty = handleClaudeSessionStart(
+      { session_id: 's-empty-1', source: 'startup', cwd: env.projectDir },
+      { part: 'context', globalDir: env.globalDir, promptsDir: env.promptsDir },
+    );
+    assert.equal(ctxEmpty.hookSpecificOutput?.additionalContext, EMPTY_MEMORY_NOTICE);
+    assert.equal(ctxEmpty.systemMessage, undefined);
+    assert.equal(fs.existsSync(path.join(env.projectDir, '.memory')), false);
+
+    const allEmpty = handleClaudeSessionStart(
+      { session_id: 's-empty-all', source: 'startup', cwd: env.projectDir },
+      { part: 'all', globalDir: env.globalDir, promptsDir: env.promptsDir },
+    );
+    assert.ok(allEmpty.hookSpecificOutput?.additionalContext.endsWith(`\n\n${EMPTY_MEMORY_NOTICE}`));
+
+    // Antigravity SessionStart & first PreInvocation in approved empty project also emit EMPTY_MEMORY_NOTICE
+    const agyEmpty = handleAntigravitySessionStart(
+      { conversationId: 'agy-empty-1', rootConversationId: 'agy-empty-1', cwd: env.projectDir },
+      { globalDir: env.globalDir, promptsDir: env.promptsDir },
+    );
+    const agyEmptySteps = agyEmpty.injectSteps.map((s) => s.systemMessage.systemMessage);
+    assert.equal(agyEmptySteps.includes(EMPTY_MEMORY_NOTICE), true);
+
+    const agyPreEmpty = handleAntigravityPreInvocation(
+      { conversationId: 'agy-empty-2', rootConversationId: 'agy-empty-2', cwd: env.projectDir, lastUserInput: 'Hi' },
+      { globalDir: env.globalDir, promptsDir: env.promptsDir },
+    );
+    assert.equal(agyPreEmpty.injectSteps.map((s) => s.systemMessage.systemMessage).includes(EMPTY_MEMORY_NOTICE), true);
+
+    // 2. Never emitted in `part: "core"`, worker session, subagent, excluded project, or unapproved folders (even with 0 global docs)
+    const coreEmpty = handleClaudeSessionStart(
+      { session_id: 's-empty-core', source: 'startup', cwd: env.projectDir },
+      { part: 'core', globalDir: env.globalDir, promptsDir: env.promptsDir },
+    );
+    assert.equal((coreEmpty.hookSpecificOutput?.additionalContext || '').includes(EMPTY_MEMORY_NOTICE), false);
+
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 's-empty-worker', source: 'startup', cwd: env.projectDir },
+        { part: 'context', env: { HERDR_CORTEX_ROLE: 'worker' }, globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+    assert.deepEqual(
+      handleAntigravitySessionStart(
+        { conversationId: 'agy-empty-worker', rootConversationId: 'agy-empty-worker', cwd: env.projectDir },
+        { env: { HERDR_CORTEX_ROLE: 'worker' }, globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 's-empty-sub', agent_id: 'sub-9', source: 'startup', cwd: env.projectDir },
+        { part: 'context', globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+
+    const unapprovedBare = path.join(env.root, 'unapproved-0doc-bare');
+    const unapprovedWithMem = path.join(env.root, 'unapproved-0doc-mem');
+    fs.mkdirSync(unapprovedBare, { recursive: true });
+    fs.mkdirSync(path.join(unapprovedWithMem, '.memory', 'docs'), { recursive: true });
+
+    const claudeUnappBare = handleClaudeSessionStart(
+      { session_id: 's-unapp-bare', source: 'startup', cwd: unapprovedBare },
+      { part: 'context', globalDir: env.globalDir, homeDir: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.equal((claudeUnappBare.hookSpecificOutput?.additionalContext || '').includes(EMPTY_MEMORY_NOTICE), false);
+    // Second run on same unapproved folder (after 1-time unapproved notice was recorded): still NO empty-memory notice!
+    const claudeUnappBare2 = handleClaudeSessionStart(
+      { session_id: 's-unapp-bare-2', source: 'startup', cwd: unapprovedBare },
+      { part: 'context', globalDir: env.globalDir, homeDir: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.deepEqual(claudeUnappBare2, {});
+
+    const claudeUnappMem = handleClaudeSessionStart(
+      { session_id: 's-unapp-mem', source: 'startup', cwd: unapprovedWithMem },
+      { part: 'context', globalDir: env.globalDir, homeDir: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.equal((claudeUnappMem.hookSpecificOutput?.additionalContext || '').includes(EMPTY_MEMORY_NOTICE), false);
+
+    const agyUnapp = handleAntigravitySessionStart(
+      { conversationId: 'agy-unapp-0', rootConversationId: 'agy-unapp-0', cwd: unapprovedBare },
+      { globalDir: env.globalDir, homeDir: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.equal(
+      (agyUnapp.injectSteps || []).some((s) => s.systemMessage.systemMessage.includes(EMPTY_MEMORY_NOTICE)),
+      false,
+    );
+
+    // Excluded project -> {}
+    const excludedDir = path.join(env.root, 'excluded-0doc');
+    fs.mkdirSync(excludedDir, { recursive: true });
+    approveAsUser(excludedDir, { globalDir: env.globalDir });
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { excludedProjects: [excludedDir] });
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 's-excl-0', source: 'startup', cwd: excludedDir },
+        { part: 'context', globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+    fs.unlinkSync(path.join(env.globalDir, 'config.json'));
+
+    // 3. Stateless transition: saving 1 doc replaces EMPTY_MEMORY_NOTICE with overview; marking it superseded restores EMPTY_MEMORY_NOTICE
+    const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+    try {
+      store.saveDoc({
+        id: 'dec-first-1',
+        type: 'decision',
+        title: 'First recorded decision',
+        summary: 'Once saved, overview replaces the empty-memory notice.',
+      });
+      const withDoc = handleClaudeSessionStart(
+        { session_id: 's-with-doc', source: 'startup', cwd: env.projectDir },
+        { part: 'context', globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ).hookSpecificOutput.additionalContext;
+      assert.match(withDoc, /^# Cortex Memory Overview/);
+      assert.equal(withDoc.includes(EMPTY_MEMORY_NOTICE), false);
+
+      store.updateDoc({ id: 'dec-first-1', scope: 'project', status: 'superseded' });
+      const emptyAgain = handleClaudeSessionStart(
+        { session_id: 's-empty-again', source: 'startup', cwd: env.projectDir },
+        { part: 'context', globalDir: env.globalDir, promptsDir: env.promptsDir },
+      ).hookSpecificOutput.additionalContext;
+      assert.equal(emptyAgain, EMPTY_MEMORY_NOTICE);
+    } finally {
+      store.close();
+    }
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('{{HERDR_CORTEX_ROOT}} placeholder expansion: literal forward-slash substitution across cortex_prompt, Claude & Antigravity HEAD_CORE (with resume marker), and byte-exact preservation without placeholder', async () => {
+  const env = makeTempEnv('cortex-placeholder-');
+  const spacedRepo = path.join(env.root, 'repo with spaces & $signs');
+  const customPrompts = path.join(spacedRepo, 'prompts');
+  fs.mkdirSync(path.join(customPrompts, 'skills', 'delegate', 'steps'), { recursive: true });
+  fs.mkdirSync(path.join(customPrompts, 'agents'), { recursive: true });
+
+  const expectedRoot = spacedRepo.replace(/\\/g, '/');
+  atomicWriteText(
+    path.join(customPrompts, 'HEAD_CORE.md'),
+    '# HEAD 운영 원칙\n\n- Run worker: node --no-warnings "{{HERDR_CORTEX_ROOT}}/scripts/cortex-worker.mjs"\n- Unquoted: {{HERDR_CORTEX_ROOT}}/scripts/cortex-status.mjs\n',
+  );
+  atomicWriteText(
+    path.join(customPrompts, 'skills', 'delegate', 'SKILL.md'),
+    '---\nname: delegate\ndescription: Delegate skill\n---\n\nInvoke `node --no-warnings "{{HERDR_CORTEX_ROOT}}/scripts/cortex-worker.mjs"`.\n',
+  );
+  atomicWriteText(
+    path.join(customPrompts, 'skills', 'delegate', 'steps', '01-check.md'),
+    'Step check: {{HERDR_CORTEX_ROOT}}/scripts/cortex-worker.mjs\n',
+  );
+  const untouchedAgentText = '# Agent Without Placeholder\r\nKeep literal $& $$ `$` and trailing spaces   \r\n';
+  fs.writeFileSync(path.join(customPrompts, 'agents', 'plain.md'), untouchedAgentText, 'utf8');
+
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  try {
+    assert.equal(CORTEX_ROOT_PLACEHOLDER, '{{HERDR_CORTEX_ROOT}}');
+    assert.equal(expandCortexRootPlaceholder(untouchedAgentText, spacedRepo), untouchedAgentText);
+    assert.equal(
+      expandCortexRootPlaceholder('cmd "{{HERDR_CORTEX_ROOT}}/x" {{HERDR_CORTEX_ROOT}}', spacedRepo),
+      `cmd "${expectedRoot}/x" ${expectedRoot}`,
+    );
+
+    // 1. cortex_prompt tool content expands {{HERDR_CORTEX_ROOT}} and leaves non-placeholder assets untouched
+    const registry = createToolRegistry(store, { repoRoot: spacedRepo, promptsDir: customPrompts });
+    const skillRes = await registry.callTool('cortex_prompt', { kind: 'skill', name: 'delegate' });
+    assert.equal(skillRes.isError, false);
+    assert.equal(skillRes.data.content.includes('{{HERDR_CORTEX_ROOT}}'), false);
+    assert.ok(skillRes.data.content.includes(`"${expectedRoot}/scripts/cortex-worker.mjs"`));
+
+    const stepRes = await registry.callTool('cortex_prompt', { kind: 'skill', name: 'delegate/steps/01-check' });
+    assert.equal(stepRes.isError, false);
+    assert.equal(stepRes.data.content, `Step check: ${expectedRoot}/scripts/cortex-worker.mjs\n`);
+
+    const coreRes = await registry.callTool('cortex_prompt', { kind: 'core', name: 'HEAD_CORE' });
+    assert.equal(coreRes.isError, false);
+    assert.ok(coreRes.data.content.includes(`"${expectedRoot}/scripts/cortex-worker.mjs"`));
+    assert.ok(coreRes.data.content.includes(`Unquoted: ${expectedRoot}/scripts/cortex-status.mjs`));
+
+    const plainRes = await registry.callTool('cortex_prompt', { kind: 'agent', name: 'plain' });
+    assert.equal(plainRes.isError, false);
+    assert.equal(plainRes.data.content, untouchedAgentText);
+
+    // 2. Claude `core` & `all` and Antigravity `HEAD_CORE` expand {{HERDR_CORTEX_ROOT}}, and resume/fork marker still skips duplicates
+    const claudeCore = handleClaudeSessionStart(
+      { session_id: 's-ph-1', source: 'startup', cwd: env.projectDir },
+      { part: 'core', globalDir: env.globalDir, repoRoot: spacedRepo, promptsDir: customPrompts },
+    ).hookSpecificOutput.additionalContext;
+    assert.match(claudeCore, /^# HEAD 운영 원칙/);
+    assert.equal(claudeCore.includes('{{HERDR_CORTEX_ROOT}}'), false);
+    assert.ok(claudeCore.includes(`"${expectedRoot}/scripts/cortex-worker.mjs"`));
+    assert.ok(claudeCore.includes(`Unquoted: ${expectedRoot}/scripts/cortex-status.mjs`));
+
+    const phTranscript = path.join(env.root, 'ph-resume.jsonl');
+    writeJsonl(phTranscript, [
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_additional_context',
+          hookEvent: 'SessionStart',
+          content: claudeCore,
+        },
+      },
+    ]);
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 's-ph-1', source: 'resume', transcript_path: phTranscript, cwd: env.projectDir },
+        { part: 'core', globalDir: env.globalDir, repoRoot: spacedRepo, promptsDir: customPrompts },
+      ),
+      {},
+      'resume skips duplicate HEAD_CORE after placeholder expansion',
+    );
+
+    const agyPh = handleAntigravitySessionStart(
+      { conversationId: 'agy-ph-1', rootConversationId: 'agy-ph-1', cwd: env.projectDir },
+      { globalDir: env.globalDir, repoRoot: spacedRepo, promptsDir: customPrompts },
+    );
+    const agyHeadStep = agyPh.injectSteps[0].systemMessage.systemMessage;
+    assert.equal(agyHeadStep, claudeCore);
+  } finally {
+    store.close();
     env.cleanup();
   }
 });
