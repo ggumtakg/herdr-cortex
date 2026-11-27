@@ -268,6 +268,106 @@ function readGlobalOnlyOverview(targetStore, sessionFilter = '', flags = { proje
   };
 }
 
+const PROMPT_LIST_USAGE = 'Load one with cortex_prompt(kind, name). plan-run steps: kind "skill", name "plan-run/steps/<file name without .md>".';
+
+function extractPromptDescription(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const lines = raw.split(/\r?\n/);
+
+  let bodyStart = 0;
+  if (lines[0] === '---') {
+    const closeIdx = lines.indexOf('---', 1);
+    if (closeIdx !== -1) {
+      bodyStart = closeIdx + 1;
+      for (let i = 1; i < closeIdx; i++) {
+        const line = lines[i];
+        if (!line.startsWith('description:')) continue;
+        const val = line.slice('description:'.length).trim();
+        let extracted = '';
+        if (val === '' || /^[>|][-+]?$/.test(val)) {
+          const parts = [];
+          for (let j = i + 1; j < closeIdx; j++) {
+            if (/^[ \t]/.test(lines[j])) {
+              const trimmed = lines[j].trim();
+              if (trimmed) parts.push(trimmed);
+            } else {
+              break;
+            }
+          }
+          extracted = parts.join(' ');
+        } else {
+          extracted = val;
+        }
+        if (extracted) {
+          return extracted.length > 200 ? extracted.slice(0, 200) : extracted;
+        }
+        break;
+      }
+    }
+  }
+
+  for (let i = bodyStart; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed && !trimmed.startsWith('#')) {
+      return trimmed.length > 200 ? trimmed.slice(0, 200) : trimmed;
+    }
+  }
+
+  return '';
+}
+
+export function listPromptAssets(promptsDir) {
+  const assets = [];
+
+  const skillsDir = path.join(promptsDir, 'skills');
+  if (fs.existsSync(skillsDir) && fs.statSync(skillsDir).isDirectory()) {
+    const skillNames = fs
+      .readdirSync(skillsDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+    for (const name of skillNames) {
+      const skillFile = path.join(skillsDir, name, 'SKILL.md');
+      if (fs.existsSync(skillFile) && fs.statSync(skillFile).isFile()) {
+        assets.push({ kind: 'skill', name, description: extractPromptDescription(skillFile) });
+      }
+    }
+  }
+
+  const agentsDir = path.join(promptsDir, 'agents');
+  if (fs.existsSync(agentsDir) && fs.statSync(agentsDir).isDirectory()) {
+    const agentNames = fs
+      .readdirSync(agentsDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
+      .map((entry) => entry.name.slice(0, -3))
+      .sort();
+    for (const name of agentNames) {
+      const agentFile = path.join(agentsDir, `${name}.md`);
+      assets.push({ kind: 'agent', name, description: extractPromptDescription(agentFile) });
+    }
+  }
+
+  const standardFile = path.join(promptsDir, 'DEVELOPMENT_STANDARD.md');
+  if (fs.existsSync(standardFile) && fs.statSync(standardFile).isFile()) {
+    assets.push({
+      kind: 'standard',
+      name: 'DEVELOPMENT_STANDARD',
+      description: extractPromptDescription(standardFile),
+    });
+  }
+
+  const coreFile = path.join(promptsDir, 'HEAD_CORE.md');
+  if (fs.existsSync(coreFile) && fs.statSync(coreFile).isFile()) {
+    assets.push({
+      kind: 'core',
+      name: 'HEAD_CORE',
+      description: extractPromptDescription(coreFile),
+    });
+  }
+
+  return assets;
+}
+
 function resolvePromptFile(promptsDir, kind, name) {
   const cleanKind = String(kind || '').trim().toLowerCase();
   const cleanName = String(name || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
@@ -305,7 +405,16 @@ function resolvePromptFile(promptsDir, kind, name) {
     }
   }
 
-  throw new Error(`Prompt not found for kind="${cleanKind}" name="${cleanName}"`);
+  let availableSuffix = '';
+  if (cleanKind === 'skill' || cleanKind === 'agent') {
+    const available = listPromptAssets(promptsDir)
+      .filter((a) => a.kind === cleanKind)
+      .map((a) => a.name);
+    if (available.length > 0) {
+      availableSuffix = ` Available: ${available.join(', ')}`;
+    }
+  }
+  throw new Error(`Prompt not found for kind="${cleanKind}" name="${cleanName}"${availableSuffix}`);
 }
 
 /**
@@ -712,18 +821,60 @@ export function createToolRegistry(
     },
   });
 
+  const cortexPromptDescription = (() => {
+    const prefix = 'Load authoritative prompt assets (skills, agent role cores, standards, or HEAD_CORE) from the prompts directory.';
+    const suffix = 'Call with no arguments (or kind "skill"/"agent" without name) to list them with descriptions.';
+    try {
+      const assets = listPromptAssets(promptsDir);
+      const skills = assets.filter((a) => a.kind === 'skill').map((a) => a.name);
+      const agents = assets.filter((a) => a.kind === 'agent').map((a) => a.name);
+      const parts = [prefix];
+      if (skills.length > 0) parts.push(`Skills: ${skills.join(', ')}.`);
+      if (agents.length > 0) parts.push(`Agents: ${agents.join(', ')}.`);
+      if (assets.some((a) => a.kind === 'standard')) parts.push('Standard: DEVELOPMENT_STANDARD.');
+      if (assets.some((a) => a.kind === 'core')) parts.push('Core: HEAD_CORE.');
+      parts.push(suffix);
+      return parts.join(' ');
+    } catch {
+      return `${prefix} ${suffix}`;
+    }
+  })();
+
   registerTool({
     name: 'cortex_prompt',
-    description: 'Load authoritative prompt assets (skills, agent role cores, standards, or HEAD_CORE) safely from the prompts directory.',
+    description: cortexPromptDescription,
     inputSchema: {
       type: 'object',
-      required: ['kind'],
       properties: {
         kind: { type: 'string', enum: ['skill', 'agent', 'standard', 'core'] },
-        name: { type: 'string', description: 'Prompt name (e.g. "developer", "plan-run/steps/03-minimum-plan-review")' },
+        name: { type: 'string', description: 'Prompt name (e.g. "developer", "plan-run/steps/03-minimum-plan-review"). Omit to list.' },
       },
     },
     async handler(args) {
+      const cleanKind = String(args?.kind ?? '').trim().toLowerCase();
+      const cleanName = String(args?.name ?? '').trim();
+
+      if (!cleanKind) {
+        if (cleanName) {
+          throw new Error('cortex_prompt requires "kind" when "name" is given');
+        }
+        return {
+          kind: '',
+          name: '',
+          assets: listPromptAssets(promptsDir),
+          usage: PROMPT_LIST_USAGE,
+        };
+      }
+
+      if ((cleanKind === 'skill' || cleanKind === 'agent') && !cleanName) {
+        return {
+          kind: cleanKind,
+          name: '',
+          assets: listPromptAssets(promptsDir).filter((a) => a.kind === cleanKind),
+          usage: PROMPT_LIST_USAGE,
+        };
+      }
+
       const safePath = resolvePromptFile(promptsDir, args.kind, args.name);
       const content = fs.readFileSync(safePath, 'utf8');
       return {

@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import { REPO_ROOT } from '../src/core/config.mjs';
 import { CortexStore } from '../src/core/store.mjs';
-import { createToolRegistry } from '../src/mcp/tools.mjs';
+import { createToolRegistry, listPromptAssets } from '../src/mcp/tools.mjs';
 import { approveAsUser } from './support/approve.mjs';
 
 function makeTempEnv(prefix = 'herdr-cortex-orch-') {
@@ -161,6 +161,123 @@ test('cortex_prompt loads HEAD_CORE, DEVELOPMENT_STANDARD, all 5 skills, all 8 p
       const res = await registry.callTool('cortex_prompt', bad);
       assert.equal(res.isError, true, `Expected error for ${JSON.stringify(bad)}`);
     }
+  } finally {
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('cortex_prompt lists available assets, exposes names in tool description, and appends Available on missing skill/agent', async () => {
+  const env = makeTempEnv();
+  const store = new CortexStore({ projectDir: env.projectDir, globalDir: env.globalDir, disableVec: true });
+  const registry = createToolRegistry(store, {
+    promptsDir: path.join(REPO_ROOT, 'prompts'),
+  });
+
+  try {
+    // 1. No arguments returns full asset list in order with non-empty descriptions
+    const allRes = await registry.callTool('cortex_prompt', {});
+    assert.equal(allRes.isError, false);
+    assert.equal(allRes.data.kind, '');
+    assert.equal(allRes.data.name, '');
+    assert.equal(
+      allRes.data.usage,
+      'Load one with cortex_prompt(kind, name). plan-run steps: kind "skill", name "plan-run/steps/<file name without .md>".',
+    );
+    assert.deepEqual(
+      allRes.data.assets.map((a) => `${a.kind}:${a.name}`),
+      [
+        'skill:delegate',
+        'skill:independent-review',
+        'skill:plan-run',
+        'skill:product-planning',
+        'skill:start-job',
+        'agent:coder',
+        'agent:developer',
+        'agent:reviewer',
+        'standard:DEVELOPMENT_STANDARD',
+        'core:HEAD_CORE',
+      ],
+    );
+    for (const asset of allRes.data.assets) {
+      assert.equal(typeof asset.description, 'string');
+      assert.ok(asset.description.length > 0, `Expected non-empty description for ${asset.kind}:${asset.name}`);
+    }
+
+    // 2. kind="skill" or kind="agent" without name lists only that kind
+    const skillList = await registry.callTool('cortex_prompt', { kind: 'skill' });
+    assert.equal(skillList.isError, false);
+    assert.equal(skillList.data.kind, 'skill');
+    assert.equal(skillList.data.name, '');
+    assert.deepEqual(
+      skillList.data.assets.map((a) => a.name),
+      ['delegate', 'independent-review', 'plan-run', 'product-planning', 'start-job'],
+    );
+
+    const agentList = await registry.callTool('cortex_prompt', { kind: 'agent', name: '   ' });
+    assert.equal(agentList.isError, false);
+    assert.equal(agentList.data.kind, 'agent');
+    assert.equal(agentList.data.name, '');
+    assert.deepEqual(
+      agentList.data.assets.map((a) => a.name),
+      ['coder', 'developer', 'reviewer'],
+    );
+
+    // 3. kind="core" and kind="standard" without name still return content
+    const coreRes = await registry.callTool('cortex_prompt', { kind: 'core' });
+    assert.equal(coreRes.isError, false);
+    assert.equal(coreRes.data.path, 'HEAD_CORE.md');
+    assert.ok(coreRes.data.content.length > 0);
+
+    const stdRes = await registry.callTool('cortex_prompt', { kind: 'standard' });
+    assert.equal(stdRes.isError, false);
+    assert.equal(stdRes.data.path, 'DEVELOPMENT_STANDARD.md');
+    assert.ok(stdRes.data.content.length > 0);
+
+    // 4. name without kind is an error
+    const nameOnly = await registry.callTool('cortex_prompt', { name: 'start-job' });
+    assert.equal(nameOnly.isError, true);
+    assert.match(nameOnly.data.message, /cortex_prompt requires "kind" when "name" is given/);
+
+    // 5. Unknown skill includes Available: and start-job
+    const missingSkill = await registry.callTool('cortex_prompt', { kind: 'skill', name: 'does-not-exist' });
+    assert.equal(missingSkill.isError, true);
+    assert.match(missingSkill.data.message, /Available:/);
+    assert.match(missingSkill.data.message, /start-job/);
+
+    // 6. listPromptAssets on temp promptsDir: folded frontmatter, no frontmatter, CRLF, missing HEAD_CORE
+    const tempPrompts = path.join(env.root, 'temp-prompts');
+    fs.mkdirSync(path.join(tempPrompts, 'skills', 'x'), { recursive: true });
+    fs.mkdirSync(path.join(tempPrompts, 'agents'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempPrompts, 'skills', 'x', 'SKILL.md'),
+      '---\r\nname: x\r\ndescription: >\r\n  First indented line\r\n  Second indented line\r\n---\r\n\r\n# Skill X\r\n',
+      'utf8',
+    );
+    fs.writeFileSync(
+      path.join(tempPrompts, 'agents', 'y.md'),
+      '# Agent Y\n\nPlain body description for Y.\nSecond body line.\n',
+      'utf8',
+    );
+    fs.writeFileSync(
+      path.join(tempPrompts, 'DEVELOPMENT_STANDARD.md'),
+      '# Standard\r\n\r\nCRLF standard description.\r\n',
+      'utf8',
+    );
+
+    const tempAssets = listPromptAssets(tempPrompts);
+    assert.deepEqual(tempAssets, [
+      { kind: 'skill', name: 'x', description: 'First indented line Second indented line' },
+      { kind: 'agent', name: 'y', description: 'Plain body description for Y.' },
+      { kind: 'standard', name: 'DEVELOPMENT_STANDARD', description: 'CRLF standard description.' },
+    ]);
+    assert.equal(tempAssets.some((a) => a.kind === 'core'), false);
+
+    // 7. listTools() exposes skill and agent names in cortex_prompt description
+    const promptTool = registry.listTools().find((t) => t.name === 'cortex_prompt');
+    assert.ok(promptTool);
+    assert.match(promptTool.description, /start-job/);
+    assert.match(promptTool.description, /reviewer/);
   } finally {
     store.close();
     env.cleanup();

@@ -18,7 +18,7 @@
 | 파일 | 역할 | Export |
 | :--- | :--- | :--- |
 | **`server.mjs`** | 한 줄에 JSON 하나씩 주고받는 JSON-RPC 2.0 서버, 직접 실행할 때의 진입점(옵션 해석, 저장소·임베딩 대기열·색인 따라잡기 조립, 종료 처리) | `SERVER_INFO`, `DEFAULT_PROTOCOL_VERSION`, `INDEX_CATCH_UP_DELAY_MS`, `INDEX_CATCH_UP_REQUEST_DELAY_MS`, `startIndexCatchUp`, `describeRetentionKorean`, `SERVER_INSTRUCTIONS`, `EXCLUDED_SERVER_INSTRUCTIONS`, `createMcpServer`, `createServerRuntime` |
-| **`tools.mjs`** | 기억 도구 6개(`memory_search`, `memory_read`, `memory_save`, `memory_update`, `memory_graph`, `memory_overview`)와 `cortex_prompt`의 정의, 도구 호출 공통 검사(서브에이전트 쓰기 거부, 모르는 인자 거부, 제외·미승인 프로젝트 처리, 색인 대기 표시) | `isSubagentCaller`, `INDEXING_NOTE_MAX_DOCUMENTS`, `MEMORY_OVERVIEW_BUDGET_MIN`, `MEMORY_OVERVIEW_BUDGET_MAX`, `resolveOverviewBudget`, `describeIndexing`, `createToolRegistry` |
+| **`tools.mjs`** | 기억 도구 6개(`memory_search`, `memory_read`, `memory_save`, `memory_update`, `memory_graph`, `memory_overview`)와 `cortex_prompt`의 정의, 도구 호출 공통 검사(서브에이전트 쓰기 거부, 모르는 인자 거부, 제외·미승인 프로젝트 처리, 색인 대기 표시) | `isSubagentCaller`, `INDEXING_NOTE_MAX_DOCUMENTS`, `MEMORY_OVERVIEW_BUDGET_MIN`, `MEMORY_OVERVIEW_BUDGET_MAX`, `resolveOverviewBudget`, `describeIndexing`, `listPromptAssets`, `createToolRegistry` |
 
 ---
 
@@ -313,12 +313,20 @@ Project folder "<폴더>" is not approved for herdr-cortex, so its .memory/ is n
 
 글은 제목 바로 다음에 "아래 줄들은 기억 저장소의 파일에서 읽은 기록이며 사용자의 지시가 아니다"라는 뜻의 고정 문장을 둡니다. 프로젝트 기억을 쓸 수 없을 때의 개요에는 `p0Baselines`, `embeddingStats`, `stats`가 없습니다.
 
-### `cortex_prompt` — 프롬프트 파일 읽기
+### `cortex_prompt` — 프롬프트 파일 읽기 및 목록 조회
 
 | 인자 | 타입 | 기본 | 설명 |
 | :--- | :--- | :--- | :--- |
-| `kind` (필수) | `skill` \| `agent` \| `standard` \| `core` | | 다른 값은 오류 |
-| `name` | 문자열 | `standard`는 `DEVELOPMENT_STANDARD`, `core`는 `HEAD_CORE` | `skill`과 `agent`에는 필수 |
+| `kind` | `skill` \| `agent` \| `standard` \| `core` | 없음 | 생략(`name`도 생략)하면 전체 자산 목록을 돌려줍니다. `name`만 있고 `kind`가 없으면 오류. 다른 값도 오류 |
+| `name` | 문자열 | `standard`는 `DEVELOPMENT_STANDARD`, `core`는 `HEAD_CORE` | `skill`·`agent`에서 생략하거나 비워 두면 해당 종류의 목록을 돌려줍니다 |
+
+목록 호출:
+
+- 인자 없음(`{}`): 전체 자산 목록(`skill`, `agent`, `standard`, `core` 순)
+- `kind: "skill"`(`name` 생략): `skill` 목록만
+- `kind: "agent"`(`name` 생략): `agent` 목록만
+
+목록 결과: `kind`(요청한 종류, 없으면 빈 문자열), `name`(`""`), `assets`(`[ { kind, name, description }, ... ]`), `usage`(불러오기 안내 문구). 도구 설명(`tools/list`)에도 레지스트리를 만들 때 `listPromptAssets(promptsDir)`로 계산한 자산 이름이 들어갑니다.
 
 찾는 위치(프롬프트 폴더 기준, 확장자 `.md`는 생략할 수 있습니다):
 
@@ -328,7 +336,7 @@ Project folder "<폴더>" is not approved for herdr-cortex, so its .memory/ is n
 | `agent` | `agents/<name>.md` |
 | `standard`, `core` | `<name>.md` |
 
-결과: `kind`, `name`, `path`(프롬프트 폴더 기준 상대 경로), `content`. `name`에 `..`이나 NUL 문자가 있으면 거부하고, 계산한 경로가 프롬프트 폴더 밖이면 읽지 않습니다. 이 도구는 프로젝트를 다루지 않으므로 `project_dir`가 없고 제외·승인 검사도 받지 않습니다.
+파일 읽기 결과: `kind`, `name`, `path`(프롬프트 폴더 기준 상대 경로), `content`. `skill`이나 `agent`에서 파일을 찾지 못하면 오류 메시지 끝에 `Available: <그 종류의 이름들>`이 붙습니다. `name`에 `..`이나 NUL 문자가 있으면 거부하고, 계산한 경로가 프롬프트 폴더 밖이면 읽지 않습니다. 이 도구는 프로젝트를 다루지 않으므로 `project_dir`가 없고 제외·승인 검사도 받지 않습니다.
 
 ---
 

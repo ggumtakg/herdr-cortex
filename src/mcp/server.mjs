@@ -223,7 +223,7 @@ export const SERVER_INSTRUCTIONS = `herdr-cortex MCP 도구 안내 (서버 이�
 - 멀티 워크스페이스: 필요 시 memory_* 도구에 project_dir 지정 가능.
 - 색인 대기: memory_* 결과에 indexing { pending, documents }가 있으면 그 문서들은 아직 색인 중이라(백그라운드에서 처리) 결과에 빠져 있을 수 있음.
 - Herdr 탭 협업: relay_tabs(탭 조회), relay_send(context_docs 첨부, HEAD 전용), relay_inbox(action: peek|ack; 훅이 이미 주입한 메시지는 ${describeRetentionKorean()} 보관되며 include_delivered: true로 다시 조회).
-- 프롬프트 로드: cortex_prompt로 start-job, product-planning, delegate, independent-review, plan-run(kind: "skill"), DEVELOPMENT_STANDARD(kind: "standard"), coder/developer/reviewer(kind: "agent") 로드.`;
+- 프롬프트 로드: cortex_prompt로 start-job, product-planning, delegate, independent-review, plan-run(kind: "skill"), DEVELOPMENT_STANDARD(kind: "standard"), coder/developer/reviewer(kind: "agent") 로드. 인자 없이 호출하면 전체 목록.`;
 
 /**
  * The instructions of a server whose project is excluded. Every statement follows the tool handlers
