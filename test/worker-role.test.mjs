@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 
 import { REPO_ROOT, atomicWriteJson, atomicWriteText } from '../src/core/config.mjs';
 import { ROLE_ENV_VAR, WORKER_ROLE, isWorkerSession } from '../src/core/role.mjs';
+import { formatUnapprovedFolderNotice, hasUnapprovedFolderNoticeRecord } from '../src/core/trust.mjs';
 import { serializeMarkdownDoc } from '../src/core/frontmatter.mjs';
 import { CortexStore } from '../src/core/store.mjs';
 import { readSavedSession, recordSession } from '../src/revive/tracker.mjs';
@@ -187,13 +188,39 @@ test('hooks/claude: worker session preserves tab session/inbox/clear-records and
       {},
     );
 
-    // Unapproved folder notice is still injected in worker session
+    // Unapproved folder WITH .memory/ notice is still injected in worker session
     const unapprovedOut = handleClaudeSessionStart(
       { session_id: 'worker-sess-unapproved', source: 'startup', cwd: env.unapprovedDir },
       { ...baseOpts, env: workerEnv },
     );
     assert.match(unapprovedOut.hookSpecificOutput?.additionalContext || '', /Project memory was not loaded/);
     assert.match(unapprovedOut.systemMessage || '', /Project memory was not loaded/);
+
+    // Unapproved folder WITHOUT .memory/: worker neither emits nor consumes the one-time notice, so HEAD gets it
+    const bareUnapproved = path.join(env.root, 'bare-unapproved-claude');
+    fs.mkdirSync(bareUnapproved, { recursive: true });
+    const bareWorkerOut = handleClaudeSessionStart(
+      { session_id: 'worker-sess-bare', source: 'startup', cwd: bareUnapproved },
+      { ...baseOpts, env: workerEnv },
+    );
+    assert.doesNotMatch(bareWorkerOut.hookSpecificOutput?.additionalContext || '', /Project memory is off|not approved/);
+    assert.equal(bareWorkerOut.systemMessage, undefined);
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapproved, { globalDir: env.globalDir }), false);
+
+    const bareHeadOut1 = handleClaudeSessionStart(
+      { session_id: 'head-sess-bare-1', source: 'startup', cwd: bareUnapproved },
+      { ...baseOpts, env: { HC_TERMINAL_ID: 'tab-bare' } },
+    );
+    assert.ok((bareHeadOut1.hookSpecificOutput?.additionalContext || '').includes(formatUnapprovedFolderNotice(bareUnapproved)));
+    assert.match(bareHeadOut1.systemMessage || '', /Project memory is off/);
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapproved, { globalDir: env.globalDir }), true);
+
+    const bareHeadOut2 = handleClaudeSessionStart(
+      { session_id: 'head-sess-bare-2', source: 'startup', cwd: bareUnapproved },
+      { ...baseOpts, env: { HC_TERMINAL_ID: 'tab-bare' } },
+    );
+    assert.doesNotMatch(bareHeadOut2.hookSpecificOutput?.additionalContext || '', /Project memory is off|not approved/);
+    assert.equal(bareHeadOut2.systemMessage, undefined);
 
     // SessionEnd(clear) and SessionStart(clear) in worker session touch neither cleared-sessions nor turns note
     handleClaudeSessionEnd(
@@ -322,6 +349,42 @@ test('hooks/antigravity: worker session preserves tab session/inbox and omits HE
       ),
     );
     assert.match(preUnapproved, /Project memory was not loaded/);
+
+    // Unapproved folder WITHOUT .memory/ in Antigravity: worker neither emits nor consumes the one-time notice
+    const bareUnapprovedAgy = path.join(env.root, 'bare-unapproved-agy');
+    fs.mkdirSync(bareUnapprovedAgy, { recursive: true });
+    const startBareWorker = agyText(
+      handleAntigravitySessionStart(
+        { conversationId: 'worker-conv-bare-1', rootConversationId: 'worker-conv-bare-1', cwd: bareUnapprovedAgy },
+        { ...baseOpts, env: workerEnv },
+      ),
+    );
+    assert.doesNotMatch(startBareWorker, /Project memory is off|not approved/);
+    const preBareWorker = agyText(
+      handleAntigravityPreInvocation(
+        { conversationId: 'worker-conv-bare-2', lastUserInput: 'Check', cwd: bareUnapprovedAgy },
+        { ...baseOpts, env: workerEnv },
+      ),
+    );
+    assert.doesNotMatch(preBareWorker, /Project memory is off|not approved/);
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapprovedAgy, { globalDir: env.globalDir }), false);
+
+    const startBareHead1 = agyText(
+      handleAntigravitySessionStart(
+        { conversationId: 'head-conv-bare-1', rootConversationId: 'head-conv-bare-1', cwd: bareUnapprovedAgy },
+        { ...baseOpts, env: {} },
+      ),
+    );
+    assert.ok(startBareHead1.includes(formatUnapprovedFolderNotice(bareUnapprovedAgy)));
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapprovedAgy, { globalDir: env.globalDir }), true);
+
+    const startBareHead2 = agyText(
+      handleAntigravitySessionStart(
+        { conversationId: 'head-conv-bare-2', rootConversationId: 'head-conv-bare-2', cwd: bareUnapprovedAgy },
+        { ...baseOpts, env: {} },
+      ),
+    );
+    assert.doesNotMatch(startBareHead2, /Project memory is off|not approved/);
 
     // Parent session and inbox untouched
     assert.equal(readSavedSession('tab-agy', { globalDir: env.globalDir }).sessionId, 'head-conv-1');

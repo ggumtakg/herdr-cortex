@@ -12,8 +12,12 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   DEFAULT_CONFIG,
   LEGACY_EMBEDDING_KEYS,
+  LEGACY_EMBEDDING_KEY_TARGETS,
   REPO_ROOT,
   atomicWriteJson,
+  atomicWriteText,
+  formatLegacyEmbeddingContextNotice,
+  formatLegacyEmbeddingUserNotices,
   getConfigProblems,
   loadConfig,
   projectPathKey,
@@ -40,6 +44,8 @@ import { createOpenAIProvider } from '../src/embeddings/openai.mjs';
 import { createOllamaProvider } from '../src/embeddings/ollama.mjs';
 import { EMBED_CLI_SCOPES, runEmbedCli } from '../src/embeddings/cli.mjs';
 import { installCortex } from '../src/hooks/installer.mjs';
+import { handleClaudeSessionStart } from '../src/hooks/claude.mjs';
+import { handleAntigravityPreInvocation, handleAntigravitySessionStart } from '../src/hooks/antigravity.mjs';
 import { SERVER_INSTRUCTIONS, createMcpServer, createServerRuntime } from '../src/mcp/server.mjs';
 import { createToolRegistry } from '../src/mcp/tools.mjs';
 import { approveAsUser } from './support/approve.mjs';
@@ -539,6 +545,144 @@ test('embedding config: old flat keys are ignored, warned about once, and listed
     assert.deepEqual(handBuilt.problems.map((p) => [p.code, p.keys]), [['legacy_embedding_keys', ['model']]]);
 
     assert.deepEqual(blockedFetches, []);
+  } finally {
+    warnings.restore();
+    env.cleanup();
+  }
+});
+
+test('SessionStart hooks: legacy_embedding_keys problems notify the user in Claude (systemMessage) and Antigravity (injectSteps) with global vs per-project guidance', () => {
+  const env = makeTempEnv('cortex-emb-hook-legacy-');
+  const warnings = captureWarnings();
+  try {
+    assert.deepEqual(Object.keys(LEGACY_EMBEDDING_KEY_TARGETS).sort(), ['gemini', 'ollama', 'onnx', 'openai']);
+
+    const promptsDir = path.join(env.root, 'prompts');
+    fs.mkdirSync(promptsDir, { recursive: true });
+    atomicWriteText(path.join(promptsDir, 'HEAD_CORE.md'), '# HEAD_CORE\n\n- Keep canon clean.\n');
+
+    const claudeOpts = { globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir };
+    const agyOpts = { globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir };
+    const agyText = (res) => (res.injectSteps || []).map((s) => s.systemMessage.systemMessage).join('\n\n');
+
+    // 1. Clean config: no legacy embedding notice
+    writeGlobalConfig(env, { embedding: { provider: 'ollama', ollama: { model: 'bge-m3' } } });
+    const cleanClaude = handleClaudeSessionStart({ session_id: 's-clean', source: 'startup', cwd: env.projectDir }, claudeOpts);
+    assert.equal(cleanClaude.systemMessage, undefined);
+    const cleanAgy = agyText(handleAntigravitySessionStart(
+      { conversationId: 'c-clean', rootConversationId: 'c-clean', cwd: env.projectDir },
+      agyOpts,
+    ));
+    assert.doesNotMatch(cleanAgy, /Ignored old-format/);
+
+    // 2. Global top-level legacy keys with a specific valid provider: tells user to re-run install.ps1; never prints secret value
+    const secret = 'sk-never-show-this-in-hook-notice';
+    writeGlobalConfig(env, {
+      embedding: { provider: 'openai', model: 'text-embedding-3-small', apiKey: secret, onnxEnabled: false },
+    });
+    const globalCfg = loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir });
+    const globalNotices = formatLegacyEmbeddingUserNotices(globalCfg);
+    assert.equal(globalNotices.length, 1);
+    assert.match(globalNotices[0], /Ignored old-format setting\(s\) in ".*config\.json": embedding\.model, embedding\.apiKey, embedding\.onnxEnabled\./);
+    assert.match(globalNotices[0], /Re-run install\.ps1 to migrate supported settings into embedding\.openai and remove unused ones/);
+    assert.equal(globalNotices[0].includes(secret), false);
+    assert.match(formatLegacyEmbeddingContextNotice(globalCfg), /Tell the user about this notice\.$/);
+
+    const globalClaude = handleClaudeSessionStart({ session_id: 's-glob', source: 'startup', cwd: env.projectDir }, claudeOpts);
+    assert.equal(globalClaude.systemMessage, globalNotices[0]);
+    assert.equal(globalClaude.systemMessage.includes(secret), false);
+    // part="core" never emits systemMessage
+    const coreClaude = handleClaudeSessionStart(
+      { session_id: 's-glob', source: 'startup', cwd: env.projectDir },
+      { ...claudeOpts, part: 'core' },
+    );
+    assert.equal(coreClaude.systemMessage, undefined);
+
+    const globalAgyStart = agyText(handleAntigravitySessionStart(
+      { conversationId: 'c-glob-1', rootConversationId: 'c-glob-1', cwd: env.projectDir },
+      agyOpts,
+    ));
+    assert.match(globalAgyStart, /Ignored old-format setting\(s\) in ".*config\.json": embedding\.model, embedding\.apiKey, embedding\.onnxEnabled\..*Tell the user about this notice\./);
+    assert.equal(globalAgyStart.includes(secret), false);
+
+    const globalAgyPre = agyText(handleAntigravityPreInvocation(
+      { conversationId: 'c-glob-2', cwd: env.projectDir, lastUserInput: 'hello' },
+      agyOpts,
+    ));
+    assert.match(globalAgyPre, /Ignored old-format setting\(s\) in ".*config\.json": embedding\.model, embedding\.apiKey, embedding\.onnxEnabled\./);
+
+    // 2b. Global top-level legacy keys when provider is NOT specific (auto, none, missing, typo), even if project overrides provider:
+    //     does NOT promise install.ps1 alone migrates them; explains why and tells user to set provider or delete unused keys
+    for (const [rawProv, expectedLabel] of [
+      ['auto', '"auto"'],
+      ['none', '"none"'],
+      [undefined, 'not set'],
+      ['gemni', '"gemni"'],
+    ]) {
+      writeGlobalConfig(env, {
+        embedding: {
+          ...(rawProv !== undefined ? { provider: rawProv } : {}),
+          model: 'legacy-m',
+          onnxEnabled: false,
+        },
+        projects: {
+          [env.projectDir]: { embedding: { provider: 'ollama', ollama: { model: 'bge-m3' } } },
+        },
+      });
+      const unsetCfg = loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir });
+      assert.equal(unsetCfg.embedding.provider, 'ollama', 'project override applies to merged config');
+      const unsetNotices = formatLegacyEmbeddingUserNotices(unsetCfg);
+      assert.equal(unsetNotices.length, 1);
+      assert.ok(unsetNotices[0].includes(`install.ps1 cannot migrate them automatically because embedding.provider is ${expectedLabel}`), unsetNotices[0]);
+      assert.match(unsetNotices[0], /set embedding\.provider to a specific provider and re-run install\.ps1/);
+      assert.match(unsetNotices[0], /delete unused flat keys/);
+    }
+
+    // 2c. Global top-level with invalid provider block (non-object)
+    writeGlobalConfig(env, {
+      embedding: { provider: 'gemini', model: 'legacy-m', gemini: 'bad-block' },
+    });
+    const badBlockNotices = formatLegacyEmbeddingUserNotices(loadConfig({ globalDir: env.globalDir }));
+    assert.equal(badBlockNotices.length, 1);
+    assert.match(badBlockNotices[0], /install\.ps1 cannot migrate them automatically because embedding\.gemini is not a JSON object/);
+
+    // 3. Per-project settings in global config.json (projects["..."].embedding) AND in <project>/.memory/config.json:
+    //    tells user to move supported settings and delete unused keys manually
+    writeGlobalConfig(env, {
+      embedding: { provider: 'none' },
+      projects: {
+        [env.projectDir]: { embedding: { provider: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: 'bge-m3', onnxEnabled: false } },
+      },
+    });
+    writeProjectConfig(env.projectDir, {
+      embedding: { provider: 'ollama', dimensions: 1024 },
+    });
+
+    const projClaude = handleClaudeSessionStart({ session_id: 's-proj', source: 'startup', cwd: env.projectDir }, claudeOpts);
+    const projLines = (projClaude.systemMessage || '').split('\n');
+    assert.equal(projLines.length, 2);
+    assert.match(projLines[0], /Ignored old-format per-project setting\(s\) in ".*config\.json": projects\[.*\].embedding\.baseUrl, projects\[.*\].embedding\.model, projects\[.*\].embedding\.onnxEnabled\./);
+    assert.match(projLines[0], /Move supported settings into projects\[.*\].embedding\.ollama and delete unused flat key\(s\) \(projects\[.*\].embedding\.onnxEnabled\) manually \(install\.ps1 does not edit per-project settings\)/);
+    assert.match(projLines[1], /Ignored old-format project setting\(s\) in ".*\.memory[\\/]config\.json": embedding\.dimensions\./);
+    assert.match(projLines[1], /move needed supported settings manually into global config\.json under projects\[.*\]\.embedding\.<provider> and remove "embedding" \(including unused keys\)/);
+
+    const projAgy = agyText(handleAntigravitySessionStart(
+      { conversationId: 'c-proj-1', rootConversationId: 'c-proj-1', cwd: env.projectDir },
+      agyOpts,
+    ));
+    assert.match(projAgy, /install\.ps1 does not edit per-project settings/);
+    assert.match(projAgy, /Project \.memory\/config\.json cannot set embedding/);
+
+    // 3b. Per-project settings where ALL legacy keys are unused for that provider (delete-only guidance)
+    fs.rmSync(path.join(env.projectDir, '.memory', 'config.json'));
+    writeGlobalConfig(env, {
+      projects: {
+        [env.projectDir]: { embedding: { provider: 'gemini', onnxEnabled: false } },
+      },
+    });
+    const unmappedProjNotices = formatLegacyEmbeddingUserNotices(loadConfig({ projectDir: env.projectDir, globalDir: env.globalDir }));
+    assert.equal(unmappedProjNotices.length, 1);
+    assert.match(unmappedProjNotices[0], /Delete it from projects\[.*\].embedding manually — not used by gemini/);
   } finally {
     warnings.restore();
     env.cleanup();

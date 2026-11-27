@@ -39,6 +39,7 @@ import {
   isLegacyReviveHook,
   isOwnHook,
   listBackups,
+  migrateGlobalEmbeddingConfig,
   quotePathForShells,
   readInstallRecord,
   removeBackups,
@@ -959,6 +960,306 @@ test('installer: a config.json that is still an older default is replaced (with 
     fs.rmSync(configPath);
     assert.equal(install().globalInit.configAction, 'created');
     assert.deepEqual(readJson(configPath).embedding.provider, 'none');
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('installer: legacy flat embedding keys in global config.json are migrated per provider (deleting unused ones), with backup, collision preservation, BOM/broken JSON handling, and idempotency', () => {
+  const env = makeTempEnv('herdr-cortex-installer-migrate-');
+  const configPath = path.join(env.globalDir, 'config.json');
+  const runInstall = (now) => installCortex({
+    repoRoot: REPO_ROOT,
+    homeDir: env.homeDir,
+    now,
+    antigravityPresent: false,
+  });
+
+  try {
+    // 1. Per-provider migration: gemini, openai, ollama, onnx (mapped keys moved, unmapped keys deleted)
+    const providerCases = [
+      {
+        provider: 'gemini',
+        input: {
+          provider: 'gemini',
+          baseUrl: 'https://gemini.proxy.example/v1beta',
+          model: 'gemini-embedding-001',
+          dimensions: 512,
+          apiKey: 'secret-gemini-key-do-not-print',
+          apiKeyEnv: 'MY_GEMINI_KEY',
+          onnxEnabled: true,
+          chunkMaxChars: 640,
+        },
+        expectedBlock: {
+          baseUrl: 'https://gemini.proxy.example/v1beta',
+          model: 'gemini-embedding-001',
+          dimensions: 512,
+          apiKey: 'secret-gemini-key-do-not-print',
+          apiKeyEnv: 'MY_GEMINI_KEY',
+        },
+        expectedRemovedUnused: ['embedding.onnxEnabled'],
+      },
+      {
+        provider: 'openai',
+        input: {
+          provider: 'openai',
+          baseUrl: 'https://openai.proxy.example/v1',
+          model: 'text-embedding-3-large',
+          dimensions: 1024,
+          apiKey: 'secret-openai-key-do-not-print',
+          apiKeyEnv: 'MY_OPENAI_KEY',
+          onnxEnabled: false,
+        },
+        expectedBlock: {
+          baseUrl: 'https://openai.proxy.example/v1',
+          model: 'text-embedding-3-large',
+          dimensions: 1024,
+          apiKey: 'secret-openai-key-do-not-print',
+          apiKeyEnv: 'MY_OPENAI_KEY',
+        },
+        expectedRemovedUnused: ['embedding.onnxEnabled'],
+      },
+      {
+        provider: 'ollama',
+        input: {
+          provider: 'ollama',
+          baseUrl: 'http://127.0.0.1:11434',
+          model: 'bge-m3',
+          dimensions: 1024,
+          apiKey: 'secret-unused-ollama-key',
+          apiKeyEnv: 'UNUSED_KEY_ENV',
+          onnxEnabled: false,
+        },
+        expectedBlock: {
+          baseUrl: 'http://127.0.0.1:11434',
+          model: 'bge-m3',
+          dimensions: 1024,
+        },
+        expectedRemovedUnused: ['embedding.apiKey', 'embedding.apiKeyEnv', 'embedding.onnxEnabled'],
+      },
+      {
+        provider: 'onnx',
+        input: {
+          provider: 'onnx',
+          model: 'Xenova/multilingual-e5-base',
+          dimensions: 768,
+          onnxEnabled: true,
+          baseUrl: 'http://unused:11434',
+          apiKey: 'secret-unused-onnx-key',
+          apiKeyEnv: 'UNUSED_ONNX_ENV',
+        },
+        expectedBlock: {
+          model: 'Xenova/multilingual-e5-base',
+          dimensions: 768,
+          enabled: true,
+        },
+        expectedRemovedUnused: ['embedding.baseUrl', 'embedding.apiKey', 'embedding.apiKeyEnv'],
+      },
+    ];
+
+    let minute = 1;
+    for (const tc of providerCases) {
+      const rawBefore = {
+        mode: 'opt-in',
+        enabledProjects: ['D:\\work\\alpha'],
+        customUserKey: { keep: [1, 2, 3] },
+        embedding: {
+          ...tc.input,
+          unknownSharedKey: 'keep-me',
+        },
+        projects: {
+          'D:\\work\\alpha': { embedding: { provider: 'ollama', model: 'stay-untouched' } },
+        },
+      };
+      const beforeText = `${JSON.stringify(rawBefore, null, 2)}\n`;
+      atomicWriteText(configPath, beforeText);
+
+      const first = runInstall(new Date(2026, 10, 27, 9, minute++, 0));
+      assert.equal(first.ok, true, tc.provider);
+      assert.equal(first.globalInit.configAction, 'migrated', tc.provider);
+      assert.ok(first.globalInit.backupPath, `${tc.provider} backup created`);
+      assert.equal(fs.readFileSync(first.globalInit.backupPath, 'utf8'), beforeText, `${tc.provider} backup matches original`);
+      assert.ok(first.backups.includes(first.globalInit.backupPath));
+      assert.deepEqual(
+        first.globalInit.migration.removedUnused.map((u) => u.from),
+        tc.expectedRemovedUnused,
+        `${tc.provider} removedUnused list`,
+      );
+
+      const after = readJson(configPath);
+      assert.equal(after.mode, 'opt-in');
+      assert.deepEqual(after.enabledProjects, ['D:\\work\\alpha']);
+      assert.deepEqual(after.customUserKey, { keep: [1, 2, 3] });
+      assert.equal(after.embedding.unknownSharedKey, 'keep-me');
+      assert.deepEqual(after.projects, rawBefore.projects, 'per-project settings in projects map are not rewritten');
+      assert.deepEqual(after.embedding[tc.provider], tc.expectedBlock, tc.provider);
+
+      for (const movedKey of Object.keys(tc.input)) {
+        if (movedKey === 'provider' || movedKey === 'chunkMaxChars') continue;
+        assert.equal(movedKey in after.embedding, false, `${tc.provider} deletes every legacy key (${movedKey})`);
+      }
+
+      // After migration, loadConfig reports ZERO legacy_embedding_keys problems on global config
+      assert.deepEqual(getConfigProblems(loadConfig({ globalDir: env.globalDir })), [], `${tc.provider} has empty configProblems`);
+
+      const summaryText = formatInstallSummary(first).join('\n');
+      assert.match(summaryText, /\[OK\] Migrated legacy embedding setting\(s\) in /);
+      assert.match(summaryText, /\[OK\] Removed unused legacy embedding key\(s\) in .* \(not used by embedding\./);
+      assert.ok(summaryText.includes(first.globalInit.backupPath));
+      assert.doesNotMatch(summaryText, /not moved/);
+      assert.doesNotMatch(summaryText, /old config format and ignored/);
+      assert.equal(summaryText.includes('secret-'), false, 'secret key values must never appear in summary output');
+
+      // Second run: nothing left to migrate -> file and backups untouched (idempotent)
+      const afterFirstText = fs.readFileSync(configPath, 'utf8');
+      const backupCountAfterFirst = findBackups(configPath).length;
+      const second = runInstall(new Date(2026, 10, 27, 9, minute++, 0));
+      assert.equal(second.ok, true);
+      assert.equal(second.globalInit.configAction, 'kept', `${tc.provider} second run is a no-op`);
+      assert.equal(second.globalInit.backupPath, '');
+      assert.equal(fs.readFileSync(configPath, 'utf8'), afterFirstText);
+      assert.equal(findBackups(configPath).length, backupCountAfterFirst);
+    }
+
+    // 2. Only unused legacy keys (nothing to move, e.g. provider: "gemini" with onnxEnabled: false):
+    //    backed up once, deleted on first run, problem list empty, second run is a no-op
+    const unusedOnlyRaw = {
+      embedding: {
+        provider: 'gemini',
+        onnxEnabled: false,
+        gemini: { apiKey: 'secret-keep-me', model: 'gemini-embedding-001' },
+      },
+    };
+    const unusedOnlyBefore = `${JSON.stringify(unusedOnlyRaw, null, 2)}\n`;
+    atomicWriteText(configPath, unusedOnlyBefore);
+    const backupsBeforeUnused = findBackups(configPath).length;
+    const unusedFirst = runInstall(new Date(2026, 10, 27, 9, 45, 0));
+    assert.equal(unusedFirst.ok, true);
+    assert.equal(unusedFirst.globalInit.configAction, 'migrated');
+    assert.ok(unusedFirst.globalInit.backupPath);
+    assert.equal(fs.readFileSync(unusedFirst.globalInit.backupPath, 'utf8'), unusedOnlyBefore);
+    assert.equal(findBackups(configPath).length, backupsBeforeUnused + 1);
+    const afterUnused = readJson(configPath);
+    assert.equal('onnxEnabled' in afterUnused.embedding, false);
+    assert.deepEqual(afterUnused.embedding.gemini, { apiKey: 'secret-keep-me', model: 'gemini-embedding-001' });
+    assert.deepEqual(unusedFirst.globalInit.configProblems, []);
+    assert.deepEqual(getConfigProblems(loadConfig({ globalDir: env.globalDir })), []);
+    const unusedSummary = formatInstallSummary(unusedFirst).join('\n');
+    assert.match(unusedSummary, /\[OK\] Removed unused legacy embedding key\(s\) in .* \(not used by embedding\.gemini\): embedding\.onnxEnabled \(backup: /);
+    assert.doesNotMatch(unusedSummary, /Migrated legacy embedding setting/);
+    assert.doesNotMatch(unusedSummary, /old config format/);
+    assert.equal(unusedSummary.includes('secret-keep-me'), false);
+
+    const afterUnusedText = fs.readFileSync(configPath, 'utf8');
+    const unusedSecond = runInstall(new Date(2026, 10, 27, 9, 46, 0));
+    assert.equal(unusedSecond.globalInit.configAction, 'kept');
+    assert.equal(unusedSecond.globalInit.backupPath, '');
+    assert.equal(findBackups(configPath).length, backupsBeforeUnused + 1);
+    assert.equal(fs.readFileSync(configPath, 'utf8'), afterUnusedText);
+
+    // 3. Direct unit check on migrateGlobalEmbeddingConfig with only unmapped keys
+    const unmappedOnly = migrateGlobalEmbeddingConfig({
+      embedding: { provider: 'ollama', onnxEnabled: true, apiKeyEnv: '' },
+    });
+    assert.equal(unmappedOnly.changed, true);
+    assert.deepEqual(unmappedOnly.moved, []);
+    assert.deepEqual(unmappedOnly.removedUnused.map((u) => u.from), ['embedding.apiKeyEnv', 'embedding.onnxEnabled']);
+    assert.deepEqual(unmappedOnly.next, { embedding: { provider: 'ollama' } });
+
+    // 4. Clean migration (all legacy keys valid for ollama): zero config problems afterward
+    atomicWriteJson(configPath, {
+      embedding: { provider: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: 'bge-m3', dimensions: 1024 },
+    });
+    const cleanMig = runInstall(new Date(2026, 10, 27, 10, 0, 0));
+    assert.equal(cleanMig.globalInit.configAction, 'migrated');
+    assert.deepEqual(cleanMig.globalInit.configProblems, []);
+    assert.deepEqual(getConfigProblems(loadConfig({ globalDir: env.globalDir })), []);
+    assert.match(
+      describeInstalledEmbedding({ homeDir: env.homeDir })[0],
+      /^embedding: ollama, model bge-m3; sends documents and search queries to 127\.0\.0\.1:11434/,
+    );
+
+    // 5. Existing target keys in provider block are NEVER overwritten (even when false or 0); legacy key is deleted
+    atomicWriteJson(configPath, {
+      embedding: {
+        provider: 'onnx',
+        model: 'old-flat-model',
+        dimensions: 384,
+        onnxEnabled: true,
+        onnx: { enabled: false, model: 'explicit-new-model', dtype: 'fp16' },
+      },
+    });
+    const collision = runInstall(new Date(2026, 10, 27, 10, 5, 0));
+    assert.equal(collision.globalInit.configAction, 'migrated');
+    const afterCollision = readJson(configPath);
+    assert.deepEqual(afterCollision.embedding.onnx, {
+      enabled: false,
+      model: 'explicit-new-model',
+      dtype: 'fp16',
+      dimensions: 384,
+    });
+    assert.equal('model' in afterCollision.embedding, false);
+    assert.equal('onnxEnabled' in afterCollision.embedding, false);
+    assert.equal('dimensions' in afterCollision.embedding, false);
+    const collisionSummary = formatInstallSummary(collision).join('\n');
+    assert.match(collisionSummary, /\[OK\] Migrated legacy embedding setting\(s\).*embedding\.dimensions -> embedding\.onnx\.dimensions/);
+    assert.match(collisionSummary, /\[OK\] Removed legacy embedding key\(s\).*existing values kept.*embedding\.model \(kept embedding\.onnx\.model\).*embedding\.onnxEnabled \(kept embedding\.onnx\.enabled\)/);
+
+    // 6. BOM-prefixed config.json with legacy keys: migrates cleanly, backup keeps exact BOM bytes, second run is no-op
+    const bomRaw = `\uFEFF${JSON.stringify({
+      embedding: { provider: 'gemini', model: 'bom-gemini-model', onnxEnabled: false, gemini: { apiKey: 'k' } },
+    })}\n`;
+    atomicWriteText(configPath, bomRaw);
+    const bomFirst = runInstall(new Date(2026, 10, 27, 10, 10, 0));
+    assert.equal(bomFirst.ok, true);
+    assert.equal(bomFirst.globalInit.configAction, 'migrated');
+    assert.equal(fs.readFileSync(bomFirst.globalInit.backupPath, 'utf8'), bomRaw, 'backup preserves original UTF-8 BOM');
+    assert.equal(fs.readFileSync(configPath, 'utf8').startsWith('\uFEFF'), false);
+    assert.deepEqual(readJson(configPath).embedding, {
+      provider: 'gemini',
+      gemini: { apiKey: 'k', model: 'bom-gemini-model' },
+    });
+    assert.deepEqual(getConfigProblems(loadConfig({ globalDir: env.globalDir })), []);
+    const bomSecond = runInstall(new Date(2026, 10, 27, 10, 11, 0));
+    assert.equal(bomSecond.globalInit.configAction, 'kept');
+    assert.equal(bomSecond.globalInit.backupPath, '');
+
+    // 7. Broken JSON containing legacy keys: untouched, no backup, reported clearly
+    const brokenRaw = '{"embedding": {"provider": "gemini", "model": "x", "onnxEnabled": false,}';
+    atomicWriteText(configPath, brokenRaw);
+    const backupsBeforeBroken = findBackups(configPath).length;
+    const brokenRes = runInstall(new Date(2026, 10, 27, 10, 12, 0));
+    assert.equal(brokenRes.ok, true);
+    assert.equal(brokenRes.globalInit.configAction, 'kept');
+    assert.equal(brokenRes.globalInit.backupPath, '');
+    assert.equal(findBackups(configPath).length, backupsBeforeBroken);
+    assert.equal(fs.readFileSync(configPath, 'utf8'), brokenRaw);
+    assert.match(brokenRes.globalInit.configProblems[0], /is not valid JSON/);
+    assert.match(formatInstallSummary(brokenRes).join('\n'), /\[WARN\].*config\.json: is not valid JSON/);
+
+    // 8. Non-specific provider (auto, none, missing, unknown): NOT migrated, NO backup, warned clearly
+    for (const nonSpecific of ['auto', 'none', '', undefined, 'unknown-prov']) {
+      const raw = {
+        hookBudget: 7000,
+        embedding: {
+          ...(nonSpecific !== undefined ? { provider: nonSpecific } : {}),
+          model: 'bge-m3',
+          baseUrl: 'http://127.0.0.1:11434',
+        },
+      };
+      const rawText = `${JSON.stringify(raw, null, 2)}\n`;
+      atomicWriteText(configPath, rawText);
+      const backupsBefore = findBackups(configPath).length;
+      const skipped = runInstall(new Date(2026, 10, 27, 10, 20 + minute++, 0));
+      assert.equal(skipped.globalInit.configAction, 'kept');
+      assert.equal(skipped.globalInit.backupPath, '');
+      assert.equal(findBackups(configPath).length, backupsBefore);
+      assert.equal(fs.readFileSync(configPath, 'utf8'), rawText);
+      const skippedLines = formatInstallSummary(skipped).join('\n');
+      assert.match(skippedLines, /were not migrated because embedding\.provider is /);
+      assert.match(skippedLines, /delete unused flat keys/);
+      assert.match(skippedLines, /Move provider settings into embedding\.<provider>/);
+    }
   } finally {
     env.cleanup();
   }

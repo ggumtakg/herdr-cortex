@@ -8,7 +8,9 @@ import {
   getTierPaths,
   getTrustedProjectsPath,
   isProjectTrusted,
+  projectPathKey,
   readTrustedProjects,
+  resolveHomeDir,
   resolveProjectRoot,
   trustedPathKey,
 } from './config.mjs';
@@ -68,6 +70,97 @@ export function formatProjectNotApprovedNotice(projectDir) {
 export function formatProjectNotApprovedUserNotice(projectDir) {
   return `[herdr-cortex] Project memory was not loaded: "${displayPath(projectDir)}" has a .memory/ folder but is not approved. `
     + `To approve it, run: ${TRUST_COMMAND} approve`;
+}
+
+/**
+ * One-time notice injected when the working folder is not approved and has no `.memory/` directory yet.
+ */
+export function formatUnapprovedFolderNotice(projectDir) {
+  return `[herdr-cortex] Project memory is off in "${displayPath(projectDir)}" (folder not approved; `
+    + 'project-scope `memory_save` will fail with PROJECT_NOT_APPROVED, global memory works). '
+    + PROJECT_APPROVAL_INSTRUCTION;
+}
+
+/**
+ * The same one-time notice as one compact line for the user's screen (`systemMessage`).
+ */
+export function formatUnapprovedFolderUserNotice(projectDir) {
+  return `[herdr-cortex] Project memory is off in "${displayPath(projectDir)}" (folder not approved; global memory works). `
+    + `To enable it, run: ${TRUST_COMMAND} approve`;
+}
+
+/**
+ * <globalDir>/state/unapproved-folder-notices.json: folders (keyed by `projectPathKey`) for which the
+ * one-time "folder not approved (no .memory/ yet)" startup notice has already been shown.
+ *   { "version": 1, "folders": { "<projectPathKey>": "<timestamp>" } }
+ */
+export const UNAPPROVED_FOLDER_NOTICES_FILE = 'unapproved-folder-notices.json';
+
+export function getUnapprovedFolderNoticesPath(globalDir) {
+  return path.join(getTierPaths(getGlobalDir(globalDir)).stateDir, UNAPPROVED_FOLDER_NOTICES_FILE);
+}
+
+function readUnapprovedFolderNotices(globalDir) {
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(getUnapprovedFolderNoticesPath(globalDir), 'utf8').replace(/^\uFEFF/, ''));
+  } catch {
+    return {};
+  }
+  if (
+    !data
+    || typeof data !== 'object'
+    || Array.isArray(data)
+    || !data.folders
+    || typeof data.folders !== 'object'
+    || Array.isArray(data.folders)
+  ) {
+    return {};
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(data.folders)) {
+    if (typeof key === 'string' && key && typeof value === 'string' && value) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * True when `projectDir` is the user's home folder (`resolveHomeDir`) or a filesystem root (`C:\`, `/`, etc.),
+ * where prompting the user to run `cortex-trust approve` would encourage approving an entire home or drive.
+ */
+export function isHomeOrRootFolder(projectDir = process.cwd(), { homeDir, env = process.env } = {}) {
+  if (typeof projectDir !== 'string' || !projectDir.trim()) return false;
+  const root = resolveProjectRoot(projectDir.trim());
+  const resolved = path.resolve(root);
+  if (path.dirname(resolved) === resolved) return true;
+  try {
+    const real = fs.realpathSync.native(resolved);
+    if (path.dirname(real) === real) return true;
+  } catch {
+    // ignore missing folder
+  }
+  const home = resolveHomeDir(homeDir, { env });
+  return Boolean(home) && projectPathKey(root) === projectPathKey(home);
+}
+
+export function hasUnapprovedFolderNoticeRecord(projectDir = process.cwd(), { globalDir } = {}) {
+  if (typeof projectDir !== 'string' || !projectDir.trim()) return false;
+  const key = projectPathKey(resolveProjectRoot(projectDir.trim()));
+  const folders = readUnapprovedFolderNotices(globalDir);
+  return Boolean(folders[key]);
+}
+
+export function recordUnapprovedFolderNotice(projectDir = process.cwd(), { globalDir, now = new Date() } = {}) {
+  if (typeof projectDir !== 'string' || !projectDir.trim()) return '';
+  const key = projectPathKey(resolveProjectRoot(projectDir.trim()));
+  const folders = readUnapprovedFolderNotices(globalDir);
+  const filePath = getUnapprovedFolderNoticesPath(globalDir);
+  if (folders[key]) return filePath;
+  folders[key] = formatIsoTimestamp(now);
+  atomicWriteJson(filePath, { version: 1, folders });
+  return filePath;
 }
 
 export class ProjectNotApprovedError extends Error {

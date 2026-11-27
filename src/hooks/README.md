@@ -24,7 +24,7 @@
 | **`approvals-watch.mjs`** | 승인 목록이 확인 대화상자를 거치지 않고 바뀌었는지를 세션마다 값싸게 확인 | `APPROVAL_CHECK_DIR_NAME`, `APPROVAL_CHECK_STALE_MS`, `checkApprovalsForSession`, `getApprovalChecksDir`, `pruneApprovalCheckRecords` |
 | **`shell-read-only.mjs`** | 셸 명령줄이 읽기만 하는 것으로 분명히 인식되는지 판정 | `READ_ONLY_GIT_SUBCOMMANDS`, `READ_ONLY_SHELL_VERBS`, `isReadOnlyShellCommand`, `splitPlainCommands` |
 | **`tool-names.mjs`** | MCP 서버 이름, 이 서버의 도구 이름 판정, PreToolUse 매처 문자열 | `CLAUDE_PRE_TOOL_USE_MATCHER`, `CORTEX_MCP_SERVER_NAMES`, `FILE_WRITE_TOOL_NAMES`, `LEGACY_MCP_SERVER_NAME`, `MCP_SERVER_NAME`, `SHELL_TOOL_NAMES`, `cortexToolBaseName`, `isCortexToolName` |
-| **`installer.mjs`** | 훅·MCP 서버·스킬의 설치와 제거, 날짜 붙인 백업, 설치 상태 점검 함수, 명령줄 진입점 | `AGY_HOOK_KEY`, `ANTIGRAVITY_HOOK_SPECS`, `BACKUP_INFIX`, `CLAUDE_HOOK_MARKER`, `CLAUDE_HOOK_SPECS`, `CLAUDE_MCP_VERIFY_DELAY_MS`, `CLAUDE_SESSION_END_TIMEOUT_SECONDS`, `HOOK_ID_FLAG`, `INSTALL_RECORD_FILE`, `LEGACY_AGY_HOOK_KEY`, `LEGACY_BACKUP_SUFFIX`, `LEGACY_MCP_SERVER_KEY`, `MCP_SERVER_KEY`, `OLD_DEFAULT_CONFIGS`, `SKILL_MANAGED_MARKER`, `buildClaudeHookHandler`, `buildShellHookCommand`, `checkAntigravity`, `checkClaudeHooks`, `checkClaudeMcpRegistration`, `claudeMcpAddArgs`, `claudeMcpRemoveArgs`, `createDatedBackup`, `describeGlobalConfigProblems`, `describeInstalledEmbedding`, `describeMcpEntry`, `describeOwnHook`, `detectAntigravity`, `findBackups`, `findOnPath`, `formatBackupStamp`, `formatInstallSummary`, `getInstallRecordPath`, `installCortex`, `isLegacyReviveHook`, `isOwnHook`, `listBackups`, `quotePathForShells`, `readInstallRecord`, `removeBackups`, `resolveClaudeCli`, `runClaudeCli`, `splitCommandLine`, `uninstallCortex` |
+| **`installer.mjs`** | 훅·MCP 서버·스킬의 설치와 제거, 전역 `config.json`의 옛 임베딩 키 이관, 날짜 붙인 백업, 설치 상태 점검 함수, 명령줄 진입점 | `AGY_HOOK_KEY`, `ANTIGRAVITY_HOOK_SPECS`, `BACKUP_INFIX`, `CLAUDE_HOOK_MARKER`, `CLAUDE_HOOK_SPECS`, `CLAUDE_MCP_VERIFY_DELAY_MS`, `CLAUDE_SESSION_END_TIMEOUT_SECONDS`, `HOOK_ID_FLAG`, `INSTALL_RECORD_FILE`, `LEGACY_AGY_HOOK_KEY`, `LEGACY_BACKUP_SUFFIX`, `LEGACY_MCP_SERVER_KEY`, `MCP_SERVER_KEY`, `OLD_DEFAULT_CONFIGS`, `SKILL_MANAGED_MARKER`, `buildClaudeHookHandler`, `buildShellHookCommand`, `checkAntigravity`, `checkClaudeHooks`, `checkClaudeMcpRegistration`, `claudeMcpAddArgs`, `claudeMcpRemoveArgs`, `createDatedBackup`, `describeGlobalConfigProblems`, `describeInstalledEmbedding`, `describeMcpEntry`, `describeOwnHook`, `detectAntigravity`, `findBackups`, `findOnPath`, `formatBackupStamp`, `formatInstallSummary`, `getInstallRecordPath`, `installCortex`, `isLegacyReviveHook`, `isOwnHook`, `listBackups`, `migrateGlobalEmbeddingConfig`, `quotePathForShells`, `readInstallRecord`, `removeBackups`, `resolveClaudeCli`, `runClaudeCli`, `splitCommandLine`, `uninstallCortex` |
 
 ---
 
@@ -78,9 +78,10 @@ Antigravity가 감지된 경우에만 `~/.gemini/config/hooks.json`의 `herdr-co
   ```
 * **실패해도 호스트를 막지 않음**: 두 진입점은 오류를 모두 삼키고 종료 코드 0으로 끝납니다. 훅이 실패하거나 제한 시간에 걸리면 주입도 검사도 없이 그대로 진행됩니다.
 * **서브에이전트 호출은 건너뜀**: 입력에 `agent_id`, `is_subagent`, 부모 대화·세션 ID가 있거나 `conversationId`와 `rootConversationId`가 다르면 서브에이전트로 보고(`src/revive/tracker.mjs`의 `isSubagentPayload`), 주입과 세션 기록을 하지 않습니다. `PreToolUse`만은 서브에이전트 호출을 검사 대상으로 삼습니다.
-* **워커 세션(`HERDR_CORTEX_ROLE=worker`)**: 환경변수 `HERDR_CORTEX_ROLE`의 값이 앞뒤 공백을 떼고 대소문자를 무시했을 때 `worker`이면 위임 워커 세션입니다(`src/core/role.mjs`의 `isWorkerSession`). 워커 세션에서는 탭별 세션 기록(`recordSession`), `/clear` 종료 기록(`SessionEnd`), `HEAD_CORE.md` 주입, 최근 대화 턴 복원, 릴레이 받은편지함 전달·알림 표시를 하지 않으므로 워커를 띄운 탭의 세션 기록과 받은편지함이 보존됩니다. 기억 개요(`Cortex Memory Overview`), 미승인 폴더 안내, 색인되지 않은 문서 안내, 승인 목록 변경 경고는 그대로 동작합니다.
+* **워커 세션(`HERDR_CORTEX_ROLE=worker`)**: 환경변수 `HERDR_CORTEX_ROLE`의 값이 앞뒤 공백을 떼고 대소문자를 무시했을 때 `worker`이면 위임 워커 세션입니다(`src/core/role.mjs`의 `isWorkerSession`). 워커 세션에서는 탭별 세션 기록(`recordSession`), `/clear` 종료 기록(`SessionEnd`), `HEAD_CORE.md` 주입, 최근 대화 턴 복원, 릴레이 받은편지함 전달·알림 표시를 하지 않으므로 워커를 띄운 탭의 세션 기록과 받은편지함이 보존됩니다. `.memory/`가 없는 미승인 폴더의 1회 안내도 워커 세션에서는 내지도 기록하지도 않습니다(워커가 1회 안내를 소진해 주 대화가 받지 못하는 일을 막음). 기억 개요(`Cortex Memory Overview`), `.memory/`가 있는 미승인 폴더 안내, 색인되지 않은 문서 안내, 승인 목록 변경 경고는 그대로 동작합니다.
 * **제외된 프로젝트**: 설정으로 꺼진 프로젝트(`enabled: false`, `excludedProjects`, `mode: "opt-in"`에서 미등록)에서는 `PreToolUse`를 뺀 모든 처리기가 아무것도 내보내지 않습니다. 받은편지함도 전달하지 않고 `/clear` 기록도 쓰지 않습니다. 탭별 세션 기록(재부팅 복구용)만은 계속 갱신합니다.
-* **승인되지 않은 프로젝트**: 그 폴더의 `.memory/`는 읽지도 만들지도 않으며, 그 안의 `config.json`도 읽지 않습니다. 세션 시작 지침, 전역 기억, 받은편지함은 그대로 동작합니다. 폴더에 `.memory/`가 있으면 그 사실을 안내합니다(아래 문구).
+* **승인되지 않은 프로젝트**: 그 폴더의 `.memory/`는 읽지도 만들지도 않으며, 그 안의 `config.json`도 읽지 않습니다. 세션 시작 지침, 전역 기억, 받은편지함은 그대로 동작합니다. 폴더에 `.memory/`가 있으면 매 세션 그 사실을 알리고, `.memory/`가 없어도 주 대화에서는 폴더당 한 번 승인 전 안내를 내고 `<전역>/state/unapproved-folder-notices.json`에 기록합니다(아래 문구). 다만 작업 폴더가 사용자 홈 폴더(`resolveHomeDir`) 자체이거나 파일 시스템 루트(`C:\`, `/` 등, `isHomeOrRootFolder`)이면 홈·드라이브 전체 승인을 유도하지 않도록 `.memory/` 없는 1회 안내를 내지도 기록하지도 않으며, `hookBudget`에 들어가지 않거나 기존 구획을 밀어내게 되는 경우에도 그 안내만 빼고 기록하지 않습니다.
+* **무시되는 옛 임베딩 키 알림**: 세션 시작 때 불러온 설정에 옛 평면 임베딩 키(`legacy_embedding_keys`, 또는 승인된 폴더의 `<프로젝트>/.memory/config.json` 안 옛 키)가 있으면 어느 파일의 어떤 키가 무시되는지와 고치는 방법을 한 줄로 알립니다. 전역 최상위 `embedding`은 `embedding.provider`가 유효한 프로바이더 이름이어서 설치기가 실제로 이관·정리할 수 있을 때만 `install.ps1` 재실행을 안내하고, 프로바이더가 미정(`auto`, `none`, 미설정, 모르는 값 등)일 때는 그 이유와 함께 프로바이더 지정 후 재실행 또는 직접 이동·삭제를 안내합니다. 프로젝트별 설정도 지원하는 키 이동과 쓰이지 않는 키 삭제를 함께 안내합니다. Claude Code는 `systemMessage`로, Antigravity는 모델 문맥(`injectSteps`)으로 내보냅니다.
 
 ---
 
@@ -103,7 +104,7 @@ node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|u
 | `pre-compact` | JSON이 아닌 일반 글 한 단락과 줄바꿈 | Claude Code가 압축 요약의 지시문으로 씁니다 |
 | `session-end` | 없음 | Claude Code가 이 이벤트의 출력을 쓰지 않습니다 |
 
-`systemMessage`에는 사용자가 알아야 하는 일만 한 건당 한 줄로 넣습니다. 프로젝트 기억을 싣지 못함(미승인), 색인되지 않은 문서가 있음, 최근 대화를 복원하지 못함, 승인 목록이 대화상자 없이 바뀜의 네 가지입니다. 여러 건은 줄바꿈으로 잇고, 합쳐서 2,000자(`USER_NOTICE_MAX_CHARS`)를 넘으면 끝을 `...`로 자릅니다. 평소의 주입 내용은 여기에 넣지 않습니다.
+`systemMessage`에는 사용자가 알아야 하는 일만 한 건당 한 줄로 넣습니다. 프로젝트 기억 미승인(`.memory/`가 있을 때는 매 세션, 없을 때는 주 대화에서 폴더당 한 번), 승인 목록이 대화상자 없이 바뀜, 설정 파일의 옛 평면 임베딩 키가 무시됨, 색인되지 않은 문서가 있음, 최근 대화를 복원하지 못함의 다섯 가지입니다. 여러 건은 줄바꿈으로 잇고, 합쳐서 2,000자(`USER_NOTICE_MAX_CHARS`)를 넘으면 끝을 `...`로 자릅니다. 평소의 주입 내용은 여기에 넣지 않습니다.
 
 ### SessionStart: 무엇을 어떤 순서로 주입하는가
 
@@ -111,8 +112,8 @@ node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|u
 
 | 순서 | 구획 | 조건과 분량 |
 | :--- | :--- | :--- |
-| 1 | 세션 시작 지침 `prompts/HEAD_CORE.md` | `source`가 `resume` 또는 `fork`이면 대화 기록(`transcript_path` 또는 `transcriptPath`)을 처음부터 최대 32MiB(`MAX_HEAD_SCAN_BYTES`)까지 읽으며 `SessionStart` 훅이 주입한 문맥 기록(`attachment.type: "hook_additional_context"`, `hookEvent: "SessionStart"`) 안에 현재 `HEAD_CORE.md`의 첫 번째 비어 있지 않은 줄이 이미 있을 때만 건너뛰고(찾는 즉시 읽기를 멈춤), 표식이 없거나(설치 전 시작된 대화, 제목 변경, 도구 결과·메시지에만 같은 글이 있는 경우, 상한 초과) 경로가 없거나 읽지 못하면 주입합니다. `headCoreEnabled: false`이거나 파일이 없어도 넣지 않습니다. 예산을 넘으면 줄 단위로 뒤쪽을 덜어 내며, 2·3번 구획이 들어갈 자리는 남겨 둡니다 |
-| 2 | 미승인 안내(`formatProjectNotApprovedNotice`) | 작업 폴더에 `.memory/`가 있는데 승인되지 않았을 때 |
+| 1 | 세션 시작 지침 `prompts/HEAD_CORE.md` | `source`가 `resume` 또는 `fork`이면 대화 기록(`transcript_path` 또는 `transcriptPath`)을 처음부터 최대 32MiB(`MAX_HEAD_SCAN_BYTES`)까지 읽으며 `SessionStart` 훅이 주입한 문맥 기록(`attachment.type: "hook_additional_context"`, `hookEvent: "SessionStart"`) 안에 현재 `HEAD_CORE.md`의 첫 번째 비어 있지 않은 줄이 이미 있을 때만 건너뛰고(찾는 즉시 읽기를 멈춤), 표식이 없거나(설치 전 시작된 대화, 제목 변경, 도구 결과·메시지에만 같은 글이 있는 경우, 상한 초과) 경로가 없거나 읽지 못하면 주입합니다. `headCoreEnabled: false`이거나 파일이 없어도 넣지 않습니다. 예산을 넘으면 줄 단위로 뒤쪽을 덜어 내며, 기존 필수 안내(`.memory/`가 있는 미승인 안내, 승인 목록 변경 경고)와 예산에 실제로 들어가는 1회 미승인 안내의 자리를 남겨 둡니다 |
+| 2 | 미승인 안내(`formatProjectNotApprovedNotice` / `formatUnapprovedFolderNotice`) | 작업 폴더가 승인되지 않았을 때. `.memory/`가 있으면 매 세션 내고, `.memory/`가 없으면 워커·홈 폴더·파일 시스템 루트가 아닌 세션에서 예산에 들어갈 때만 폴더당 첫 한 번 내고 `<전역>/state/unapproved-folder-notices.json`에 기록합니다 |
 | 3 | 승인 목록 변경 경고 | 아래 "승인 목록 변경 경고" 참고 |
 | 4 | 색인되지 않은 문서 안내(`formatUnindexedNotice`) | 색인 갱신이 문서를 미뤘을 때 |
 | 5 | 릴레이 받은편지함 | 탭 ID가 유효하고 남은 예산이 120자 이상일 때. 기억 개요가 있거나 최근 대화를 복원할 차례이면 `min(2000, max(300, 남은 예산의 35%))`자(남은 예산의 35%, 300자 이상 2,000자 이하), 아니면 남은 예산 전부 |
@@ -120,7 +121,7 @@ node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|u
 | 7 | 기억 개요(`fitOverviewToBudget`) | 최근 대화 몫을 뺀 남은 예산이 120자 이상일 때. 프로젝트 기억과 전역 기억에서 뽑은 `P0` 기준선, 활성 세션과 브랜치, 열린 할 일, 최근 결정과 기준선, 최근 작업, 전역 선호가 들어갑니다. 예산에 맞지 않으면 문장 중간을 자르지 않고 항목 수와 세부 항목을 6단계(`full` → `standard` → `focused` → `compact` → `minimal` → `essential`)로 줄여 맞추며, `P0` 기준선은 가장 먼저, 마지막 단계까지 남깁니다([`src/core/README.md`](../core/README.md#개요를-한도에-맞추기)) |
 | 8 | 최근 대화 턴 | `source`가 `compact` 또는 `clear`이고 `transcript_path`가 있으며 남은 예산이 200자 이상일 때. 기억 개요가 있으면 `min(4500, max(400, 남은 예산의 55%))`자(남은 예산의 55%, 400자 이상 4,500자 이하), 없으면 `min(4500, 남은 예산)`자. 최대 5턴 |
 
-미승인 안내는 모델용과 사용자용 두 가지입니다(`src/core/trust.mjs`).
+미승인 안내는 `.memory/` 유무에 따라 모델용과 사용자용 두 쌍입니다(`src/core/trust.mjs`). `.memory/`가 없을 때의 두 줄은 폴더당 한 번만 나갑니다.
 
 ```
 [herdr-cortex] Project memory was not loaded: "<폴더>" contains a .memory/ directory, but this folder is not approved. To approve a folder, the user runs `cortex-trust approve` inside it from their own terminal (or `cortex-trust approve "<folder>"`). Approval is the user's decision: ask them, do not run it for them.
@@ -128,6 +129,14 @@ node --no-warnings src/hooks/claude.mjs <session-start|session-end|pre-compact|u
 
 ```
 [herdr-cortex] Project memory was not loaded: "<폴더>" has a .memory/ folder but is not approved. To approve it, run: cortex-trust approve
+```
+
+```
+[herdr-cortex] Project memory is off in "<폴더>" (folder not approved; project-scope `memory_save` will fail with PROJECT_NOT_APPROVED, global memory works). To approve a folder, the user runs `cortex-trust approve` inside it from their own terminal (or `cortex-trust approve "<folder>"`). Approval is the user's decision: ask them, do not run it for them.
+```
+
+```
+[herdr-cortex] Project memory is off in "<폴더>" (folder not approved; global memory works). To enable it, run: cortex-trust approve
 ```
 
 승인되지 않은 폴더나 `.memory/`가 없는 폴더에서는 기억 개요가 전역 기억만으로 만들어집니다(상태가 `active`인 전역 문서 최대 25건, `docs/preferences/` 아래 문서 먼저). 이때 프로젝트에 `.memory/`를 만들지 않습니다.
@@ -298,7 +307,7 @@ node --no-warnings src/hooks/antigravity.mjs <session-start|pre-invocation> --id
 **SessionStart**
 
 * `subagent`이면 아무것도 하지 않습니다. `unknown`이고 입력의 `rootConversationId`가 `conversationId`와 같다고 명시되어 있지 않으면, 주입과 세션 기록을 모두 `PreInvocation`으로 미룹니다.
-* 그 밖에는 탭별 세션 기록을 갱신하고 다음 순서로 주입합니다. 승인 목록 변경 경고, 세션 시작 지침(`headCoreEnabled: false`이면 생략), 미승인 안내, 색인되지 않은 문서 안내, 기억 개요, 받은편지함. 색인 한도와 미루기는 Claude Code와 같습니다.
+* 그 밖에는 탭별 세션 기록을 갱신하고 다음 순서로 주입합니다. 승인 목록 변경 경고, 세션 시작 지침(`headCoreEnabled: false`이면 생략), 미승인 안내(`.memory/`가 있으면 매번, 없으면 워커·홈 폴더·파일 시스템 루트가 아닐 때 예산 안에서 폴더당 한 번), 무시되는 옛 임베딩 키 안내(`formatLegacyEmbeddingContextNotice`), 색인되지 않은 문서 안내, 기억 개요, 받은편지함. 색인 한도와 미루기는 Claude Code와 같습니다.
 
 **PreInvocation**
 
@@ -306,7 +315,7 @@ node --no-warnings src/hooks/antigravity.mjs <session-start|pre-invocation> --id
 * 주입 순서는 다음과 같습니다.
   1. 승인 목록 변경 경고
   2. 사용자 입력이 `/compact`로 시작하면 압축 지시문(`buildCompactInstruction`, Claude Code와 같은 문장. `/compact` 뒤에 인자가 있으면 사용자 지시 우선 문장이 붙음)
-  3. 이 대화에서 처음이면 세션 시작 지침, 미승인 안내, 색인되지 않은 문서 안내, 기억 개요
+  3. 이 대화에서 처음이면 세션 시작 지침, 미승인 안내(`.memory/`가 있으면 매번, 없으면 워커·홈 폴더·파일 시스템 루트가 아닐 때 예산 안에서 폴더당 한 번), 무시되는 옛 임베딩 키 안내, 색인되지 않은 문서 안내, 기억 개요
   4. 체크포인트 뒤 복원(아래)
   5. 받은편지함
 
@@ -418,7 +427,7 @@ node --no-warnings src/hooks/installer.mjs <command>
 
 **스킬**: `prompts/skills/` 아래의 폴더마다 `~/.claude/skills/cortex-<이름>/`으로 복사하고, `SKILL.md` 머리말의 `name:`을 설치된 폴더 이름으로 맞춘 뒤, 표시 파일 `.herdr-cortex-managed`(`SKILL_MANAGED_MARKER`)를 넣습니다. 같은 이름의 폴더가 이미 있으면 표시 파일이 있을 때만 교체하고, 없으면 사용자가 만든 스킬로 보고 건드리지 않습니다.
 
-**옛 기본 설정(`OLD_DEFAULT_CONFIGS`)**: `<전역>/config.json`이 이전 설치기가 쓴 기본값 두 가지(임베딩 프로바이더 `auto`, 그리고 여기에 `onnxEnabled: false`가 더해진 것) 가운데 하나와 완전히 같으면 사용자가 손대지 않은 것으로 보고, 백업을 만든 뒤 현재 기본값으로 바꿉니다. 조금이라도 다르면 그대로 두고 문제점만 `[WARN]`으로 알립니다. `config.json`이 깨져 있어도 설치를 막지는 않습니다.
+**옛 기본 설정(`OLD_DEFAULT_CONFIGS`)과 옛 임베딩 키 이관(`migrateGlobalEmbeddingConfig`)**: `<전역>/config.json`이 이전 설치기가 쓴 기본값 두 가지(임베딩 프로바이더 `auto`, 그리고 여기에 `onnxEnabled: false`가 더해진 것) 가운데 하나와 완전히 같으면 사용자가 손대지 않은 것으로 보고, 백업을 만든 뒤 현재 기본값으로 바꿉니다. 사용자가 고친 파일에 옛 평면 임베딩 키(`LEGACY_EMBEDDING_KEYS`)가 있을 때는 `embedding.provider`가 특정 프로바이더(`gemini`, `openai`, `ollama`, `onnx`)이면 날짜 붙인 백업을 만든 뒤 그 프로바이더 묶음(`embedding.<프로바이더>.*`)으로 값을 옮기고 옛 키를 지우며(`[OK] Migrated legacy embedding setting(s) ...`), 새 묶음에 같은 키가 이미 있으면 기존 값을 지키고 옛 키만 지우며(`[OK] Removed legacy embedding key(s) ...`), 해당 프로바이더에 대응하는 키가 없는 옛 키(쓰이지 않던 값)도 같은 백업 아래 지우고 `[OK] Removed unused legacy embedding key(s) ...`로 알립니다(옮길 키 없이 지울 키만 있는 파일도 백업 뒤 고칩니다). `embedding.provider`가 `auto`·`none`·빈 값·모르는 이름이면 어느 묶음으로 옮길지 정할 수 없으므로 파일과 백업을 건드리지 않고 `[WARN]`으로 알립니다. 프로젝트별 설정(`projects[...]` 및 `<프로젝트>/.memory/config.json`)은 고치지 않으며, `config.json`이 깨져 있어도 설치를 막지는 않고 `[WARN]`으로 알립니다.
 
 ### 백업
 

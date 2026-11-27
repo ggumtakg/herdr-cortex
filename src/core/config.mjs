@@ -43,6 +43,37 @@ export const EMBEDDING_PROVIDER_NAMES = Object.freeze(['gemini', 'openai', 'olla
  */
 export const LEGACY_EMBEDDING_KEYS = Object.freeze(['baseUrl', 'model', 'dimensions', 'apiKey', 'apiKeyEnv', 'onnxEnabled']);
 
+/**
+ * Mapping of each legacy flat `embedding.<key>` to its per-provider `embedding.<provider>.<target>` key.
+ * Keys omitted for a provider have no equivalent in that provider's block.
+ */
+export const LEGACY_EMBEDDING_KEY_TARGETS = Object.freeze({
+  gemini: Object.freeze({
+    baseUrl: 'baseUrl',
+    model: 'model',
+    dimensions: 'dimensions',
+    apiKey: 'apiKey',
+    apiKeyEnv: 'apiKeyEnv',
+  }),
+  openai: Object.freeze({
+    baseUrl: 'baseUrl',
+    model: 'model',
+    dimensions: 'dimensions',
+    apiKey: 'apiKey',
+    apiKeyEnv: 'apiKeyEnv',
+  }),
+  ollama: Object.freeze({
+    baseUrl: 'baseUrl',
+    model: 'model',
+    dimensions: 'dimensions',
+  }),
+  onnx: Object.freeze({
+    model: 'model',
+    dimensions: 'dimensions',
+    onnxEnabled: 'enabled',
+  }),
+});
+
 const DOC_ID_RE = /^[a-zA-Z0-9가-힣._-]+$/;
 const RESERVED_WIN_NAMES = new Set([
   'con', 'prn', 'aux', 'nul',
@@ -294,6 +325,112 @@ export function describeLegacyEmbeddingKeys(keys, location = 'embedding') {
     + `(for example ${location}.ollama.baseUrl, ${location}.gemini.model, ${location}.openai.apiKeyEnv, ${location}.onnx.enabled).`;
 }
 
+function singleLineConfigText(value) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function describeRawProvider(rawProvider) {
+  const provider = typeof rawProvider === 'string' ? rawProvider.trim().toLowerCase() : '';
+  let providerDisplay = 'not set';
+  if (typeof rawProvider === 'string' && rawProvider.trim() !== '') {
+    providerDisplay = JSON.stringify(rawProvider.trim());
+  } else if (rawProvider !== undefined && rawProvider !== null && rawProvider !== '') {
+    providerDisplay = JSON.stringify(rawProvider);
+  }
+  return { provider, providerDisplay };
+}
+
+/**
+ * One-line notices for the user's screen when `loadConfig` found ignored old-format `embedding.*` keys.
+ * Global top-level settings advise re-running `install.ps1` immediately only when `embedding.provider`
+ * already names a valid provider (with a valid provider block); otherwise they explain why `install.ps1`
+ * cannot migrate them automatically and what to change or delete. Per-project settings advise moving
+ * supported settings and deleting unused keys directly.
+ */
+export function formatLegacyEmbeddingUserNotices(config) {
+  const notices = [];
+  for (const problem of getConfigProblems(config)) {
+    if (problem.code === 'legacy_embedding_keys') {
+      if (!problem.source || problem.source === 'overrides') continue;
+      const location = singleLineConfigText(problem.location || 'embedding');
+      const keys = Array.isArray(problem.keys) ? problem.keys : [];
+      if (keys.length === 0) continue;
+      const named = keys.map((key) => `${location}.${key}`).join(', ');
+      const source = singleLineConfigText(problem.source);
+      if (location === 'embedding') {
+        if (problem.providerValid && problem.providerBlockOk) {
+          notices.push(
+            `[herdr-cortex] Ignored old-format setting(s) in "${source}": ${named}. `
+            + `Re-run install.ps1 to migrate supported settings into embedding.${problem.provider} and remove unused ones `
+            + `(or move supported settings into embedding.${problem.provider} and delete unused flat keys manually).`,
+          );
+        } else if (problem.providerValid && !problem.providerBlockOk) {
+          notices.push(
+            `[herdr-cortex] Ignored old-format setting(s) in "${source}": ${named}. `
+            + `install.ps1 cannot migrate them automatically because embedding.${problem.provider} is not a JSON object; `
+            + `fix embedding.${problem.provider} and re-run install.ps1, or delete unused flat keys manually.`,
+          );
+        } else {
+          const provText = singleLineConfigText(problem.providerDisplay || 'not set');
+          notices.push(
+            `[herdr-cortex] Ignored old-format setting(s) in "${source}": ${named}. `
+            + `install.ps1 cannot migrate them automatically because embedding.provider is ${provText} (not gemini, openai, ollama or onnx); `
+            + 'set embedding.provider to a specific provider and re-run install.ps1, or move needed settings into embedding.<provider> and delete unused flat keys.',
+          );
+        }
+      } else if (problem.providerValid) {
+        const targets = LEGACY_EMBEDDING_KEY_TARGETS[problem.provider] || {};
+        const mapped = keys.filter((key) => Boolean(targets[key]));
+        const unmapped = keys.filter((key) => !targets[key]);
+        if (mapped.length > 0 && unmapped.length === 0) {
+          notices.push(
+            `[herdr-cortex] Ignored old-format per-project setting(s) in "${source}": ${named}. `
+            + `Move them into ${location}.${problem.provider} manually, or delete them if unused (install.ps1 does not edit per-project settings).`,
+          );
+        } else if (mapped.length === 0) {
+          notices.push(
+            `[herdr-cortex] Ignored old-format per-project setting(s) in "${source}": ${named}. `
+            + `Delete ${unmapped.length === 1 ? 'it' : 'them'} from ${location} manually — not used by ${problem.provider} (install.ps1 does not edit per-project settings).`,
+          );
+        } else {
+          notices.push(
+            `[herdr-cortex] Ignored old-format per-project setting(s) in "${source}": ${named}. `
+            + `Move supported settings into ${location}.${problem.provider} and delete unused flat key(s) `
+            + `(${unmapped.map((key) => `${location}.${key}`).join(', ')}) manually (install.ps1 does not edit per-project settings).`,
+          );
+        }
+      } else {
+        notices.push(
+          `[herdr-cortex] Ignored old-format per-project setting(s) in "${source}": ${named}. `
+          + `Move needed settings into ${location}.<provider> and delete unused or unsupported flat keys manually (install.ps1 does not edit per-project settings).`,
+        );
+      }
+    } else if (problem.code === 'project_embedding_ignored' && Array.isArray(problem.legacyKeys) && problem.legacyKeys.length > 0) {
+      const named = problem.legacyKeys.map((key) => `embedding.${key}`).join(', ');
+      const source = singleLineConfigText(problem.source);
+      const targetRoot = singleLineConfigText(problem.projectRoot || path.dirname(path.dirname(problem.source || '')));
+      notices.push(
+        `[herdr-cortex] Ignored old-format project setting(s) in "${source}": ${named}. `
+        + 'Project .memory/config.json cannot set embedding; move needed supported settings manually into global config.json under '
+        + `projects[${JSON.stringify(targetRoot)}].embedding.<provider> and remove "embedding" (including unused keys) from "${source}".`,
+      );
+    }
+  }
+  return notices;
+}
+
+/**
+ * Same notices formatted for a host that only has a model-context channel (Antigravity `injectSteps`).
+ */
+export function formatLegacyEmbeddingContextNotice(config) {
+  const notices = formatLegacyEmbeddingUserNotices(config);
+  if (notices.length === 0) return '';
+  return notices.map((line) => `${line} Tell the user about this notice.`).join('\n');
+}
+
 // Returns a copy of `embedding` without the old flat keys and records a problem when any were present.
 function dropLegacyEmbeddingKeys(embedding, { source, location, problems }) {
   if (!isPlainObject(embedding)) return undefined;
@@ -303,8 +440,22 @@ function dropLegacyEmbeddingKeys(embedding, { source, location, problems }) {
   const clean = { ...embedding };
   for (const key of legacyKeys) delete clean[key];
 
+  const { provider, providerDisplay } = describeRawProvider(embedding.provider);
+  const providerValid = EMBEDDING_PROVIDER_NAMES.includes(provider);
+  const providerBlockOk = providerValid && (embedding[provider] === undefined || isPlainObject(embedding[provider]));
+
   const message = `${describeLegacyEmbeddingKeys(legacyKeys, location)} (in "${source}")`;
-  problems.push({ code: 'legacy_embedding_keys', keys: legacyKeys, location, source, message });
+  problems.push({
+    code: 'legacy_embedding_keys',
+    keys: legacyKeys,
+    location,
+    source,
+    provider,
+    providerDisplay,
+    providerValid,
+    providerBlockOk,
+    message,
+  });
   warnConfigOnce(`legacy\0${source}\0${location}\0${legacyKeys.join(',')}`, message);
   return clean;
 }
@@ -452,10 +603,17 @@ export function loadConfig({ projectDir, globalDir, overrides } = {}) {
     const pPaths = getTierPaths(getProjectMemoryDir(projectDir));
     const projectRaw = isProjectTrusted(projectRoot, { globalDir }) ? readJsonSafe(pPaths.configPath) : null;
     if (isPlainObject(projectRaw) && projectRaw.embedding !== undefined) {
+      const legacyKeys = findLegacyEmbeddingKeys(projectRaw.embedding);
       const message = `"embedding" in the project file "${pPaths.configPath}" is ignored: a repository cannot choose `
         + 'where documents are sent. Put per-project embedding settings in the global config.json under '
         + `projects[${JSON.stringify(projectRoot)}].embedding.`;
-      problems.push({ code: 'project_embedding_ignored', source: pPaths.configPath, message });
+      problems.push({
+        code: 'project_embedding_ignored',
+        source: pPaths.configPath,
+        projectRoot,
+        ...(legacyKeys.length > 0 ? { legacyKeys } : {}),
+        message,
+      });
       warnConfigOnce(`project-embedding\0${pPaths.configPath}`, message);
     }
     cfg = mergeConfig(cfg, sanitizeProjectConfig(projectRaw));

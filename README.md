@@ -56,6 +56,16 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 설치가 묻는 것과 바꾸는 것의 전체 표, 스위치 네 개(`-NoAutoResume`, `-SetExecutionPolicy`, `-SkipExecutionPolicy`, `-NodePath`)는 [`scripts/README.md`의 "설치와 제거"](scripts/README.md#설치와-제거)에 있습니다.
 
+### 업그레이드 점검 목록
+
+이전 버전에서 코드를 받아 올린 뒤에는 다음 순서로 확인합니다.
+
+1. **설치기를 다시 실행합니다.** 저장소 폴더에서 `git pull`과 `npm install` 뒤 `powershell -ExecutionPolicy Bypass -File .\install.ps1`을 실행하고, 열려 있던 Claude Code와 Antigravity 탭을 다시 시작합니다.
+2. **설치 화면의 이관 결과와 백업을 확인합니다.** 전역 `%USERPROFILE%\.herdr-cortex\config.json`의 `embedding.provider`가 특정 프로바이더(`gemini`, `openai`, `ollama`, `onnx`)이고 옛 평면 키(`baseUrl`, `model`, `dimensions`, `apiKey`, `apiKeyEnv`, `onnxEnabled`)가 있으면, 설치기가 먼저 `<파일>.herdr-cortex.<연월일-시분초>.bak` 백업을 만든 뒤 해당 프로바이더 블록(`embedding.<프로바이더>.*`)으로 옮기고 `[OK] Migrated legacy embedding setting(s) ...`와 `[OK] Backup: ...`을 출력합니다. 새 블록에 이미 같은 키가 있으면 기존 값을 지키고 옛 키만 지우며, 그 프로바이더에서 쓰이지 않던 옛 키(대응하는 새 키가 없는 항목, 예: `gemini`일 때의 `onnxEnabled`)도 같은 백업 아래 함께 지우고 `[OK] Removed unused legacy embedding key(s) ...`로 알립니다. `embedding.provider`가 `auto`·`none`·모르는 값이면 고치지 않고 `[WARN]`으로 알립니다(`embedding.provider`를 프로바이더 이름으로 정한 뒤 `install.ps1`을 다시 실행하거나, 필요한 설정은 `embedding.<프로바이더>` 아래로 직접 옮기고 쓰지 않는 평면 키는 지웁니다).
+3. **`cortex-status`로 임베딩 상태를 확인합니다.** 새 PowerShell 창에서 `cortex-status`를 실행해 `Embedding` 줄(선택된 프로바이더·모델·전송 호스트 또는 `off`), `Config` 줄(`no problems`), 그리고 고칠 것이 있을 때만 나오는 `Needs attention` 목록을 확인합니다.
+4. **프로젝트별 설정의 옛 키는 직접 정리합니다.** 설치기는 프로젝트별 설정을 고치지 않습니다. 전역 `config.json`의 `projects["<프로젝트 경로>"].embedding`에 옛 평면 키가 있으면 지원하는 키는 같은 항목의 `embedding.<프로바이더>` 블록으로 직접 옮기고 쓰지 않는 키는 지우며, 프로젝트 안의 `<프로젝트>\.memory\config.json`에 적어 둔 `embedding` 설정이 있으면 필요한 지원 키만 전역 `config.json`의 `projects["<프로젝트 경로>"].embedding.<프로바이더>`로 옮기고 프로젝트 파일의 `embedding` 항목은 지웁니다(전역 `projects[...]`의 옛 키는 남아 있으면 세션 시작 때 알림이 나오고, 프로젝트 `.memory\config.json`은 승인된 폴더에서만 읽히며 그 `embedding`에 옛 평면 키가 있을 때만 세션 시작 알림이 나옵니다. `cortex-status`는 승인된 폴더의 `.memory\config.json`에 어떤 `embedding` 블록이든 남아 있으면 함께 알려 줍니다).
+5. **기억을 쓸 폴더마다 `cortex-trust`로 승인합니다.** 각 프로젝트 폴더에서 `cortex-trust approve`(또는 `cortex-trust approve "<폴더>"`)를 실행하고 확인 대화상자에서 "예"를 누릅니다(`cortex-trust status`로 현재 폴더의 승인 여부를, `cortex-trust list`로 승인된 폴더 전체를 확인합니다).
+
 ### 제거
 
 ```powershell

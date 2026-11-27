@@ -5,6 +5,7 @@ import {
   REPO_ROOT,
   assertInsideDir,
   atomicWriteJson,
+  formatLegacyEmbeddingContextNotice,
   getProjectMemoryDir,
   getTierPaths,
   hasProjectMemoryDir,
@@ -15,7 +16,13 @@ import {
 } from '../core/config.mjs';
 import { fitOverviewToBudget, resolveHookBudget } from '../core/budget.mjs';
 import { isWorkerSession } from '../core/role.mjs';
-import { formatProjectNotApprovedNotice } from '../core/trust.mjs';
+import {
+  formatProjectNotApprovedNotice,
+  formatUnapprovedFolderNotice,
+  hasUnapprovedFolderNoticeRecord,
+  isHomeOrRootFolder,
+  recordUnapprovedFolderNotice,
+} from '../core/trust.mjs';
 import {
   extractCwd,
   extractSessionId,
@@ -85,9 +92,83 @@ function trimLinesToBudget(text, budget) {
   return out.join('\n').trimEnd();
 }
 
-// Notice injected with the startup context when the folder has a .memory/ directory that was not loaded.
+// Notice injected when the folder has a .memory/ directory that was not loaded (every startup/restore).
 function resolveNotApprovedNotice(projectDir, projectTrusted) {
   return !projectTrusted && hasProjectMemoryDir(projectDir) ? formatProjectNotApprovedNotice(projectDir) : '';
+}
+
+// Startup notice: every session when .memory/ exists; once per folder (non-worker, non-home/root) when .memory/ is absent.
+function resolveStartupNotApproved(projectDir, { projectTrusted, worker, globalDir, homeDir, env }) {
+  if (projectTrusted) return { contextText: '', recordOnce: false };
+  if (hasProjectMemoryDir(projectDir)) {
+    return { contextText: formatProjectNotApprovedNotice(projectDir), recordOnce: false };
+  }
+  if (
+    !worker
+    && !isHomeOrRootFolder(projectDir, { homeDir, env })
+    && !hasUnapprovedFolderNoticeRecord(projectDir, { globalDir })
+  ) {
+    return { contextText: formatUnapprovedFolderNotice(projectDir), recordOnce: true };
+  }
+  return { contextText: '', recordOnce: false };
+}
+
+function pushStartupHeadAndNotices({
+  pushSection,
+  availableBudget,
+  worker,
+  promptsDir,
+  config,
+  notApproved,
+  legacyEmbeddingNotice,
+  projectDir,
+  globalDir,
+}) {
+  const headCore = !worker ? readHeadCore(promptsDir, config) : '';
+  const mandatoryNotApproved = !notApproved.recordOnce ? notApproved.contextText : '';
+  const oneTimeCandidate = notApproved.recordOnce ? notApproved.contextText : '';
+
+  let reserve = mandatoryNotApproved.length;
+  const baseHead = headCore ? trimLinesToBudget(headCore, availableBudget() - reserve) : '';
+
+  let includeOneTime = false;
+  if (oneTimeCandidate && oneTimeCandidate.length <= availableBudget() - reserve) {
+    const withOneTime = headCore
+      ? trimLinesToBudget(headCore, availableBudget() - reserve - oneTimeCandidate.length)
+      : '';
+    if (!baseHead || Boolean(withOneTime)) {
+      includeOneTime = true;
+      reserve += oneTimeCandidate.length;
+    }
+  }
+
+  let reserveLegacy = false;
+  if (legacyEmbeddingNotice && legacyEmbeddingNotice.length <= availableBudget() - reserve) {
+    const headBeforeLegacy = headCore ? trimLinesToBudget(headCore, availableBudget() - reserve) : '';
+    const headWithLegacy = headCore
+      ? trimLinesToBudget(headCore, availableBudget() - reserve - legacyEmbeddingNotice.length)
+      : '';
+    if (!headBeforeLegacy || Boolean(headWithLegacy)) {
+      reserveLegacy = true;
+      reserve += legacyEmbeddingNotice.length;
+    }
+  }
+
+  if (headCore) {
+    pushSection(trimLinesToBudget(headCore, availableBudget() - reserve));
+  }
+  if (mandatoryNotApproved) {
+    pushSection(mandatoryNotApproved);
+  } else if (includeOneTime && pushSection(oneTimeCandidate)) {
+    try {
+      recordUnapprovedFolderNotice(projectDir, { globalDir });
+    } catch {
+      // ignore state write errors in hook
+    }
+  }
+  if (legacyEmbeddingNotice && (reserveLegacy || legacyEmbeddingNotice.length <= availableBudget())) {
+    pushSection(legacyEmbeddingNotice);
+  }
 }
 
 /**
@@ -274,6 +355,7 @@ export function handleAntigravitySessionStart(
     env = process.env,
     terminalId = env?.HC_TERMINAL_ID,
     globalDir,
+    homeDir,
     legacyHome,
     promptsDir = path.join(REPO_ROOT, 'prompts'),
     startedAt,
@@ -299,6 +381,7 @@ export function handleAntigravitySessionStart(
 
   const worker = isWorkerSession({ env });
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+  const effectiveHomeDir = homeDir || ((env?.HERDR_CORTEX_TEST_HOME || env?.HERDR_REVIVE_TEST_HOME) ? '' : legacyHome);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   const budget = resolveHookBudget(config);
@@ -320,30 +403,43 @@ export function handleAntigravitySessionStart(
 
   // Nothing from the project's .memory/ is read, injected or created until the user approved the folder.
   const projectTrusted = isProjectTrusted(projectDir, { globalDir: effectiveGlobalDir });
-  const notApprovedNotice = resolveNotApprovedNotice(projectDir, projectTrusted);
+  const notApproved = resolveStartupNotApproved(projectDir, {
+    projectTrusted,
+    worker,
+    globalDir: effectiveGlobalDir,
+    homeDir: effectiveHomeDir,
+    env,
+  });
+  const legacyEmbeddingNotice = formatLegacyEmbeddingContextNotice(config);
 
   const sections = [];
   let used = 0;
 
   const pushSection = (text) => {
     const clean = typeof text === 'string' ? text.trim() : '';
-    if (!clean) return;
+    if (!clean) return false;
     if (used + clean.length <= budget) {
       sections.push(clean);
       used += clean.length;
+      return true;
     }
+    return false;
   };
 
   pruneApprovalCheckRecords(effectiveGlobalDir);
   pushSection(resolveApprovalsWarning(effectiveGlobalDir, convId));
 
-  if (!worker) {
-    const headCore = readHeadCore(promptsDir, config);
-    if (headCore) {
-      pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
-    }
-  }
-  pushSection(notApprovedNotice);
+  pushStartupHeadAndNotices({
+    pushSection,
+    availableBudget: () => budget - used,
+    worker,
+    promptsDir,
+    config,
+    notApproved,
+    legacyEmbeddingNotice,
+    projectDir,
+    globalDir: effectiveGlobalDir,
+  });
 
   pushOverviewSections({
     pushSection,
@@ -405,6 +501,7 @@ export function handleAntigravityPreInvocation(
     env = process.env,
     terminalId = env?.HC_TERMINAL_ID,
     globalDir,
+    homeDir,
     legacyHome,
     promptsDir = path.join(REPO_ROOT, 'prompts'),
     startedAt,
@@ -436,6 +533,7 @@ export function handleAntigravityPreInvocation(
 
   const worker = isWorkerSession({ env });
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+  const effectiveHomeDir = homeDir || ((env?.HERDR_CORTEX_TEST_HOME || env?.HERDR_REVIVE_TEST_HOME) ? '' : legacyHome);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   const budget = resolveHookBudget(config);
@@ -500,13 +598,25 @@ export function handleAntigravityPreInvocation(
   // 2. First root PreInvocation startup injection (deferred from SessionStart)
   let injectedStartupThisTurn = false;
   if (!cpState.started) {
-    if (!worker) {
-      const headCore = readHeadCore(promptsDir, config);
-      if (headCore) {
-        pushSection(trimLinesToBudget(headCore, budget - used - notApprovedNotice.length));
-      }
-    }
-    pushSection(notApprovedNotice);
+    const startupNotApproved = resolveStartupNotApproved(projectDir, {
+      projectTrusted,
+      worker,
+      globalDir: effectiveGlobalDir,
+      homeDir: effectiveHomeDir,
+      env,
+    });
+    const legacyEmbeddingNotice = formatLegacyEmbeddingContextNotice(config);
+    pushStartupHeadAndNotices({
+      pushSection,
+      availableBudget: () => budget - used,
+      worker,
+      promptsDir,
+      config,
+      notApproved: startupNotApproved,
+      legacyEmbeddingNotice,
+      projectDir,
+      globalDir: effectiveGlobalDir,
+    });
     pushOverviewSections({ pushSection, remaining: () => budget - used, ...overviewArgs });
     cpState.started = true;
     stateDirty = true;

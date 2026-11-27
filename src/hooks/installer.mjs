@@ -6,10 +6,13 @@ import { spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import {
   DEFAULT_CONFIG,
+  EMBEDDING_PROVIDER_NAMES,
+  LEGACY_EMBEDDING_KEY_TARGETS,
   REPO_ROOT,
   assertInsideDir,
   atomicWriteJson,
   atomicWriteText,
+  findLegacyEmbeddingKeys,
   getConfigProblems,
   isMainModule,
   loadConfig,
@@ -919,31 +922,143 @@ export function describeGlobalConfigProblems(globalDir) {
   });
 }
 
-// What to do with the global config.json: create it, replace an untouched old default, or leave it.
+/**
+ * Inspect a parsed global `config.json` object and migrate flat `embedding.*` legacy keys into
+ * `embedding.<provider>.*` when `embedding.provider` names a specific provider (`gemini`, `openai`,
+ * `ollama`, `onnx`). Existing keys inside `embedding.<provider>` are never overwritten (the legacy key
+ * is dropped); legacy keys with no equivalent in that provider's block (unused by that provider) are
+ * also deleted and reported under `removedUnused`.
+ */
+export function migrateGlobalEmbeddingConfig(rawConfig) {
+  const base = {
+    changed: false,
+    legacyKeys: [],
+    provider: '',
+    providerDisplay: 'not set',
+    providerValid: false,
+    moved: [],
+    keptExisting: [],
+    removedUnused: [],
+    skipReason: '',
+  };
+  if (!isPlainObject(rawConfig) || !isPlainObject(rawConfig.embedding)) {
+    return base;
+  }
+  const legacyKeys = findLegacyEmbeddingKeys(rawConfig.embedding);
+  if (legacyKeys.length === 0) {
+    return base;
+  }
+
+  const rawProvider = rawConfig.embedding.provider;
+  const provider = typeof rawProvider === 'string' ? rawProvider.trim().toLowerCase() : '';
+  let providerDisplay = 'not set';
+  if (typeof rawProvider === 'string' && rawProvider.trim() !== '') {
+    providerDisplay = JSON.stringify(rawProvider.trim());
+  } else if (rawProvider !== undefined && rawProvider !== null && rawProvider !== '') {
+    providerDisplay = JSON.stringify(rawProvider);
+  }
+
+  if (!EMBEDDING_PROVIDER_NAMES.includes(provider)) {
+    return {
+      ...base,
+      legacyKeys,
+      provider,
+      providerDisplay,
+      skipReason: 'no_specific_provider',
+    };
+  }
+
+  const existingProviderVal = rawConfig.embedding[provider];
+  if (existingProviderVal !== undefined && !isPlainObject(existingProviderVal)) {
+    return {
+      ...base,
+      legacyKeys,
+      provider,
+      providerDisplay,
+      providerValid: true,
+      skipReason: 'invalid_provider_block',
+    };
+  }
+
+  const targets = LEGACY_EMBEDDING_KEY_TARGETS[provider] || {};
+  const existingBlock = isPlainObject(existingProviderVal) ? existingProviderVal : null;
+  const next = clone(rawConfig);
+  const moved = [];
+  const keptExisting = [];
+  const removedUnused = [];
+
+  for (const key of legacyKeys) {
+    const targetKey = targets[key];
+    if (!targetKey) {
+      delete next.embedding[key];
+      removedUnused.push({ from: `embedding.${key}`, key });
+      continue;
+    }
+    if (existingBlock && Object.prototype.hasOwnProperty.call(existingBlock, targetKey)) {
+      delete next.embedding[key];
+      keptExisting.push({ from: `embedding.${key}`, to: `embedding.${provider}.${targetKey}`, key, targetKey });
+      continue;
+    }
+    if (!isPlainObject(next.embedding[provider])) next.embedding[provider] = {};
+    next.embedding[provider][targetKey] = next.embedding[key];
+    delete next.embedding[key];
+    moved.push({ from: `embedding.${key}`, to: `embedding.${provider}.${targetKey}`, key, targetKey });
+  }
+
+  const changed = moved.length > 0 || keptExisting.length > 0 || removedUnused.length > 0;
+  return {
+    changed,
+    ...(changed ? { next } : {}),
+    legacyKeys,
+    provider,
+    providerDisplay,
+    providerValid: true,
+    moved,
+    keptExisting,
+    removedUnused,
+    skipReason: '',
+  };
+}
+
+// What to do with the global config.json: create it, replace an untouched old default, migrate legacy keys, or leave it.
 function planGlobalConfig(globalDir) {
   const configPath = path.join(globalDir, 'config.json');
   if (!fs.existsSync(configPath)) {
-    return { configPath, action: 'created', problems: [] };
+    return { configPath, action: 'created', problems: [], migration: null };
   }
   let parsed;
   try {
     parsed = readJsonStrict(configPath).data;
   } catch (err) {
-    return { configPath, action: 'kept', problems: [`${err.message}; it is ignored until it is fixed`] };
+    return { configPath, action: 'kept', problems: [`${err.message}; it is ignored until it is fixed`], migration: null };
   }
   if (OLD_DEFAULT_CONFIGS.some((oldDefault) => isDeepStrictEqual(parsed, oldDefault))) {
-    return { configPath, action: 'replaced', problems: [] };
+    return { configPath, action: 'replaced', problems: [], migration: null };
   }
-  return { configPath, action: 'kept', problems: describeGlobalConfigProblems(globalDir) };
+  const migration = migrateGlobalEmbeddingConfig(parsed);
+  if (migration.changed) {
+    return { configPath, action: 'migrated', next: migration.next, problems: [], migration };
+  }
+  return {
+    configPath,
+    action: 'kept',
+    problems: describeGlobalConfigProblems(globalDir),
+    migration: migration.legacyKeys.length > 0 ? migration : null,
+  };
 }
 
 function applyGlobalConfig(globalDir, plan, now) {
   fs.mkdirSync(path.join(globalDir, 'sessions'), { recursive: true });
   fs.mkdirSync(path.join(globalDir, 'docs'), { recursive: true });
   let backupPath = '';
+  let problems = plan.problems;
   if (plan.action === 'replaced') {
     backupPath = createDatedBackup(plan.configPath, now);
     atomicWriteJson(plan.configPath, DEFAULT_CONFIG);
+  } else if (plan.action === 'migrated') {
+    backupPath = createDatedBackup(plan.configPath, now);
+    atomicWriteJson(plan.configPath, plan.next);
+    problems = describeGlobalConfigProblems(globalDir);
   } else if (plan.action === 'created') {
     atomicWriteJson(plan.configPath, DEFAULT_CONFIG);
   }
@@ -951,7 +1066,8 @@ function applyGlobalConfig(globalDir, plan, now) {
     globalDir,
     configPath: plan.configPath,
     configAction: plan.action,
-    configProblems: plan.problems,
+    configProblems: problems,
+    migration: plan.migration || null,
     backupPath,
   };
 }
@@ -1439,8 +1555,47 @@ export function formatInstallSummary(res) {
       lines.push(`[OK] Global store: ${init.globalDir}`);
       lines.push('[OK] config.json was still the default of an older version (embedding provider "auto"); '
         + 'it was replaced by the current default (embedding off).');
+    } else if (init.configAction === 'migrated') {
+      const mig = init.migration;
+      const backupNote = init.backupPath ? ` (backup: ${init.backupPath})` : '';
+      lines.push(`[OK] Global store: ${init.globalDir}`);
+      if (mig?.moved?.length > 0) {
+        lines.push(
+          `[OK] Migrated legacy embedding setting(s) in ${init.configPath}: `
+          + `${mig.moved.map((m) => `${m.from} -> ${m.to}`).join(', ')}`
+          + backupNote,
+        );
+      }
+      if (mig?.keptExisting?.length > 0) {
+        lines.push(
+          `[OK] Removed legacy embedding key(s) in ${init.configPath} because the target key(s) already existed (existing values kept): `
+          + `${mig.keptExisting.map((m) => `${m.from} (kept ${m.to})`).join(', ')}`
+          + backupNote,
+        );
+      }
+      if (mig?.removedUnused?.length > 0) {
+        const names = mig.removedUnused.map((u) => u.from).join(', ');
+        lines.push(
+          `[OK] Removed unused legacy embedding key(s) in ${init.configPath} (not used by embedding.${mig.provider}): `
+          + `${names}`
+          + backupNote,
+        );
+      }
+      for (const problem of init.configProblems) lines.push(`[WARN] ${init.configPath}: ${problem}`);
     } else {
       lines.push(`[OK] Global store: ${init.globalDir} (config.json kept as it is)`);
+      const mig = init.migration;
+      if (mig?.skipReason === 'no_specific_provider') {
+        lines.push(
+          `[WARN] ${init.configPath}: legacy embedding key(s) (${mig.legacyKeys.map((k) => `embedding.${k}`).join(', ')}) `
+          + `were not migrated because embedding.provider is ${mig.providerDisplay}, not a specific provider name `
+          + '(set embedding.provider to gemini, openai, ollama or onnx and re-run install.ps1, or move needed settings into embedding.<provider> and delete unused flat keys).',
+        );
+      } else if (mig?.skipReason === 'invalid_provider_block') {
+        lines.push(
+          `[WARN] ${init.configPath}: legacy embedding key(s) were not migrated because embedding.${mig.provider} is not a JSON object.`,
+        );
+      }
       for (const problem of init.configProblems) lines.push(`[WARN] ${init.configPath}: ${problem}`);
     }
     if (!res.antigravityPresent) {

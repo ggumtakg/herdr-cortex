@@ -5,6 +5,7 @@ import {
   REPO_ROOT,
   assertInsideDir,
   atomicWriteJson,
+  formatLegacyEmbeddingUserNotices,
   getTierPaths,
   getTrustedProjectsPath,
   hasProjectMemoryDir,
@@ -22,7 +23,12 @@ import {
   APPROVAL_STATE_FILE_NAMES,
   formatProjectNotApprovedNotice,
   formatProjectNotApprovedUserNotice,
+  formatUnapprovedFolderNotice,
+  formatUnapprovedFolderUserNotice,
   getAcknowledgedApprovalsPath,
+  hasUnapprovedFolderNoticeRecord,
+  isHomeOrRootFolder,
+  recordUnapprovedFolderNotice,
 } from '../core/trust.mjs';
 import { checkApprovalsForSession, pruneApprovalCheckRecords } from './approvals-watch.mjs';
 import { isReadOnlyShellCommand } from './shell-read-only.mjs';
@@ -586,6 +592,31 @@ function joinUserNotices(notices) {
   return text.length > USER_NOTICE_MAX_CHARS ? `${text.slice(0, USER_NOTICE_MAX_CHARS - 3)}...` : text;
 }
 
+function resolveClaudeNotApprovedNotice(projectDir, { projectTrusted, part, worker, globalDir, homeDir, env }) {
+  if (projectTrusted || part === 'core') {
+    return { contextText: '', userText: '', recordOnce: false };
+  }
+  if (hasProjectMemoryDir(projectDir)) {
+    return {
+      contextText: formatProjectNotApprovedNotice(projectDir),
+      userText: formatProjectNotApprovedUserNotice(projectDir),
+      recordOnce: false,
+    };
+  }
+  if (
+    !worker
+    && !isHomeOrRootFolder(projectDir, { homeDir, env })
+    && !hasUnapprovedFolderNoticeRecord(projectDir, { globalDir })
+  ) {
+    return {
+      contextText: formatUnapprovedFolderNotice(projectDir),
+      userText: formatUnapprovedFolderUserNotice(projectDir),
+      recordOnce: true,
+    };
+  }
+  return { contextText: '', userText: '', recordOnce: false };
+}
+
 export function restoreFailureNote(restoreFailure) {
   if (restoreFailure === RESTORE_FAILURE_RECORD_TOO_LARGE) return TURNS_NOT_RESTORED_TOO_LARGE_NOTE;
   if (restoreFailure === RESTORE_FAILURE_NO_TURNS_WITHIN_CAP) return TURNS_NOT_RESTORED_NO_TURNS_NOTE;
@@ -613,6 +644,7 @@ export function handleClaudeSessionStart(
     env = process.env,
     terminalId = env?.HC_TERMINAL_ID,
     globalDir,
+    homeDir,
     legacyHome,
     promptsDir = path.join(REPO_ROOT, 'prompts'),
     startedAt,
@@ -630,6 +662,7 @@ export function handleClaudeSessionStart(
 
   const worker = isWorkerSession({ env });
   const effectiveGlobalDir = resolveCortexGlobalDir(globalDir);
+  const effectiveHomeDir = homeDir || ((env?.HERDR_CORTEX_TEST_HOME || env?.HERDR_REVIVE_TEST_HOME) ? '' : legacyHome);
   const projectDir = extractCwd(payload, process.cwd());
   const config = loadConfig({ projectDir, globalDir: effectiveGlobalDir });
   const maxChars = resolveHookBudget(config);
@@ -652,22 +685,28 @@ export function handleClaudeSessionStart(
   }
 
   // Nothing from the project's .memory/ is read, injected or created until the user approved the folder.
-  // If such a folder is there, one short notice says so; global memory and HEAD_CORE are unaffected.
+  // When .memory/ exists, every session says so; without .memory/, non-worker sessions say so once per folder.
   const projectTrusted = isProjectTrusted(projectDir, { globalDir: effectiveGlobalDir });
-  const notApprovedNotice = !projectTrusted && part !== 'core' && hasProjectMemoryDir(projectDir)
-    ? formatProjectNotApprovedNotice(projectDir)
-    : '';
+  const notApproved = resolveClaudeNotApprovedNotice(projectDir, {
+    projectTrusted,
+    part,
+    worker,
+    globalDir: effectiveGlobalDir,
+    homeDir: effectiveHomeDir,
+    env,
+  });
+  const mandatoryNotApproved = !notApproved.recordOnce ? notApproved.contextText : '';
+  const oneTimeCandidate = notApproved.recordOnce ? notApproved.contextText : '';
 
   // Lines for the user's own screen (`systemMessage`); see the function comment.
   const userNotices = [];
-  if (notApprovedNotice) userNotices.push(formatProjectNotApprovedUserNotice(projectDir));
+  if (mandatoryNotApproved) userNotices.push(notApproved.userText);
 
   // Approvals changed without the confirmation dialog: announced once per session and change.
   let approvalsNotice = null;
   if (part !== 'core') {
     pruneApprovalCheckRecords(effectiveGlobalDir);
     approvalsNotice = checkApprovalsForSession({ globalDir: effectiveGlobalDir, sessionId: extractSessionId(payload) });
-    if (approvalsNotice) userNotices.push(approvalsNotice.userText);
   }
   const approvalsContext = approvalsNotice ? approvalsNotice.contextText : '';
 
@@ -681,26 +720,50 @@ export function handleClaudeSessionStart(
     used += sep + text.trim().length;
   };
 
+  const mandatoryReserve = (mandatoryNotApproved ? mandatoryNotApproved.length + 2 : 0)
+    + (approvalsContext ? approvalsContext.length + 2 : 0);
+
+  let headCoreToInject = '';
+  if ((part === 'all' || part === 'core') && !worker) {
+    const headCore = readHeadCore(promptsDir, config);
+    if (headCore) {
+      const marker = extractHeadCoreMarker(headCore);
+      const transcriptPath = payload.transcript_path || payload.transcriptPath;
+      const skipDuplicateHeadCore = (source === 'resume' || source === 'fork')
+        && Boolean(marker)
+        && hasClaudeSessionStartMarker(
+          transcriptPath,
+          marker,
+          turnOptions && typeof turnOptions === 'object' ? turnOptions : undefined,
+        );
+      if (!skipDuplicateHeadCore) {
+        headCoreToInject = headCore;
+      }
+    }
+  }
+
+  let includeOneTimeNotice = false;
+  if (oneTimeCandidate && part !== 'core') {
+    const neededWithMandatory = oneTimeCandidate.length + (approvalsContext ? 2 + approvalsContext.length : 0);
+    if (neededWithMandatory <= maxChars) {
+      if (!headCoreToInject) {
+        includeOneTimeNotice = true;
+      } else {
+        const baseTrimmed = trimLinesToBudget(headCoreToInject, maxChars - mandatoryReserve);
+        const withNoticeTrimmed = trimLinesToBudget(
+          headCoreToInject,
+          maxChars - mandatoryReserve - (oneTimeCandidate.length + 2),
+        );
+        includeOneTimeNotice = !baseTrimmed || Boolean(withNoticeTrimmed);
+      }
+    }
+  }
+
   // 1. HEAD_CORE.md (in 'all' or 'core'); skipped in worker sessions, and on resume/fork when already injected
   if (part === 'all' || part === 'core') {
-    if (!worker) {
-      const headCore = readHeadCore(promptsDir, config);
-      if (headCore) {
-        const marker = extractHeadCoreMarker(headCore);
-        const transcriptPath = payload.transcript_path || payload.transcriptPath;
-        const skipDuplicateHeadCore = (source === 'resume' || source === 'fork')
-          && Boolean(marker)
-          && hasClaudeSessionStartMarker(
-            transcriptPath,
-            marker,
-            turnOptions && typeof turnOptions === 'object' ? turnOptions : undefined,
-          );
-        if (!skipDuplicateHeadCore) {
-          const noticeReserve = (notApprovedNotice ? notApprovedNotice.length + 2 : 0)
-            + (approvalsContext ? approvalsContext.length + 2 : 0);
-          pushSection(trimLinesToBudget(headCore, maxChars - noticeReserve));
-        }
-      }
+    if (headCoreToInject) {
+      const noticeReserve = mandatoryReserve + (includeOneTimeNotice ? oneTimeCandidate.length + 2 : 0);
+      pushSection(trimLinesToBudget(headCoreToInject, maxChars - noticeReserve));
     }
     if (part === 'core') {
       if (sections.length === 0) return {};
@@ -713,12 +776,24 @@ export function handleClaudeSessionStart(
     }
   }
 
-  if (notApprovedNotice) {
-    pushSection(notApprovedNotice);
+  if (mandatoryNotApproved) {
+    pushSection(mandatoryNotApproved);
+  } else if (includeOneTimeNotice) {
+    pushSection(oneTimeCandidate);
+    userNotices.push(notApproved.userText);
+    try {
+      recordUnapprovedFolderNotice(projectDir, { globalDir: effectiveGlobalDir });
+    } catch {
+      // ignore state write errors in hook
+    }
+  }
+  if (approvalsNotice) {
+    userNotices.push(approvalsNotice.userText);
   }
   if (approvalsContext) {
     pushSection(approvalsContext);
   }
+  userNotices.push(...formatLegacyEmbeddingUserNotices(config));
 
   const sepCost = (n) => (sections.length + n > 0 ? 2 : 0);
   // A one-line note is added only when it fits; it is counted like every other section.

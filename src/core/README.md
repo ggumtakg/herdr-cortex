@@ -17,8 +17,8 @@
 
 | 파일 | 역할 | Export |
 | :--- | :--- | :--- |
-| **`config.mjs`** | 전역 저장소와 홈 폴더 위치 결정, 계층 폴더 구조, 설정 읽기와 병합, 프로젝트 사용 여부 판정, 승인 목록 읽기, ID·경로 검증, 원자적 파일 쓰기, 시각 형식 | `DEFAULT_CONFIG`, `EMBEDDING_PROVIDER_NAMES`, `GLOBAL_DIR_NAME`, `LEGACY_EMBEDDING_KEYS`, `MEMORY_GITIGNORE_CONTENT`, `REPO_ROOT`, `assertInsideDir`, `atomicWriteJson`, `atomicWriteText`, `compareTimestamps`, `describeLegacyEmbeddingKeys`, `ensureMemoryGitignore`, `ensureTierDirs`, `findLegacyEmbeddingKeys`, `formatIsoTimestamp`, `generateDocId`, `getConfigProblems`, `getGlobalDir`, `getProjectMemoryDir`, `getTierPaths`, `getTrustedProjectsPath`, `hasProjectMemoryDir`, `isMainModule`, `isProjectEnabled`, `isProjectTrusted`, `isValidId`, `loadConfig`, `normalizeRelPath`, `parseTimestampMs`, `projectPathKey`, `readTrustedProjects`, `resolveGlobalDir`, `resolveHomeDir`, `resolveProjectRoot`, `sanitizeProjectConfig`, `sanitizeRelFilePath`, `trustedPathKey`, `validateDocId` |
-| **`trust.mjs`** | 프로젝트 승인 목록의 쓰기 쪽(승인, 취소, 조회), 사람이 확인한 승인 목록, 두 목록의 차이 감지, 안내 문구 | `ACKNOWLEDGED_APPROVALS_FILE`, `ACKNOWLEDGE_COMMAND`, `APPROVALS_CHANGED_AGENT_NOTE`, `APPROVALS_CHANGE_MAX_FOLDERS`, `APPROVAL_STATE_FILE_NAMES`, `PROJECT_APPROVAL_INSTRUCTION`, `PROJECT_NOT_APPROVED_CODE`, `ProjectNotApprovedError`, `TRUST_COMMAND`, `acknowledgeApproval`, `acknowledgeCurrentApprovals`, `acknowledgeRevocation`, `approveProject`, `describeApprovalsChange`, `describeProjectTrust`, `formatApprovalsChangedContext`, `formatApprovalsChangedWarning`, `formatProjectNotApprovedMessage`, `formatProjectNotApprovedNotice`, `formatProjectNotApprovedUserNotice`, `getAcknowledgedApprovalsPath`, `getTrustedProjectsPath`, `isProjectTrusted`, `listTrustedProjects`, `readAcknowledgedApprovals`, `resolveApprovalTarget`, `revokeProject` |
+| **`config.mjs`** | 전역 저장소와 홈 폴더 위치 결정, 계층 폴더 구조, 설정 읽기와 병합, 프로젝트 사용 여부 판정, 승인 목록 읽기, ID·경로 검증, 원자적 파일 쓰기, 시각 형식 | `DEFAULT_CONFIG`, `EMBEDDING_PROVIDER_NAMES`, `GLOBAL_DIR_NAME`, `LEGACY_EMBEDDING_KEYS`, `LEGACY_EMBEDDING_KEY_TARGETS`, `MEMORY_GITIGNORE_CONTENT`, `REPO_ROOT`, `assertInsideDir`, `atomicWriteJson`, `atomicWriteText`, `compareTimestamps`, `describeLegacyEmbeddingKeys`, `ensureMemoryGitignore`, `ensureTierDirs`, `findLegacyEmbeddingKeys`, `formatIsoTimestamp`, `formatLegacyEmbeddingContextNotice`, `formatLegacyEmbeddingUserNotices`, `generateDocId`, `getConfigProblems`, `getGlobalDir`, `getProjectMemoryDir`, `getTierPaths`, `getTrustedProjectsPath`, `hasProjectMemoryDir`, `isMainModule`, `isProjectEnabled`, `isProjectTrusted`, `isValidId`, `loadConfig`, `normalizeRelPath`, `parseTimestampMs`, `projectPathKey`, `readTrustedProjects`, `resolveGlobalDir`, `resolveHomeDir`, `resolveProjectRoot`, `sanitizeProjectConfig`, `sanitizeRelFilePath`, `trustedPathKey`, `validateDocId` |
+| **`trust.mjs`** | 프로젝트 승인 목록의 쓰기 쪽(승인, 취소, 조회), 사람이 확인한 승인 목록, 두 목록의 차이 감지, 안내 문구와 1회 안내 기록 | `ACKNOWLEDGED_APPROVALS_FILE`, `ACKNOWLEDGE_COMMAND`, `APPROVALS_CHANGED_AGENT_NOTE`, `APPROVALS_CHANGE_MAX_FOLDERS`, `APPROVAL_STATE_FILE_NAMES`, `PROJECT_APPROVAL_INSTRUCTION`, `PROJECT_NOT_APPROVED_CODE`, `ProjectNotApprovedError`, `TRUST_COMMAND`, `UNAPPROVED_FOLDER_NOTICES_FILE`, `acknowledgeApproval`, `acknowledgeCurrentApprovals`, `acknowledgeRevocation`, `approveProject`, `describeApprovalsChange`, `describeProjectTrust`, `formatApprovalsChangedContext`, `formatApprovalsChangedWarning`, `formatProjectNotApprovedMessage`, `formatProjectNotApprovedNotice`, `formatProjectNotApprovedUserNotice`, `formatUnapprovedFolderNotice`, `formatUnapprovedFolderUserNotice`, `getAcknowledgedApprovalsPath`, `getTrustedProjectsPath`, `getUnapprovedFolderNoticesPath`, `hasUnapprovedFolderNoticeRecord`, `isHomeOrRootFolder`, `isProjectTrusted`, `listTrustedProjects`, `readAcknowledgedApprovals`, `recordUnapprovedFolderNotice`, `resolveApprovalTarget`, `revokeProject` |
 | **`trust-cli.mjs`** | 승인 명령줄(`cortex-trust`, `npm run trust`): `approve`, `revoke`, `status`, `list`, `acknowledge` | `ACKNOWLEDGE_DIALOG_MAX_FOLDERS`, `APPROVE_DIALOG_MEANING`, `TRUST_CLI_USAGE`, `TRUST_EXIT_ERROR`, `TRUST_EXIT_NOT_APPROVED`, `TRUST_EXIT_OK`, `buildAcknowledgeDialogMessage`, `buildApproveDialogMessage`, `resolveTrustCliCwd`, `runTrustCli` |
 | **`confirm.mjs`** | 사람에게 확인받기: Windows 확인 대화상자, 터미널 질문으로 대체, 물을 수 없을 때의 거부 | `CONFIRM_DIALOG_SCRIPT`, `CONFIRM_DIALOG_SHOW_LINE`, `CONFIRM_DIALOG_TITLE`, `CONFIRM_TERMINAL_PROMPT`, `CONFIRM_TERMINAL_WORD`, `confirmWithUser`, `resolveWindowsPowerShell`, `showWindowsConfirmDialog` |
 | **`frontmatter.mjs`** | 머리말 해석과 쓰기, 원문을 보존하는 갱신, 링크·파일 참조 추출, 제목 단위 조각 나누기 | `UnsafeUpdateError`, `chunkMarkdown`, `extractReferences`, `parseHeadingLine`, `parseMarkdownDoc`, `parseMarkdownDocDetailed`, `renderUpdatedMarkdownDoc`, `scanMarkdownLinkTargets`, `scanWikiLinkTargets`, `serializeMarkdownDoc`, `splitLongText` |
@@ -59,6 +59,7 @@
   sessions/<탭 ID>.json                    탭별 세션 기록(탭 복구용)
   state/trusted-projects.json              승인된 폴더 목록
   state/trusted-projects.acknowledged.json 대화상자에서 확인한 승인 목록
+  state/unapproved-folder-notices.json     .memory/가 없는 미승인 폴더의 1회 안내 기록
   state/approval-checks/                   세션별로 승인 목록을 마지막으로 확인한 기록
   state/inbox/<탭 ID>/                     릴레이 받은편지함
   state/cleared-sessions/                  /clear로 끝난 세션의 기록(10분 뒤 정리)
@@ -236,7 +237,7 @@
 
 ### 이전 형식의 임베딩 키
 
-`embedding` 바로 아래에 평평하게 적던 키 `baseUrl`, `model`, `dimensions`, `apiKey`, `apiKeyEnv`, `onnxEnabled`(`LEGACY_EMBEDDING_KEYS`)는 어디에 있든 읽지 않습니다. 전역 설정의 `embedding`, `projects[...]`의 `embedding`, `overrides`의 `embedding`에서 이 키들을 떼어 낸 뒤 겹칩니다. 호환 변환은 하지 않으며, 설정은 프로바이더 묶음(`embedding.<프로바이더>.*`)으로 옮겨 적어야 합니다.
+`embedding` 바로 아래에 평평하게 적던 키 `baseUrl`, `model`, `dimensions`, `apiKey`, `apiKeyEnv`, `onnxEnabled`(`LEGACY_EMBEDDING_KEYS`)는 런타임에 어디에 있든 읽지 않습니다. 전역 설정의 `embedding`, `projects[...]`의 `embedding`, `overrides`의 `embedding`에서 이 키들을 떼어 낸 뒤 겹칩니다. 런타임 호환 변환은 하지 않으며, 설치기(`src/hooks/installer.mjs`)가 전역 `config.json` 최상위 `embedding`의 옛 키를 `LEGACY_EMBEDDING_KEY_TARGETS` 대응표(`gemini`·`openai`: `baseUrl`·`model`·`dimensions`·`apiKey`·`apiKeyEnv`, `ollama`: `baseUrl`·`model`·`dimensions`, `onnx`: `model`·`dimensions`·`onnxEnabled`→`enabled`)에 따라 프로바이더 묶음으로 옮기고, 그 프로바이더에 대응하는 키가 없는 옛 키(쓰이지 않던 값)도 함께 지웁니다(`embedding.provider`가 특정 프로바이더 이름일 때).
 
 - `findLegacyEmbeddingKeys(embedding)`는 그 객체에 들어 있는 이전 키 이름을 돌려줍니다.
 - `describeLegacyEmbeddingKeys(keys, location)`는 안내 문구를 만듭니다. 예:
@@ -246,7 +247,8 @@
   ```
 
 - `loadConfig`는 발견할 때마다 이 문구 뒤에 ` (in "<파일>")`을 붙여 표준 오류에 `[herdr-cortex] Warning: ` 머리로 남깁니다. 같은 내용은 프로세스당 한 번만 나옵니다.
-- `getConfigProblems(config)`는 `loadConfig`가 돌려준 바로 그 객체에 대해 발견한 문제 목록을 돌려줍니다. 항목은 `{ code, message, source, ... }`이고 `code`는 `legacy_embedding_keys`(추가로 `keys`, `location`) 또는 `project_embedding_ignored`입니다. `loadConfig`가 만들지 않은 객체에는 빈 배열을 돌려줍니다.
+- `getConfigProblems(config)`는 `loadConfig`가 돌려준 바로 그 객체에 대해 발견한 문제 목록을 돌려줍니다. 항목은 `{ code, message, source, ... }`이고 `code`는 `legacy_embedding_keys`(추가로 `keys`, `location`, `provider`, `providerDisplay`, `providerValid`, `providerBlockOk`) 또는 `project_embedding_ignored`(프로젝트 `.memory/config.json`의 `embedding`에 옛 키가 있으면 `legacyKeys`와 `projectRoot`도 포함)입니다. `loadConfig`가 만들지 않은 객체에는 빈 배열을 돌려줍니다.
+- `formatLegacyEmbeddingUserNotices(config)`와 `formatLegacyEmbeddingContextNotice(config)`는 세션 시작 훅이 무시된 옛 키를 한 줄로 알릴 때 씁니다. 전역 최상위 `embedding`은 `embedding.provider`가 유효한 특정 프로바이더(그리고 그 블록이 객체)여서 설치기가 바로 고칠 수 있을 때만 `install.ps1` 재실행을 권하고, `auto`·`none`·미설정·모르는 값이거나 프로바이더 블록이 잘못되어 설치기가 고치지 못하는 경우에는 그 이유와 할 일(`embedding.provider`를 특정 프로바이더로 정한 뒤 `install.ps1` 실행, 또는 필요한 설정만 옮기고 쓰지 않는 키 삭제)을 알립니다. 프로젝트별 설정(`projects[...]` 및 승인된 폴더의 `.memory/config.json`)도 지원하는 키는 옮기고 쓰지 않는 키(또는 `.memory/config.json`의 `embedding`)는 지우라고 안내합니다.
 
 ### 프로젝트에서 동작할지 판정: `isProjectEnabled(projectDir, config)`
 
@@ -315,7 +317,8 @@
 ### 승인하지 않은 폴더에서 일어나는 일
 
 - 그 폴더의 `.memory/`에서는 아무것도 읽지 않고 대화에 넣지 않으며, `.memory/` 폴더를 만들지도 않습니다.
-- 폴더에 `.memory/`가 있으면 세션 시작 때 한 줄 알림이 나옵니다. 사용자 화면에는 아래 "승인되지 않았을 때의 문구"의 사용자용 한 줄이 보이고, 에이전트에게는 승인이 사용자의 결정이니 대신 실행하지 말고 사용자에게 물으라는 안내가 함께 들어갑니다([`../hooks/README.md`](../hooks/README.md#sessionstart-무엇을-어떤-순서로-주입하는가)).
+- 폴더에 `.memory/`가 있으면 세션 시작 때마다 한 줄 알림이 나옵니다(`formatProjectNotApprovedNotice`, `formatProjectNotApprovedUserNotice`).
+- 폴더에 `.memory/`가 없어도 승인 전에는 프로젝트 기억이 꺼져 있고 프로젝트 범위 `memory_save`가 실패한다는 짧은 안내를 **폴더당 한 번만** 냅니다(`formatUnapprovedFolderNotice`, `formatUnapprovedFolderUserNotice`, [`../hooks/README.md`](../hooks/README.md#sessionstart-무엇을-어떤-순서로-주입하는가)). 안내를 냈다는 기록은 `<전역 저장소>/state/unapproved-folder-notices.json`(`UNAPPROVED_FOLDER_NOTICES_FILE`, `getUnapprovedFolderNoticesPath`)에 `projectPathKey`를 키로 원자적으로 저장합니다(`hasUnapprovedFolderNoticeRecord`, `recordUnapprovedFolderNotice`). 위임 워커 세션(`HERDR_CORTEX_ROLE=worker`), 사용자 홈 폴더(`resolveHomeDir`)나 파일 시스템 루트(`C:\`, `/` 등, `isHomeOrRootFolder`), 또는 `hookBudget`이 모자라 안내가 들어가지 못하는 경우에는 이 안내를 내지도 기록하지도 않습니다.
 - 프로젝트 기억을 쓰거나 지정해서 읽는 도구 호출은 `PROJECT_NOT_APPROVED` 오류를 돌려줍니다. 검색처럼 두 계층을 함께 보는 호출은 전역 기억만으로 답하고 결과에 `projectNotApproved: true`를 붙입니다([`../mcp/README.md`](../mcp/README.md#project_dir와-제외승인)).
 - **전역 기억, `HEAD_CORE.md` 주입, 탭 릴레이, 탭 복구는 그대로 동작합니다.**
 - 그 폴더의 `.memory/config.json`도 읽지 않습니다. 따라서 그 파일에 적힌 `enabled: false`는 승인하기 전에는 적용되지 않습니다. 승인하지 않은 폴더를 완전히 끄려면 전역 설정의 `excludedProjects`에 넣으세요.
@@ -351,8 +354,10 @@ To approve a folder, the user runs `cortex-trust approve` inside it from their o
 | 함수 | 쓰이는 곳 | 문구 |
 | :--- | :--- | :--- |
 | `formatProjectNotApprovedMessage(dir)` | `PROJECT_NOT_APPROVED` 도구 오류, 저장소가 프로젝트 계층 열기를 거부할 때 | `Project folder "<폴더>" is not approved for herdr-cortex, so its .memory/ is neither read nor written (global memory still works). ` + 위 문장 |
-| `formatProjectNotApprovedNotice(dir)` | 작업 폴더에 `.memory/`가 있는데 읽지 않았을 때 훅이 에이전트에게 넣는 안내 | `[herdr-cortex] Project memory was not loaded: "<폴더>" contains a .memory/ directory, but this folder is not approved. ` + 위 문장 |
+| `formatProjectNotApprovedNotice(dir)` | 작업 폴더에 `.memory/`가 있는데 읽지 않았을 때 훅이 매 세션 에이전트에게 넣는 안내 | `[herdr-cortex] Project memory was not loaded: "<폴더>" contains a .memory/ directory, but this folder is not approved. ` + 위 문장 |
 | `formatProjectNotApprovedUserNotice(dir)` | 같은 사실을 사용자 화면에 보이는 한 줄 | `[herdr-cortex] Project memory was not loaded: "<폴더>" has a .memory/ folder but is not approved. To approve it, run: cortex-trust approve` |
+| `formatUnapprovedFolderNotice(dir)` | 작업 폴더에 `.memory/`가 없고 승인되지 않았을 때 훅이 폴더당 한 번 에이전트에게 넣는 안내(워커·홈 폴더·파일 시스템 루트·예산 부족 시 제외) | `[herdr-cortex] Project memory is off in "<폴더>" (folder not approved; project-scope \`memory_save\` will fail with PROJECT_NOT_APPROVED, global memory works). ` + 위 문장 |
+| `formatUnapprovedFolderUserNotice(dir)` | 위 1회 안내를 사용자 화면에 보이는 한 줄 | `[herdr-cortex] Project memory is off in "<폴더>" (folder not approved; global memory works). To enable it, run: cortex-trust approve` |
 
 폴더 이름은 문구에 넣기 전에 제어 문자와 줄바꿈을 공백으로 바꿔 한 줄로 만듭니다.
 

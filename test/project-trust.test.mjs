@@ -23,6 +23,12 @@ import {
   describeProjectTrust,
   formatProjectNotApprovedMessage,
   formatProjectNotApprovedNotice,
+  formatProjectNotApprovedUserNotice,
+  formatUnapprovedFolderNotice,
+  formatUnapprovedFolderUserNotice,
+  getUnapprovedFolderNoticesPath,
+  hasUnapprovedFolderNoticeRecord,
+  isHomeOrRootFolder,
   listTrustedProjects,
   revokeProject,
 } from '../src/core/trust.mjs';
@@ -513,13 +519,65 @@ test('trust / Claude hooks: an unapproved .memory/ is neither injected nor touch
     // Nothing in the unapproved .memory/ was created, changed or removed: no index, no .gitignore, inbox intact
     assert.deepEqual(snapshotTree(memoryDir), before);
 
-    // --- unapproved, without a .memory/ directory: no notice, and none gets created ---
+    // --- unapproved, without a .memory/ directory: one-time notice per folder (recorded in global state), no .memory/ created ---
     const bare = path.join(env.root, 'bare-project');
+    const bare2 = path.join(env.root, 'bare-project-2');
     fs.mkdirSync(bare, { recursive: true });
-    const bareCtx = claudeStart(env, bare);
+    fs.mkdirSync(bare2, { recursive: true });
+
+    // Subagent and part="core" neither emit nor record the one-time notice
+    assert.deepEqual(
+      handleClaudeSessionStart(
+        { session_id: 'sub-bare', agent_id: 'sub-1', source: 'startup', cwd: bare },
+        { terminalId: 'tab-1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+      ),
+      {},
+    );
+    assert.doesNotMatch(claudeStart(env, bare, { part: 'core' }), /Project memory is off/);
+    assert.equal(hasUnapprovedFolderNoticeRecord(bare, { globalDir: env.globalDir }), false);
+
+    // Excluded project neither emits nor records the one-time notice
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { excludedProjects: [bare] });
+    assert.equal(claudeStart(env, bare), '');
+    assert.equal(hasUnapprovedFolderNoticeRecord(bare, { globalDir: env.globalDir }), false);
+    fs.rmSync(path.join(env.globalDir, 'config.json'));
+
+    // First session in `bare`: notice in additionalContext AND systemMessage, state recorded, no .memory/ created
+    const bareFirstOut = handleClaudeSessionStart(
+      { session_id: 'sess-bare-1', source: 'startup', cwd: bare },
+      { terminalId: 'tab-1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    const bareCtx = bareFirstOut.hookSpecificOutput?.additionalContext || '';
     assert.match(bareCtx, /GLOBAL-PREF-MARKER/);
-    assert.doesNotMatch(bareCtx, /not approved/);
+    assert.equal(countOccurrences(bareCtx, formatUnapprovedFolderNotice(bare)), 1);
+    assert.equal(bareFirstOut.systemMessage, formatUnapprovedFolderUserNotice(bare));
+    assert.equal(hasUnapprovedFolderNoticeRecord(bare, { globalDir: env.globalDir }), true);
+    assert.equal(fs.existsSync(getUnapprovedFolderNoticesPath(env.globalDir)), true);
     assert.equal(fs.existsSync(path.join(bare, '.memory')), false);
+
+    // Second session in `bare` (and via a junction to `bare`): notice is NOT repeated
+    const bareSecondOut = handleClaudeSessionStart(
+      { session_id: 'sess-bare-2', source: 'startup', cwd: bare },
+      { terminalId: 'tab-1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    assert.doesNotMatch(bareSecondOut.hookSpecificOutput?.additionalContext || '', /Project memory is off|not approved/);
+    assert.equal(bareSecondOut.systemMessage, undefined);
+    const bareLink = path.join(env.root, 'bare-project-link');
+    fs.symlinkSync(bare, bareLink, 'junction');
+    assert.doesNotMatch(claudeStart(env, bareLink), /Project memory is off|not approved/);
+
+    // Another unapproved folder without .memory/ (`bare2`, also under tight hookBudget): shown once again, then silent
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { hookBudget: 600 });
+    const bare2First = handleClaudeSessionStart(
+      { session_id: 'sess-bare2-1', source: 'startup', cwd: bare2 },
+      { terminalId: 'tab-1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir },
+    );
+    const bare2Ctx = bare2First.hookSpecificOutput?.additionalContext || '';
+    assert.ok(bare2Ctx.length <= 600);
+    assert.equal(countOccurrences(bare2Ctx, formatUnapprovedFolderNotice(bare2)), 1);
+    assert.equal(bare2First.systemMessage, formatUnapprovedFolderUserNotice(bare2));
+    fs.rmSync(path.join(env.globalDir, 'config.json'));
+    assert.doesNotMatch(claudeStart(env, bare2), /Project memory is off|not approved/);
 
     // --- approving the parent folder does not approve a project nested in it ---
     const parent = path.join(env.root, 'work');
@@ -646,15 +704,36 @@ test('trust / Antigravity hooks: SessionStart and PreInvocation skip an unapprov
 
     assert.deepEqual(snapshotTree(memoryDir), before, 'no checkpoint, index or inbox change inside the unapproved .memory/');
 
-    // No .memory/ directory: no notice
+    // No .memory/ directory: shown once per folder (SessionStart or first PreInvocation), silent on second session
     const bare = path.join(env.root, 'bare-project');
+    const bareDeferred = path.join(env.root, 'bare-project-deferred');
     fs.mkdirSync(bare, { recursive: true });
-    const bareStart = agySteps(handleAntigravitySessionStart(
-      { conversationId: 'conv-3', rootConversationId: 'conv-3', cwd: bare },
+    fs.mkdirSync(bareDeferred, { recursive: true });
+
+    const bareStart1 = agySteps(handleAntigravitySessionStart(
+      { conversationId: 'conv-3a', rootConversationId: 'conv-3a', cwd: bare },
       hookOpts,
     ));
-    assert.doesNotMatch(bareStart, /not approved/);
+    assert.equal(countOccurrences(bareStart1, formatUnapprovedFolderNotice(bare)), 1);
     assert.equal(fs.existsSync(path.join(bare, '.memory')), false);
+
+    const bareStart2 = agySteps(handleAntigravitySessionStart(
+      { conversationId: 'conv-3b', rootConversationId: 'conv-3b', cwd: bare },
+      hookOpts,
+    ));
+    assert.doesNotMatch(bareStart2, /Project memory is off|not approved/);
+
+    // Deferred startup via PreInvocation in another bare folder: shown on first session, silent on next session
+    const barePre1 = agySteps(handleAntigravityPreInvocation(
+      { conversationId: 'conv-3c', cwd: bareDeferred, lastUserInput: 'hello' },
+      hookOpts,
+    ));
+    assert.equal(countOccurrences(barePre1, formatUnapprovedFolderNotice(bareDeferred)), 1);
+    const barePre2 = agySteps(handleAntigravityPreInvocation(
+      { conversationId: 'conv-3d', cwd: bareDeferred, lastUserInput: 'hello again' },
+      hookOpts,
+    ));
+    assert.doesNotMatch(barePre2, /Project memory is off|not approved/);
 
     // Approved: the project memory and its inbox are used, and the conversation state moves into the project
     approveAsUser(env.projectDir, { globalDir: env.globalDir });
@@ -666,6 +745,167 @@ test('trust / Antigravity hooks: SessionStart and PreInvocation skip an unapprov
     assert.match(approved, /PLANTED-RELAY-MESSAGE/);
     assert.doesNotMatch(approved, /not approved/);
     assert.equal(fs.existsSync(path.join(memoryDir, 'state', 'checkpoints', 'conv-4.json')), true);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('trust / hooks: hookBudget=256 preserves all pre-existing outputs, drops unapproved-without-.memory notice without recording when budget is tight, and never prompts on home or filesystem root', () => {
+  const env = makeTempEnv('cortex-trust-budget-home-');
+  try {
+    saveGlobalNote(env);
+    const withMemUnapproved = path.join(env.root, 'unapproved-with-mem');
+    const approvedDir = path.join(env.root, 'approved-dir');
+    const excludedDir = path.join(env.root, 'excluded-dir');
+    const bareUnapproved = path.join(env.root, 'bare-unapproved');
+    for (const dir of [withMemUnapproved, approvedDir, excludedDir, bareUnapproved]) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    plantMemory(withMemUnapproved);
+    approveAsUser(approvedDir, { globalDir: env.globalDir });
+
+    const claudeOpts = { terminalId: 'tab-b1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir };
+    const agyOpts = { terminalId: 'tab-b1', globalDir: env.globalDir, legacyHome: env.homeDir, promptsDir: env.promptsDir };
+
+    // 1. hookBudget: 256 across the three existing cases + bare unapproved folder
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), {
+      hookBudget: 256,
+      excludedProjects: [excludedDir],
+    });
+
+    // 1a. Unapproved WITH .memory/: Claude emits notice + systemMessage (never {}); Antigravity stays within 256
+    const claudeWithMem = handleClaudeSessionStart(
+      { session_id: 's-256-mem', source: 'startup', cwd: withMemUnapproved },
+      claudeOpts,
+    );
+    assert.equal(
+      claudeWithMem.hookSpecificOutput?.additionalContext,
+      formatProjectNotApprovedNotice(withMemUnapproved),
+    );
+    assert.equal(claudeWithMem.systemMessage, formatProjectNotApprovedUserNotice(withMemUnapproved));
+
+    // 1b. Approved folder: HEAD_CORE is injected within the 256 budget in both Claude and Antigravity
+    const claudeApproved = handleClaudeSessionStart(
+      { session_id: 's-256-app', source: 'startup', cwd: approvedDir },
+      claudeOpts,
+    );
+    const claudeApprovedCtx = claudeApproved.hookSpecificOutput?.additionalContext || '';
+    assert.match(claudeApprovedCtx, /^# HEAD_CORE/);
+    assert.ok(claudeApprovedCtx.length <= 256);
+
+    const agyApproved = agySteps(handleAntigravitySessionStart(
+      { conversationId: 'c-256-app', rootConversationId: 'c-256-app', cwd: approvedDir },
+      agyOpts,
+    ));
+    assert.match(agyApproved, /^# HEAD_CORE/);
+    assert.ok(agyApproved.length <= 256);
+
+    // 1c. Excluded folder: empty {} in both hosts
+    assert.deepEqual(
+      handleClaudeSessionStart({ session_id: 's-256-excl', source: 'startup', cwd: excludedDir }, claudeOpts),
+      {},
+    );
+    assert.deepEqual(
+      handleAntigravitySessionStart(
+        { conversationId: 'c-256-excl', rootConversationId: 'c-256-excl', cwd: excludedDir },
+        agyOpts,
+      ),
+      {},
+    );
+
+    // 1d. Unapproved WITHOUT .memory/ under hookBudget: 256 -> notice does not fit, so HEAD_CORE still fits,
+    //     output equals the no-notice output, and NO one-time record is written
+    const claudeBare256 = handleClaudeSessionStart(
+      { session_id: 's-256-bare', source: 'startup', cwd: bareUnapproved },
+      claudeOpts,
+    );
+    assert.equal(claudeBare256.hookSpecificOutput?.additionalContext, claudeApprovedCtx);
+    assert.equal(claudeBare256.systemMessage, undefined);
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapproved, { globalDir: env.globalDir }), false);
+
+    const agyBare256 = agySteps(handleAntigravitySessionStart(
+      { conversationId: 'c-256-bare', rootConversationId: 'c-256-bare', cwd: bareUnapproved },
+      agyOpts,
+    ));
+    assert.equal(agyBare256, agyApproved);
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapproved, { globalDir: env.globalDir }), false);
+
+    // 1e. Existing approvals-changed warning is never displaced by the new one-time notice
+    const unackFolder = path.join(env.root, 'unack-added');
+    fs.mkdirSync(unackFolder, { recursive: true });
+    approveProject(unackFolder, { globalDir: env.globalDir }); // unacknowledged change!
+    atomicWriteJson(path.join(env.globalDir, 'config.json'), { hookBudget: 560 });
+
+    const claudeUnack = handleClaudeSessionStart(
+      { session_id: 's-560-unack', source: 'startup', cwd: bareUnapproved },
+      claudeOpts,
+    );
+    const claudeUnackCtx = claudeUnack.hookSpecificOutput?.additionalContext || '';
+    assert.match(claudeUnackCtx, /WARNING: the list of approved project folders was changed/);
+    assert.doesNotMatch(claudeUnackCtx, /Project memory is off/);
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapproved, { globalDir: env.globalDir }), false);
+
+    const agyUnack = agySteps(handleAntigravitySessionStart(
+      { conversationId: 'c-560-unack', rootConversationId: 'c-560-unack', cwd: bareUnapproved },
+      agyOpts,
+    ));
+    assert.match(agyUnack, /WARNING: the list of approved project folders was changed/);
+    assert.doesNotMatch(agyUnack, /Project memory is off/);
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapproved, { globalDir: env.globalDir }), false);
+    revokeProject(unackFolder, { globalDir: env.globalDir });
+
+    // Once budget is restored, the unrecorded bare folder DOES receive its one-time notice
+    fs.rmSync(path.join(env.globalDir, 'config.json'));
+    const claudeBareFull = handleClaudeSessionStart(
+      { session_id: 's-full-bare', source: 'startup', cwd: bareUnapproved },
+      claudeOpts,
+    );
+    assert.ok((claudeBareFull.hookSpecificOutput?.additionalContext || '').includes(formatUnapprovedFolderNotice(bareUnapproved)));
+    assert.equal(hasUnapprovedFolderNoticeRecord(bareUnapproved, { globalDir: env.globalDir }), true);
+
+    // 2. Home folder and filesystem root never emit or record the new one-time notice
+    const fsRoot = path.parse(env.root).root;
+    const homeLink = path.join(env.root, 'home-junction');
+    fs.symlinkSync(env.homeDir, homeLink, 'junction');
+    const subInHome = path.join(env.homeDir, 'workspace-inside-home');
+    fs.mkdirSync(subInHome, { recursive: true });
+
+    assert.equal(isHomeOrRootFolder(env.homeDir, { homeDir: env.homeDir }), true);
+    assert.equal(isHomeOrRootFolder(homeLink, { env: { HERDR_CORTEX_TEST_HOME: env.homeDir } }), true);
+    assert.equal(isHomeOrRootFolder(fsRoot, { homeDir: env.homeDir }), true);
+    assert.equal(isHomeOrRootFolder(subInHome, { homeDir: env.homeDir }), false);
+
+    const isolatedEnv = { HERDR_CORTEX_TEST_HOME: env.homeDir };
+    for (const [label, targetDir] of [['home', env.homeDir], ['home-link', homeLink], ['fs-root', fsRoot]]) {
+      const cOut = handleClaudeSessionStart(
+        { session_id: `s-skip-${label}`, source: 'startup', cwd: targetDir },
+        { ...claudeOpts, env: isolatedEnv },
+      );
+      assert.doesNotMatch(cOut.hookSpecificOutput?.additionalContext || '', /Project memory is off/, label);
+      assert.equal(cOut.systemMessage, undefined, label);
+      assert.equal(hasUnapprovedFolderNoticeRecord(targetDir, { globalDir: env.globalDir }), false, label);
+
+      const aStart = agySteps(handleAntigravitySessionStart(
+        { conversationId: `c-skip-s-${label}`, rootConversationId: `c-skip-s-${label}`, cwd: targetDir },
+        { ...agyOpts, env: isolatedEnv },
+      ));
+      assert.doesNotMatch(aStart, /Project memory is off/, label);
+      const aPre = agySteps(handleAntigravityPreInvocation(
+        { conversationId: `c-skip-p-${label}`, cwd: targetDir, lastUserInput: 'hi' },
+        { ...agyOpts, env: isolatedEnv },
+      ));
+      assert.doesNotMatch(aPre, /Project memory is off/, label);
+      assert.equal(hasUnapprovedFolderNoticeRecord(targetDir, { globalDir: env.globalDir }), false, label);
+    }
+
+    // Subfolder inside home STILL receives the one-time notice normally
+    const subOut = handleClaudeSessionStart(
+      { session_id: 's-sub-home', source: 'startup', cwd: subInHome },
+      { ...claudeOpts, env: isolatedEnv },
+    );
+    assert.ok((subOut.hookSpecificOutput?.additionalContext || '').includes(formatUnapprovedFolderNotice(subInHome)));
+    assert.equal(subOut.systemMessage, formatUnapprovedFolderUserNotice(subInHome));
+    assert.equal(hasUnapprovedFolderNoticeRecord(subInHome, { globalDir: env.globalDir }), true);
   } finally {
     env.cleanup();
   }
